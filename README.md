@@ -1,7 +1,7 @@
 # English
 
 <p align="center">
-  <img src="seccheck_poster.png" width="300" alt="SecCheck poster">
+  <img src="seccheck_poster.png" width="500" alt="SecCheck poster">
 </p>
 
 <h1 align="center">SecCheck – Security & Integrity Check</h1>
@@ -75,9 +75,9 @@ If anomalies are detected, you will be prompted to run contextual verification.
 
 ## Requirements
 
-Arch Linux or Arch-based distribution
-rkhunter
-lynis
+- Arch Linux or Arch-based distribution
+- rkhunter
+- lynis
 
 Dependencies are checked automatically.
 If missing, SecCheck can install them on request.
@@ -103,7 +103,7 @@ This project is released under the MIT License.
 ## Italiano
 
 <p align="center">
-  <img src="seccheck_poster.png" width="300" alt="SecCheck poster">
+  <img src="seccheck_poster.png" width="500" alt="SecCheck poster">
 </p>
 
 <h1 align="center">SecCheck – Security & Integrity Check</h1>
@@ -174,9 +174,10 @@ Se vengono rilevate anomalie, viene proposta la verifica contestuale.
 ---
 
 ## Requisiti
-Arch Linux o derivata
-rkhunter
-lynis
+
+- Arch Linux o derivata
+- rkhunter
+- lynis
 
 Le dipendenze vengono controllate automaticamente.
 Se mancanti, SecCheck può installarle su richiesta.
