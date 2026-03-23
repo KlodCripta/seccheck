@@ -34,6 +34,13 @@ If something needs attention, SecCheck can optionally run a contextual verificat
 This step analyzes files, packages and paths involved, helping distinguish between normal behavior, false positives and potential anomalies.
 
 ---
+## Screenshot
+
+<p align="center">
+  <img src="screenshots/01_menu.png" width="300">
+</p>
+
+---
 
 ## Output
 
@@ -97,6 +104,24 @@ It is designed to reduce ambiguity and help interpret system signals more clearl
 
 ---
 
+## Testing
+
+SecCheck includes a test harness to validate the parsing logic.
+
+Run all tests:
+bash seccheck_test.sh
+
+Run specific modules:
+bash seccheck_test.sh RK
+bash seccheck_test.sh LY
+
+The test suite currently includes 57 cases covering:
+- rkhunter output parsing
+- lynis warnings and suggestions
+- pacman integrity checks
+
+---
+
 ## License
 
 This project is released under the MIT License.
@@ -137,6 +162,13 @@ Al termine della scansione, i risultati vengono riassunti e mostrati con un indi
 
 Se vengono rilevati elementi che meritano attenzione, il tool può eseguire una verifica contestuale opzionale.
 Questa fase analizza file, pacchetti e percorsi coinvolti, aiutando a distinguere tra comportamenti normali, falsi positivi e possibili anomalie.
+
+---
+## Screenshot
+
+<p align="center">
+  <img src="screenshots/01_menu.png" width="300">
+</p>
 
 ---
 
@@ -197,6 +229,24 @@ SecCheck non è un antivirus.
 Non garantisce che un sistema sia sicuro e non pretende di rilevare ogni minaccia.
 
 È uno strumento pensato per ridurre l’ambiguità e aiutare a interpretare meglio i segnali del sistema.
+
+---
+
+## Test
+
+SecCheck include un sistema di test per verificare la logica di parsing.
+
+Eseguire tutti i test:
+bash seccheck_test.sh
+
+Eseguire moduli specifici:
+bash seccheck_test.sh RK
+bash seccheck_test.sh LY
+
+La suite contiene attualmente 57 casi che coprono:
+- parsing output rkhunter
+- warning e suggerimenti di lynis
+- controlli di integrità pacman
 
 ---
 
