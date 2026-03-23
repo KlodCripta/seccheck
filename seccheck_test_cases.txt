@@ -1,0 +1,88 @@
+# seccheck_test_cases.txt — SecCheck v1.0.0
+# Formato: ID|FUNCTION|INPUT|EXPECTED_SEVERITY|EXPECTED_CATEGORY
+# FUNCTION: rkhunter | lynis | pacman
+# Aggiornato per architettura a tre moduli (rkhunter + lynis + pacman -Qkk)
+# chkrootkit rimosso dalla v1.0.0
+
+# ── RKHUNTER: righe descrittive (devono restare info) ────────────────────────
+RK001|rkhunter|Checking system commands...|info|info
+RK002|rkhunter|Checking for rootkits...|info|info
+RK003|rkhunter|Searching for suspicious files...|info|info
+RK004|rkhunter|Performing additional rootkit checks|info|info
+RK005|rkhunter|Running startup files check|info|info
+RK006|rkhunter|Checking boot sector|info|info
+
+# ── RKHUNTER: file properties / hash ─────────────────────────────────────────
+RK007|rkhunter|Warning: The file properties have changed: /usr/bin/pacman|low|file_properties
+RK008|rkhunter|Warning: Hash value changed for file: /usr/bin/ls|low|file_properties
+RK009|rkhunter|Warning: SHA256 hash changed for command: /bin/login|medium|file_properties
+RK010|rkhunter|Warning: MD5 hash mismatch detected for /usr/sbin/sshd|medium|file_properties
+
+# ── RKHUNTER: hidden artifacts ────────────────────────────────────────────────
+RK011|rkhunter|Warning: Hidden file found: /tmp/.X11-unix/.cachefile|low|hidden_artifacts
+RK012|rkhunter|Warning: Hidden directory found: /var/tmp/.foo|low|hidden_artifacts
+RK013|rkhunter|Warning: Hidden file found: /etc/.shadowbak|medium|hidden_artifacts
+RK014|rkhunter|Warning: Hidden directory found: /usr/bin/.lib|medium|hidden_artifacts
+
+# ── RKHUNTER: kernel modules ──────────────────────────────────────────────────
+RK015|rkhunter|Warning: Suspicious kernel module detected: rkmod|medium|kernel_modules
+RK016|rkhunter|Warning: Kernel module anomaly detected|medium|kernel_modules
+RK017|rkhunter|Warning: Suspicious string found in kernel module: /lib/modules/evil.ko|medium|kernel_modules
+
+# ── RKHUNTER: network ─────────────────────────────────────────────────────────
+RK018|rkhunter|Warning: Listening port detected: 22/tcp (sshd)|low|network_anomaly
+RK019|rkhunter|Warning: Listening port detected: 53/udp (systemd-resolved)|low|network_anomaly
+RK020|rkhunter|Warning: Listening port detected: 4444/tcp (unknown)|medium|network_anomaly
+RK021|rkhunter|Warning: Network interface in promiscuous mode: eth0|medium|sniffer_or_promisc
+RK022|rkhunter|Warning: Sniffer detected: tcpdump|medium|sniffer_or_promisc
+
+# ── RKHUNTER: startup / boot ──────────────────────────────────────────────────
+RK023|rkhunter|Warning: Startup file anomaly detected: /etc/rc.local|medium|startup_config
+RK024|rkhunter|Warning: System startup files have changed|medium|startup_config
+RK025|rkhunter|Warning: Bootloader anomaly detected|medium|startup_config
+RK026|rkhunter|Warning: Boot sector check warning|medium|startup_config
+
+# ── RKHUNTER: missing tools / skipped ────────────────────────────────────────
+RK027|rkhunter|Warning: Optional application 'unhide' not installed|info|environment_or_missing_tools
+RK028|rkhunter|Warning: Test skipped due to missing command|info|environment_or_missing_tools
+RK029|rkhunter|Warning: Disabled test: packet sniffers|info|environment_or_missing_tools
+RK030|rkhunter|Warning: Permissions changed on file /etc/passwd|medium|permissions_ownership
+
+# ── RKHUNTER: borderline ─────────────────────────────────────────────────────
+RB001|rkhunter|Warning: checking for rootkits in system binaries|info|info
+RB002|rkhunter|Warning: boot process inspection started|info|info
+RB003|rkhunter|Warning: hash tables initialized|info|info
+RB004|rkhunter|Warning: startup scan running|info|info
+RB005|rkhunter|Warning: hidden file found: /dev/.udevdb|low|hidden_artifacts
+RB006|rkhunter|Warning: hidden file found: /boot/.cache|medium|hidden_artifacts
+RB007|rkhunter|Warning: Listening port detected: 68/udp (dhclient)|low|network_anomaly
+RB008|rkhunter|Warning: Listening port detected: 67/udp (NetworkManager)|low|network_anomaly
+RB009|rkhunter|Warning: Promiscuous interface detected: wlan0 (NetworkManager)|low|sniffer_or_promisc
+RB010|rkhunter|Warning: SHA256 hash changed for command: /usr/bin/echo|low|file_properties
+
+# ── LYNIS: risultati puliti ───────────────────────────────────────────────────
+LY001|lynis|[OK] Checking file permissions of /etc/passwd|info|clean_or_neutral
+LY002|lynis|[OK] SSH daemon is configured|info|clean_or_neutral
+LY003|lynis|Not found: /etc/hosts.deny|info|clean_or_neutral
+
+# ── LYNIS: warning ────────────────────────────────────────────────────────────
+LY004|lynis|[WARNING] Weak SSH configuration detected|medium|hardening_warning
+LY005|lynis|[WARNING] No firewall active|medium|hardening_warning
+LY006|lynis|[FOUND] Writable file in /tmp with sticky bit missing|medium|hardening_found
+
+# ── LYNIS: suggestions ───────────────────────────────────────────────────────
+LY007|lynis|[SUGGESTION] Install libpam-tmpdir|low|hardening_suggestion
+LY008|lynis|[SUGGESTION] Consider disabling IPv6 if not used|low|hardening_suggestion
+
+# ── LYNIS: descrittivi ───────────────────────────────────────────────────────
+LY009|lynis|Performing tests from group: authentication|info|info
+LY010|lynis|Starting lynis security scan|info|info
+LY011|lynis|=== Checking system ===|info|info
+
+# ── PACMAN: integrità ─────────────────────────────────────────────────────────
+PA001|pacman|grep: 147 file totali, 0 file alterati|info|info
+PA002|pacman|glibc: 1053 file totali, 0 file alterati|info|info
+PA003|pacman|warning: /etc/pacman.conf: size differs|low|integrity_warning
+PA004|pacman|warning: /boot/amd-ucode.img: permission mismatch|low|integrity_warning
+PA005|pacman|error: missing file /usr/lib/libxyz.so|medium|integrity_missing
+PA006|pacman|amd-ucode: 17 file totali, 1 file alterati|info|info
