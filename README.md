@@ -51,7 +51,7 @@ Messages are shown in English with an Italian translation directly below each li
 git clone https://github.com/KlodCripta/seccheck.git
 cd seccheck
 chmod +x seccheck.sh
-sudo bash seccheck.sh
+./seccheck.sh
 ```
 
 ---
@@ -64,8 +64,11 @@ SecCheck will be available on AUR.
 
 ## Usage
 
-sudo bash seccheck.sh
+```bash
+./seccheck.sh
+```
 
+SecCheck requires elevated privileges for some checks. If needed, it will request them automatically during execution.
 The tool provides a simple menu to run a full scan or individual modules.
 
 At the end of the scan, a report is generated.
@@ -153,7 +156,7 @@ Clonare il repository
 git clone https://github.com/KlodCripta/seccheck.git
 cd seccheck
 chmod +x seccheck.sh
-sudo bash seccheck.sh
+./seccheck.sh
 ```
 
 ## AUR (in arrivo)
@@ -164,8 +167,11 @@ SecCheck sarà disponibile su AUR.
 
 ## Utilizzo
 
-sudo bash seccheck.sh
+```bash
+./seccheck.sh
+```
 
+SecCheck richiede privilegi elevati per alcuni controlli. Se necessario, li richiederà automaticamente durante l’esecuzione.
 Il tool propone un menu semplice per eseguire una scansione completa o singoli moduli.
 
 Al termine viene generato un report.
