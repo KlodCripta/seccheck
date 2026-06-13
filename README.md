@@ -63,9 +63,9 @@ chmod +x seccheck.sh
 
 ---
 
-## AUR (coming soon)
+## AUR
 
-SecCheck will be available on AUR.
+SecCheck it's available on AUR.
 
 ---
 
@@ -191,9 +191,9 @@ chmod +x seccheck.sh
 ./seccheck.sh
 ```
 
-## AUR (in arrivo)
+## AUR
 
-SecCheck sarà disponibile su AUR.
+SecCheck è disponibile su AUR.
 
 ---
 
