@@ -25,12 +25,15 @@ class AurHealthTests(SecCheckCase):
     def write_response(self):
         self.fixture('rpc.json', json.dumps(dict(version=5, type='multiinfo', resultcount=1, results=[self.package])))
 
-    def scan(self, extra=''):
-        return self.shell('sc_reset aur-health; SC_LANG=en; SC_OFFLINE=0\n'
+    def scan(self, extra='', summary=False):
+        output = self.shell('sc_reset aur-health; SC_LANG=en; SC_OFFLINE=0\n'
                           'SC_RUN_DIR="$SC_TEST_DIR/run"; SC_STATE_DIR="$SC_TEST_DIR/state"\n'
                           + extra + '\nsc_run_aur_health\n'
                           'printf "%s|%s|%s\\n" "${SC_MODULE_STATUS[aur-health]}" "${SC_MODULE_REASON[aur-health]}" "${SC_HEALTH_NOTE-}"\n'
-                          'printf "%s\\n" "${SC_F_KEY[@]}"', PATH=self.path)
+                          'printf "%s\\n" "${SC_F_KEY[@]}"' +
+                          ('\nSC_ASCII=1; SC_NO_COLOR=1; sc_ui_init; sc_assess; sc_render_summary' if summary else ''),
+                          PATH=self.path)
+        return ' '.join(output.split()) if summary else output
 
     def seed_baseline(self, maintainer='alice', co=None):
         data = dict(schema=1, observed_at=1, packages={'demo': dict(
@@ -77,6 +80,51 @@ class AurHealthTests(SecCheckCase):
         out = self.scan()
         self.assertIn('partial|', out)
         self.assertNotIn('health_removed', out)
+        self.assertEqual(before, (self.state / 'aur-maintainers.json').read_bytes())
+
+    def test_successive_failed_pages_keep_each_packages_error_log(self):
+        self.command('pacman', 'printf "demo 1.0-1\\nzeta 1.0-1\\n"\n')
+        del self.package['CoMaintainers']
+        packages = [self.package, dict(self.package, Name='zeta', PackageBase='zeta')]
+        self.fixture('rpc.json', json.dumps(dict(version=5, type='multiinfo', resultcount=2, results=packages)))
+        self.command('curl', 'case "${!#}" in\n'
+                     '  */packages/demo) echo "curl: (22) The requested URL returned error: 429" >&2; exit 22;;\n'
+                     '  */packages/zeta) echo "curl: (28) Operation timed out" >&2; exit 28;;\n'
+                     '  *) cat "$SC_TEST_DIR/rpc.json";;\nesac\n')
+        out = self.scan(summary=True)
+        logs = sorted(self.run.glob('aur-page.*.stderr'))
+        self.assertEqual(len(logs), 2, 'Each failed request must keep its own diagnostic log')
+        self.assertIn('429', logs[0].read_text())
+        self.assertIn('timed out', logs[1].read_text())
+        self.assertIn('demo', out)
+        self.assertIn('429', out)
+        self.assertIn('zeta', out)
+        self.assertIn('timed out', out)
+        self.assertNotIn('health_removed', out)
+
+    def test_rpc_error_is_explained_in_summary_without_claiming_a_previous_baseline(self):
+        self.command('curl', 'echo "curl: (6) Could not resolve host: aur.archlinux.org" >&2; exit 6\n')
+        out = self.scan(summary=True)
+        self.assertIn('Could not resolve host', out)
+        self.assertIn('aur-rpc.0.stderr', out)
+        self.assertIn('No AUR baseline', out)
+        self.assertNotIn('baseline was preserved', out)
+        self.assertFalse((self.state / 'aur-maintainers.json').exists())
+
+    def test_incomplete_first_page_check_does_not_claim_to_have_recorded_a_baseline(self):
+        del self.package['CoMaintainers']
+        self.write_response()
+        self.fixture('page.html', '<html>Access denied</html>')
+        out = self.scan(summary=True)
+        self.assertIn('No AUR baseline', out)
+        self.assertNotIn('First AUR snapshot recorded', out)
+        self.assertNotIn('baseline was preserved', out)
+
+    def test_existing_baseline_is_explicitly_preserved_on_an_incomplete_scan(self):
+        before = self.seed_baseline()
+        self.command('curl', 'echo "connection failed" >&2; exit 7\n')
+        out = self.scan(summary=True)
+        self.assertIn('baseline was preserved', out)
         self.assertEqual(before, (self.state / 'aur-maintainers.json').read_bytes())
 
     def test_invalid_json_preserves_baseline(self):

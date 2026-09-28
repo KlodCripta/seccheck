@@ -2,6 +2,13 @@
 
 ## 2.0.0 — development branch
 
+- Native-test follow-up: explain skipped rkhunter checks and execution diagnostics
+  in the summary; an exact egrep deprecation notice alone no longer invalidates a
+  completed scan. Regex/read errors and skipped tests still limit coverage.
+- Keep distinct logs for successive failed AUR requests, including request URLs,
+  curl exit codes and original errors. Show connection/data failures in the summary.
+- Distinguish an incomplete first AUR scan from a preserved existing baseline.
+- Explain how to install missing pacutils and repeat the SHA-256 check.
 - English/Italian selection at startup and persistent language through sudo.
 - Petrolio terminal interface, responsive tables, count bars, labelled traffic light,
   ASCII and NO_COLOR support, four demonstration scenarios without root.

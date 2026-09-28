@@ -20,6 +20,7 @@ sc_reset() {
     declare -ga SC_SELECTED=()
     declare -ga SC_F_MODULE=() SC_F_KIND=() SC_F_PRIORITY=() SC_F_CONFIDENCE=()
     declare -ga SC_F_OBJECT=() SC_F_KEY=() SC_F_EVIDENCE=()
+    declare -ga SC_D_MODULE=() SC_D_KEY=() SC_D_EVIDENCE=()
     declare -gA SC_MODULE_STATUS=() SC_MODULE_REASON=() SC_MODULE_RC=() SC_MODULE_VERSION=()
     declare -ga SC_SCOPE=()
     local module
@@ -43,6 +44,16 @@ sc_module_set() {
     case $status in not-run|running|completed|partial|failed|skipped) ;; *) return 2;; esac
     SC_MODULE_STATUS[$module]=$status
     SC_MODULE_REASON[$module]=$reason
+}
+
+sc_add_diagnostic() {
+    local module=$1 key=$2 evidence i
+    evidence=$(sc_text "${3-}")
+    for ((i=0; i<${#SC_D_MODULE[@]}; i++)); do
+        [[ ${SC_D_MODULE[i]} == "$module" && ${SC_D_KEY[i]} == "$key" &&
+           ${SC_D_EVIDENCE[i]} == "$evidence" ]] && return 0
+    done
+    SC_D_MODULE+=("$module") SC_D_KEY+=("$key") SC_D_EVIDENCE+=("$evidence")
 }
 
 sc_add_finding() {
@@ -101,6 +112,7 @@ sc_version() {
 
 sc_parse_rkhunter() {
     local line lower key priority object
+    local -a words
     SC_PARSE_UNKNOWN=0
     while IFS= read -r line || [[ -n $line ]]; do
         line=${line#\[??:??:??\] }
@@ -120,6 +132,8 @@ sc_parse_rkhunter() {
         fi
         if [[ $lower == *'test skipped'* || $lower == *'skipped due to'* || $lower == *'[ skipped ]'* ]]; then
             SC_PARSE_UNKNOWN=1
+            read -r -a words <<< "$line"
+            sc_add_diagnostic rkhunter rkh_skipped "${words[*]}"
         fi
     done < "$1"
 }
@@ -129,9 +143,22 @@ sc_run_rkhunter() {
     sc_module_set rkhunter running ''
     SC_MODULE_VERSION[rkhunter]=$(sc_version rkhunter --version)
     local out="$SC_RUN_DIR/rkhunter.stdout" err="$SC_RUN_DIR/rkhunter.stderr"
-    local raw="$SC_RUN_DIR/rkhunter.log" parsed rc unknown=0 before=${#SC_F_MODULE[@]}
+    local raw="$SC_RUN_DIR/rkhunter.log" parsed rc line errors=0 unknown=0 before=${#SC_F_MODULE[@]}
     sc_capture "$out" "$err" 1200 rkhunter --check --nocolors --sk --lang en --logfile "$raw"
     rc=$?; SC_MODULE_RC[rkhunter]=$rc
+    # Display execution diagnostics before the potentially long skipped-test list.
+    while IFS= read -r line || [[ -n $line ]]; do
+        case $line in
+            '') continue;;
+            'egrep: warning: egrep is obsolescent; using grep -E')
+                # This exact notice states the command was forwarded to grep -E.
+                # Other warnings, including regex warnings, still limit coverage.
+                sc_add_diagnostic rkhunter rkh_legacy_grep "$line";;
+            'grep: warning: stray '\\' before '*)
+                errors=1; sc_add_diagnostic rkhunter rkh_regex "$line";;
+            *) errors=1; sc_add_diagnostic rkhunter scanner_error "$line";;
+        esac
+    done < "$err"
     parsed=$out
     [[ -s $raw ]] && parsed=$raw
     sc_parse_rkhunter "$parsed"
@@ -142,8 +169,11 @@ sc_run_rkhunter() {
         SC_PARSE_UNKNOWN=$((SC_PARSE_UNKNOWN || unknown))
     fi
     if ((rc <= 1)) && grep -Eq 'System checks summary|Info: End date is' "$parsed" "$out"; then
-        if [[ -s $err ]] || ((SC_PARSE_UNKNOWN)) || ((rc == 1 && ${#SC_F_MODULE[@]} == before)); then
-            sc_module_set rkhunter partial check_details
+        if ((rc == 1 && ${#SC_F_MODULE[@]} == before)); then
+            errors=1; sc_add_diagnostic rkhunter rkh_unparsed 'exit=1; rkhunter.log / rkhunter.stdout'
+        fi
+        if ((errors || SC_PARSE_UNKNOWN)); then
+            sc_module_set rkhunter partial rkh_limited
         else sc_module_set rkhunter completed ''; fi
     elif [[ -s $out || -s $raw ]]; then sc_module_set rkhunter partial unfinished
     else sc_module_set rkhunter failed command_failed
@@ -451,6 +481,8 @@ now = int(time.time())
 partial = False
 findings = []
 notes = []
+diagnostics = []
+baseline_note = 'health_not_updated'
 package_re = re.compile(r'[A-Za-z0-9@_+.-]{1,255}\Z')
 user_re = re.compile(r'[A-Za-z0-9_.+@-]{1,255}\Z')
 
@@ -465,19 +497,34 @@ def load_json(path):
 def text(value):
     return ''.join(c if c.isprintable() else '?' for c in str(value))
 
+class RequestError(ValueError):
+    pass
+
 def fetch(url, stem):
     if time.monotonic() - started > 260:
         raise ValueError('request budget exhausted')
-    result = subprocess.run(['curl', '--disable', '--proto', '=https', '--tlsv1.2',
-        '--fail', '--silent', '--show-error', '--connect-timeout', '5', '--max-time', '20',
-        '--max-filesize', '2097152', '--header', 'Accept-Language: en-US',
-        '--user-agent', 'SecCheck/2.0 (AUR maintenance check)', url],
-        capture_output=True, timeout=23)
-    (run / (stem + '.raw')).write_bytes(result.stdout[:2097152])
-    (run / (stem + '.stderr')).write_bytes(result.stderr[:65536])
-    if result.returncode or len(result.stdout) > 2097152:
-        raise ValueError('AUR request failed')
-    return result.stdout.decode('utf-8')
+    (run / (stem + '.request.txt')).write_text(url + '\n')
+    try:
+        result = subprocess.run(['curl', '--disable', '--proto', '=https', '--tlsv1.2',
+            '--fail', '--silent', '--show-error', '--connect-timeout', '5', '--max-time', '20',
+            '--max-filesize', '2097152', '--header', 'Accept-Language: en-US',
+            '--user-agent', 'SecCheck/2.0 (AUR maintenance check)', url],
+            capture_output=True, timeout=23, env=dict(os.environ, LC_ALL='C'))
+        output, errors, code = result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired as error:
+        output, errors, code = error.stdout or b'', error.stderr or b'', 28
+        errors += b'\nSecCheck: curl exceeded the 23-second process deadline\n'
+    (run / (stem + '.raw')).write_bytes(output[:2097152])
+    (run / (stem + '.stderr')).write_bytes(errors[:65536])
+    if code or len(output) > 2097152:
+        key = {5: 'health_dns', 6: 'health_dns', 7: 'health_connection', 22: 'health_http',
+               28: 'health_timeout', 35: 'health_tls', 60: 'health_tls'}.get(code, 'health_fetch')
+        detail = 'curl=' + str(code) + '; URL=' + url + '; log=' + stem + '.stderr; ' + \
+                 text(errors.decode('utf-8', errors='replace').strip())[:500]
+        if len(output) > 2097152: detail += '; response exceeds 2 MiB'
+        diagnostics.append((key, detail))
+        raise RequestError(detail)
+    return output.decode('utf-8')
 
 class MaintainerRow(HTMLParser):
     def __init__(self):
@@ -542,7 +589,7 @@ def validate_package(pkg):
         raise ValueError('invalid co-maintainers')
 
 def execute():
-    global partial
+    global partial, baseline_note
     lock = os.open(state / 'aur-health.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -552,6 +599,7 @@ def execute():
     baseline = {'schema': 1, 'observed_at': 0, 'packages': {}}
     first = not baseline_path.exists()
     if baseline_path.is_symlink(): raise ValueError('unsafe baseline')
+    if first: baseline_note = 'health_no_baseline'
     if not first:
         baseline = load_json(baseline_path)
         if baseline.get('schema') != 1 or not isinstance(baseline.get('packages'), dict):
@@ -564,6 +612,7 @@ def execute():
             if not isinstance(previous.get('co_maintainers'), list) or not all(
                     isinstance(x, str) and user_re.fullmatch(x) for x in previous['co_maintainers']):
                 raise ValueError('invalid baseline co-maintainers')
+        baseline_note = 'health_preserved'
     result = subprocess.run(['pacman', '-Qm'], capture_output=True, text=True, timeout=30,
                             env=dict(os.environ, LC_ALL='C'))
     (run / 'aur-health-inventory.txt').write_text(result.stdout)
@@ -582,6 +631,7 @@ def execute():
     current = dict(baseline['packages'])
     observed = {}
     page_cache = {}
+    page_serial = 0
     for start in range(0, min(len(names), 2000), 50):
         batch = names[start:start+50]
         try:
@@ -597,7 +647,10 @@ def execute():
                     raise ValueError('unexpected or duplicate package identity')
                 packages[pkg['Name']] = pkg
         except (ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
-            partial = True; notes.append(text(error)); continue
+            partial = True; notes.append(text(error))
+            if not isinstance(error, RequestError):
+                diagnostics.append(('health_data_error', 'AUR RPC: ' + text(error)))
+            continue
         for name in batch:
             if name not in packages:
                 issue('health_removed' if name in baseline['packages'] else 'health_unlisted', name,
@@ -624,8 +677,12 @@ def execute():
                     co = sorted(set(pkg['CoMaintainers']))
                 else:
                     if pkg['PackageBase'] not in page_cache:
+                        # Count attempts, not successful cache entries: a failed
+                        # request must never have its logs overwritten by the next.
+                        stem = 'aur-page.' + str(page_serial)
+                        page_serial += 1
                         page_cache[pkg['PackageBase']] = fetch('https://aur.archlinux.org/packages/' +
-                            urllib.parse.quote(name, safe=''), 'aur-page.' + str(len(page_cache)))
+                            urllib.parse.quote(name, safe=''), stem)
                     co = co_from_page(page_cache[pkg['PackageBase']], maintainer)
                 item = dict(base=pkg['PackageBase'], maintainer=maintainer, co_maintainers=co, seen_at=now)
                 previous = baseline['packages'].get(name)
@@ -638,6 +695,8 @@ def execute():
                 current[name] = observed[name] = item
             except (ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
                 partial = True; notes.append(name + ': ' + text(error))
+                if not isinstance(error, RequestError):
+                    diagnostics.append(('health_data_error', name + ': ' + text(error)))
                 observed[name] = dict(base=pkg['PackageBase'], maintainer=maintainer, co_maintainers=None, seen_at=now)
     (run / 'aur-health-observed.json').write_text(json.dumps(dict(observed_at=now, packages=observed), indent=2) + '\n')
     if not partial:
@@ -649,19 +708,27 @@ def execute():
         os.replace(temporary, baseline_path)
     notes.append('foreign=' + str(len(names)) + '; AUR observed=' + str(len(observed)) +
                  '; age-threshold=365 days; max-packages=2000; request-budget=260s; baseline=' +
-                 ('preserved' if partial else 'updated'))
-    return 'health_baseline' if first else 'health_compared'
+                 (('not-created' if first else 'preserved') if partial else 'updated'))
+    return baseline_note if partial else ('health_baseline' if first else 'health_compared')
 
 try:
     note = execute()
 except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
-    partial = True; note = 'health_unavailable'; notes.append(text(error))
+    partial = True; note = baseline_note; notes.append(text(error))
+    if not isinstance(error, RequestError): diagnostics.append(('health_data_error', text(error)))
 with (run / 'aur-health-findings.tsv').open('w') as stream:
     for finding in findings: stream.write('\t'.join(map(text, finding)) + '\n')
 (run / 'aur-health-scope.txt').write_text('\n'.join(map(text, notes)) + '\n')
+with (run / 'aur-health-diagnostics.tsv').open('w') as stream:
+    for diagnostic in diagnostics: stream.write('\t'.join(map(text, diagnostic)) + '\n')
 print(('partial' if partial else 'completed') + '\t' + note)
 PY
     rc=$?; SC_MODULE_RC[aur-health]=$rc
+    if [[ -r $SC_RUN_DIR/aur-health-diagnostics.tsv ]]; then
+        while IFS=$'\t' read -r key evidence; do
+            [[ -z $key ]] || sc_add_diagnostic aur-health "$key" "$evidence"
+        done < "$SC_RUN_DIR/aur-health-diagnostics.tsv"
+    fi
     if [[ -f $SC_RUN_DIR/aur-health-findings.tsv ]]; then
         while IFS=$'\t' read -r priority key object evidence; do
             [[ -n $key ]] && sc_add_finding aur-health maintenance "$priority" observation "$object" "$key" "$evidence"
@@ -669,9 +736,12 @@ PY
     fi
     if ((rc)) || [[ -s $SC_RUN_DIR/aur-health.stderr ]]; then
         sc_module_set aur-health partial health_unavailable
+        SC_HEALTH_NOTE=health_not_updated
+        sc_add_diagnostic aur-health scanner_error "exit=$rc; aur-health.stderr"
     else
         IFS=$'\t' read -r state note < "$SC_RUN_DIR/aur-health.stdout"
-        if [[ $state == completed ]]; then sc_module_set aur-health completed ''; SC_HEALTH_NOTE=$note
+        SC_HEALTH_NOTE=$note
+        if [[ $state == completed ]]; then sc_module_set aur-health completed ''
         else sc_module_set aur-health partial health_unavailable; fi
     fi
     if [[ -r $SC_RUN_DIR/aur-health-scope.txt ]]; then
@@ -729,7 +799,17 @@ sc_t() {
         offline) en='Online AUR metadata skipped (--offline).'; it="Dati AUR online non consultati (--offline).";;
         missing_health_tools) en='AUR metadata requires python, curl, pacman and vercmp.'; it="I dati AUR richiedono python, curl, pacman e vercmp.";;
         health_state) en='Cannot safely open the private AUR comparison history.'; it="Impossibile aprire in sicurezza lo storico privato dei confronti AUR.";;
-        health_unavailable) en='Some AUR metadata or history could not be verified. The previous baseline was preserved; consult the technical report.'; it="Alcuni dati o lo storico AUR non sono verificabili. La base precedente è stata conservata; consulta il rapporto tecnico.";;
+        health_unavailable) en='Some AUR metadata or history could not be verified. Findings collected so far are still shown; the missing checks are explained below.'; it="Alcuni dati o lo storico AUR non sono verificabili. I segnali raccolti restano disponibili; qui sotto trovi quali controlli mancano e perché.";;
+        health_no_baseline) en='No AUR baseline was created: this first scan was incomplete. Maintainer changes can be compared after a complete snapshot is saved.'; it="La prima scansione AUR è incompleta: non è stata creata una base per i confronti. Per seguire i cambi di maintainer serve prima una scansione completa.";;
+        health_preserved) en='The previous AUR baseline was preserved. This incomplete scan did not replace the history used to compare maintainers.'; it="La precedente base AUR è stata conservata. Questa scansione incompleta non ha sostituito lo storico usato per confrontare i maintainer.";;
+        health_not_updated) en='The AUR baseline update could not be confirmed. Resolve the history or execution error before comparing maintainer changes.'; it="Non è stato possibile confermare il salvataggio della base AUR. Risolvi il problema dello storico o dell'esecuzione prima di confrontare i cambi di maintainer.";;
+        health_dns) en='The AUR address could not be resolved. Check DNS and the connection; this does not mean a package was removed.'; it="Impossibile risolvere l'indirizzo di AUR. Controlla DNS e connessione; questo errore non significa che un pacchetto sia stato rimosso.";;
+        health_connection) en='The connection to AUR failed. Check connectivity and any proxy settings, then repeat this module.'; it="Connessione ad AUR non riuscita. Controlla la rete e le eventuali impostazioni proxy, poi ripeti questo modulo.";;
+        health_timeout) en='An AUR request timed out. Repeat this module when the service is reachable; its error log is listed below.'; it="Una richiesta AUR ha superato il tempo disponibile. Ripeti questo modulo quando il servizio è raggiungibile; sotto è indicato il log dell'errore.";;
+        health_http) en='AUR returned an HTTP error. Read the code below: 429 means too many requests; 5xx indicates a server error. Repeat the module later.'; it="AUR ha risposto con un errore HTTP. Leggi il codice qui sotto: 429 indica troppe richieste; 5xx un errore del server. Ripeti il modulo più tardi.";;
+        health_tls) en='The secure AUR connection could not be verified. Check the clock, certificates and proxy; do not disable certificate checks.'; it="Impossibile verificare la connessione sicura ad AUR. Controlla orologio, certificati e proxy; mantieni attiva la verifica dei certificati.";;
+        health_fetch) en='An AUR request failed. The URL, command exit code and original error below identify the failed operation.'; it="Una richiesta AUR è fallita. URL, codice di uscita ed errore originale qui sotto identificano l'operazione non riuscita.";;
+        health_data_error) en='Some AUR data could not be read or validated. Unknown maintainer information is not treated as a removal.'; it="Alcuni dati AUR non sono leggibili o verificabili. Un maintainer non verificato non viene considerato rimosso.";;
         health_baseline) en='First AUR snapshot recorded. Maintainer changes before this observation are unknown; comparison starts with the next complete scan.'; it="Registrata la prima fotografia AUR. I cambi di maintainer precedenti sono sconosciuti; il confronto inizia dalla prossima scansione completa.";;
         health_compared) en='AUR maintainers compared with the previous complete scan. Changes are observations, not evidence of malicious intent.'; it="Maintainer AUR confrontati con la precedente scansione completa. I cambi sono osservazioni, non prove di intenzioni malevole.";;
         health_orphan) en='AUR lists no primary maintainer: this package is orphaned. This differs from an unused local dependency. Check support and consider a maintained alternative if needed.'; it="AUR non indica un maintainer principale: il pacchetto è orfano. Non significa che sia una dipendenza locale inutilizzata. Verifica il supporto e valuta, se serve, un'alternativa mantenuta.";;
@@ -750,7 +830,14 @@ sc_t() {
         missing_rkhunter) en='Install rkhunter to run this module.'; it="Installa rkhunter per eseguire questo modulo.";;
         missing_lynis) en='Install lynis to run this module.'; it="Installa lynis per eseguire questo modulo.";;
         missing_pacman) en='pacman is unavailable.'; it="pacman non disponibile.";;
-        missing_paccheck) en='SHA-256 checks unavailable: install pacutils.'; it="Controllo SHA-256 non disponibile: installa pacutils.";;
+        missing_paccheck) en='SHA-256 checks unavailable: pacutils is missing, so this part of the file-content check was not performed. Use main-menu option 6 to install the missing tool, then repeat option 4.'; it="Controllo SHA-256 non disponibile: manca pacutils, quindi questa verifica del contenuto dei file non è stata eseguita. Usa la voce 6 del menu principale per installare lo strumento mancante, poi ripeti la voce 4.";;
+        rkh_limited) en='rkhunter finished, but some tests were skipped or commands reported problems. The reasons below limit coverage; they are not additional malware findings.'; it="rkhunter è arrivato alla fine, ma alcuni test sono stati saltati o alcuni comandi hanno segnalato problemi. Le cause qui sotto limitano la copertura; non sono ulteriori rilevamenti di malware.";;
+        rkh_skipped) en='Tests not performed by rkhunter. They may require optional tools, services or different settings; this result does not cover them:'; it="Test non eseguiti da rkhunter. Possono dipendere da strumenti facoltativi, servizi o impostazioni; questo risultato non li copre:";;
+        rkh_legacy_grep) en='Compatibility notice: rkhunter uses the obsolete egrep name, which still forwards to grep -E. This notice alone does not invalidate the scan:'; it="Avviso di compatibilità: rkhunter usa il nome obsoleto egrep, che richiama ancora grep -E. Questo avviso da solo non invalida la scansione:";;
+        rkh_regex) en='grep reported a compatibility problem with search expressions used by rkhunter. Check for a distribution update; affected checks are not treated as fully verified:'; it="grep segnala un problema di compatibilità nelle espressioni usate da rkhunter. Verifica gli aggiornamenti della distribuzione; i controlli interessati non sono considerati pienamente verificati:";;
+        rkh_unparsed) en='rkhunter returned a warning exit code, but no corresponding finding was recognized. Read the original logs before drawing conclusions:'; it="rkhunter ha restituito un codice di avviso, ma non è stata riconosciuta la segnalazione corrispondente. Leggi i log originali prima di trarre conclusioni:";;
+        scanner_error) en='The scanner reported an execution or reading problem. Original message:'; it="Lo scanner ha segnalato un problema di esecuzione o lettura. Messaggio originale:";;
+        diagnostics_more) en='Further diagnostic details are included in the full report (option 2).'; it="Altri dettagli diagnostici sono nel rapporto completo (voce 2).";;
         check_details) en='Warnings, read errors or an unknown output format reduced coverage. Read the raw logs.'; it="Avvisi, errori di lettura o un formato inatteso hanno limitato il controllo. Consulta i log originali.";;
         unfinished) en='The scanner did not report a normal completion.'; it="Lo scanner non ha comunicato una conclusione regolare.";;
         command_failed) en='The command failed without usable results.'; it="Il comando non ha prodotto risultati utilizzabili.";;
@@ -886,6 +973,21 @@ sc_status_color() {
         clear|completed) printf '%s' "$SC_C_GREEN";; *) printf '%s' "$SC_C_MUTED";; esac
 }
 
+sc_render_diagnostics() {
+    local module=$1 limit=${2:-0} i shown=0 last_key=''
+    for ((i=0; i<${#SC_D_MODULE[@]}; i++)); do
+        [[ ${SC_D_MODULE[i]} == "$module" ]] || continue
+        if ((limit && shown >= limit)); then sc_line "$(sc_t diagnostics_more)" "$SC_C_MUTED"; return 0; fi
+        ((shown+=1))
+        if [[ ${SC_D_KEY[i]} != "$last_key" ]]; then
+            sc_line "$(sc_t "${SC_D_KEY[i]}")" "$SC_C_MUTED"
+            last_key=${SC_D_KEY[i]}
+        fi
+        sc_line "- ${SC_D_EVIDENCE[i]}" "$SC_C_MUTED"
+    done
+    return 0
+}
+
 sc_render_summary() {
     local module count i color label bar total=${#SC_SELECTED[@]}
     sc_heading result
@@ -917,6 +1019,7 @@ sc_render_summary() {
             sc_line "$(sc_t "${SC_MODULE_STATUS[$module]}") / $(sc_t findings): $count" "$color"
         fi
         [[ -z ${SC_MODULE_REASON[$module]} ]] || sc_line "$(sc_t "${SC_MODULE_REASON[$module]}")" "$SC_C_MUTED"
+        sc_render_diagnostics "$module" 6
     done
     [[ -z ${SC_HEALTH_NOTE:-} ]] || sc_line "$(sc_t "$SC_HEALTH_NOTE")" "$SC_C_MUTED"
     sc_heading signals
@@ -977,6 +1080,7 @@ sc_render_report() {
     local module value
     for module in "${SC_SELECTED[@]}"; do
         sc_line "$module: version=${SC_MODULE_VERSION[$module]}; exit=${SC_MODULE_RC[$module]}; reason=${SC_MODULE_REASON[$module]}"
+        sc_render_diagnostics "$module" 0
     done
     for value in "${SC_SCOPE[@]}"; do sc_line "$value"; done
     sc_line 'Indicator sources: https://ioctl.fail/preliminary-analysis-of-aur-malware/'
@@ -1169,6 +1273,7 @@ sc_scan_once() {
         sc_line "[$step/${#SC_SELECTED[@]}] $(sc_t scanning): $(sc_t "$module")" "$SC_C_PRIMARY"
         case $module in rkhunter) sc_run_rkhunter;; lynis) sc_run_lynis;; integrity) sc_run_integrity;; aur) sc_run_aur;; aur-health) sc_run_aur_health;; esac
         sc_line "$(sc_t "${SC_MODULE_STATUS[$module]}")" "$(sc_status_color "${SC_MODULE_STATUS[$module]}")"
+        [[ -z ${SC_MODULE_REASON[$module]} ]] || sc_line "$(sc_t "${SC_MODULE_REASON[$module]}")" "$SC_C_MUTED"
     done
     sc_assess
     SC_RUN_ACTIVE=0

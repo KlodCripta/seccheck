@@ -31,3 +31,14 @@ event log, cannot reveal transitions between two scans, and cannot prove who
 maintained the exact installed build. First-seen packages establish comparison
 data. Reinstalling SecCheck on a machine without its private history starts a
 new comparison history. A local root attacker could tamper with that history.
+
+Each HTTP request keeps its own `aur-rpc.N` or `aur-page.N` files: `.request.txt`
+identifies the URL, `.raw` stores the bounded response and `.stderr` stores curl's
+diagnostic output. Page numbering counts attempts, including failures, so a later
+request cannot overwrite an earlier failed request's evidence. The summary gives
+the curl exit code, original error and log filename with an EN/IT explanation.
+`aur-health-diagnostics.tsv` contains these diagnostics separately from findings.
+
+A partial first scan does not create a baseline. A partial later scan preserves
+the previous complete snapshot. The interface now states which situation applies.
+An HTTP/connection failure is never interpreted as a removed package or maintainer.

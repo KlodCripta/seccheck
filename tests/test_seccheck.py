@@ -80,6 +80,44 @@ class AdapterTests(SecCheckCase):
                          'printf "%s" "${SC_MODULE_STATUS[rkhunter]}"', PATH=path)
         self.assertEqual(out, "partial")
 
+    def test_rkhunter_skips_and_grep_compatibility_are_visible_in_summary(self):
+        path = self.command('rkhunter', '[[ "$1" == --version ]] && { echo 1.4.6; exit; }\n'
+                            'echo "    Running skdet command [ Skipped ]"\n'
+                            'echo "    Checking for enabled xinetd services [ Skipped ]"\n'
+                            'echo "    Checking for software intrusions [ Skipped ]"\n'
+                            'echo "    Checking for enabled inetd services [ Skipped ]"\n'
+                            'echo "    Checking for missing log files [ Skipped ]"\n'
+                            'echo "    Checking for empty log files [ Skipped ]"\n'
+                            'echo "System checks summary"\n'
+                            'echo "egrep: warning: egrep is obsolescent; using grep -E" >&2\n'
+                            'echo "grep: warning: stray \\ before +" >&2\n')
+        out = self.shell('sc_reset rkhunter; SC_RUN_DIR="$SC_TEST_DIR"; SC_LANG=en\n'
+                         'sc_run_rkhunter; sc_assess; SC_NO_COLOR=1; sc_ui_init; sc_render_summary\n'
+                         'printf "\\n%s|%s" "${SC_MODULE_STATUS[rkhunter]}" "${#SC_F_MODULE[@]}"', PATH=path)
+        self.assertIn('skdet', out)
+        self.assertIn('xinetd', out)
+        self.assertIn('stray', out)
+        self.assertIn('compatibility', out)
+        self.assertTrue(out.endswith('partial|0'), out)
+
+    def test_egrep_deprecation_alone_does_not_discard_completed_rkhunter_coverage(self):
+        path = self.command('rkhunter', '[[ "$1" == --version ]] && { echo 1.4.6; exit; }\n'
+                            'echo "System checks summary"\n'
+                            'echo "egrep: warning: egrep is obsolescent; using grep -E" >&2\n')
+        out = self.shell('sc_reset rkhunter; SC_RUN_DIR="$SC_TEST_DIR"\n'
+                         'sc_run_rkhunter; printf "%s" "${SC_MODULE_STATUS[rkhunter]}"', PATH=path)
+        self.assertEqual(out, 'completed')
+
+    def test_unknown_rkhunter_stderr_stays_partial_and_is_explained(self):
+        path = self.command('rkhunter', '[[ "$1" == --version ]] && { echo 1.4.6; exit; }\n'
+                            'echo "System checks summary"\n'
+                            'echo "grep: /private/example: Permission denied" >&2\n')
+        out = self.shell('sc_reset rkhunter; SC_RUN_DIR="$SC_TEST_DIR"; SC_LANG=en\n'
+                         'sc_run_rkhunter; sc_assess; SC_NO_COLOR=1; sc_ui_init; sc_render_summary\n'
+                         'printf "\\n%s" "${SC_MODULE_STATUS[rkhunter]}"', PATH=path)
+        self.assertIn('Permission denied', out)
+        self.assertTrue(out.endswith('partial'), out)
+
     def test_lynis_structured_report_preserves_full_warning(self):
         self.fixture("lynis.dat", "report_version_major=1\nlynis_version=3.1.7\nreport_datetime_start=start\n"
                      "warning[]=AUTH-9262|Password hash rounds are not configured|details||\n"

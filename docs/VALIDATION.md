@@ -2,8 +2,8 @@
 
 ## Completed
 
-Final local suite: **70 tests passing**, Bash syntax checks and ShellCheck 0.11.0
-clean after the review fixes (28 September 2026).
+Latest local suite: **77 tests passing**, Bash syntax checks and ShellCheck 0.11.0
+clean after the first native-feedback corrections (28 September 2026).
 
 - Regression tests exercise evidence/coverage independently, scanner boundary fixtures,
   missing tools and unknown output, static Atomic Arch reads, private reports,
@@ -59,3 +59,31 @@ On an Arch test machine and at least one derivative, record tool versions and te
 
 Keep the resulting sanitized raw output as new fixtures when the upstream format
 differs. Do not merge/tag/publish this development branch as stable before that pass.
+
+## First native feedback, 28 September 2026
+
+The supplied run reported rkhunter 1.4.6, Lynis 3.1.7, missing pacutils, a completed
+static Atomic Arch module, and three failed AUR page requests. The rkhunter excerpt
+contains egrep deprecation notices, grep regex warnings and six skipped checks.
+Those messages do not diagnose malware. Skipped checks and regex/read problems
+remain explicit coverage limits; only the exact egrep forwarding notice is
+informational by itself.
+
+The AUR adapter was found to reuse a failed page's log filename because it numbered
+requests by successful cache entries. Numbering now counts attempts. The summary
+also carries the original curl error instead of only `AUR request failed`, and
+correctly distinguishes a missing first baseline from a preserved previous one.
+Regression fixtures reproduce successive HTTP/timeout failures, DNS failures,
+baseline preservation and the native rkhunter diagnostic patterns.
+
+The underlying cause of the user's three HTTP requests is still unconfirmed:
+the supplied excerpt does not contain the individual curl stderr. A native retry
+or the retained `aur-page.*.stderr` is needed to distinguish HTTP errors, timeouts,
+DNS and TLS problems. No retry policy or network diagnosis is inferred from counts.
+The missing-pacutils run also cannot validate the SHA-256 path on that machine.
+
+The user requested restoring the earlier version's clearer section separation,
+use of several semantic colors and educational explanations. That interface work
+is explicitly scheduled after functional corrections; this patch does not replace
+that work. The older screenshot's zero-file integrity success and unsupported
+compromise-probability score must not be restored.
