@@ -1,1606 +1,1266 @@
 #!/usr/bin/env bash
-# =============================================================================
-#  seccheck.sh — Security & Integrity Checker for Arch Linux
-#  Brand: KlodCripta | Italian Linux Society
-#  Version: 1.0.0
-#  License: MIT
-#  Description: Strumento di verifica sicurezza e integrità per Arch Linux.
-#               Combina auditing (lynis), analisi anomalie (rkhunter) e
-#               controllo integrità file di sistema (pacman -Qkk) in un
-#               unico flusso guidato con output narrativo bilingue IT/EN.
-# -----------------------------------------------------------------------------
-#  Nota: 'set -e' è omesso consapevolmente. Diversi comandi restituiscono
-#  exit code non-zero in modo legittimo; i casi sono gestiti esplicitamente.
-# =============================================================================
+# SecCheck 2.0 — Klod Cripta — MIT
+# Standalone, read-only security assistant for Arch Linux and derivatives.
+# Sourcing this file defines functions only: no traps, privilege changes or I/O.
 
-set -uo pipefail
+SC_VERSION=2.0.0
+SC_RULESET=2026.09.27
+SC_RULESET_DATE=2026-09-27
+SC_ALL_MODULES='rkhunter lynis integrity aur aur-health'
 
-# =============================================================================
-#  COLORI & STILI
-# =============================================================================
-RESET="\033[0m"
-BOLD="\033[1m"
-DIM="\033[2m"
-RED="\033[1;31m"
-GREEN="\033[1;32m"
-YELLOW="\033[1;33m"
-CYAN="\033[1;36m"
-MAGENTA="\033[1;35m"
-WHITE="\033[1;37m"
-BG_RED="\033[41m"
-BG_GREEN="\033[42m"
-BG_YELLOW="\033[43;30m"
-ORANGE="\033[38;5;208m"
-ITALIC="\033[3m"
-
-# =============================================================================
-#  CONFIGURAZIONE
-# =============================================================================
-VERSION="1.0.0"
-LOG_DIR="/var/log/seccheck"
-TIMESTAMP=""   # inizializzato in reset_session, non all'avvio
-LOG_FILE=""    # inizializzato in reset_session
-
-TEMP_RKH=""
-TEMP_LYN=""
-TEMP_PAC=""
-
-# Contatori globali scoring
-HIGH_COUNT=0
-MEDIUM_COUNT=0
-LOW_COUNT=0
-INFO_COUNT=0
-
-# Flag categorie per scoring avanzato
-HAS_ROOTKIT_SIG=0
-HAS_KERNEL=0
-HAS_HIDDEN=0
-HAS_NETWORK=0
-HAS_STARTUP=0
-HAS_INTEGRITY=0
-HAS_HARDENING=0
-
-# Array risultati classificati: severity|category|source|message|hint
-declare -a CLASSIFIED_RESULTS=()
-
-# Risk level calcolato dall'ultimo summary (passato alla fase 2)
-SECCHECK_RISK_LEVEL="clean"
-
-# Debug mode: SECCHECK_DEBUG=1 bash seccheck.sh
-# Stampa classificazione parser, scarto e motivo per ogni riga analizzata
-SECCHECK_DEBUG="${SECCHECK_DEBUG:-0}"
-
-# =============================================================================
-#  CLEANUP
-# =============================================================================
-cleanup() {
-    [[ -n "$TEMP_RKH" ]] && rm -f "$TEMP_RKH"
-    [[ -n "$TEMP_LYN" ]] && rm -f "$TEMP_LYN"
-    [[ -n "$TEMP_PAC" ]] && rm -f "$TEMP_PAC"
-}
-trap cleanup EXIT
-
-# =============================================================================
-#  HELPERS
-# =============================================================================
-separator() {
-    echo -e "${DIM}──────────────────────────────────────────────────────────────${RESET}"
+# ---- Evidence model ---------------------------------------------------------
+sc_text() {
+    local value=${1-}
+    value=${value//$'\n'/ }
+    printf '%s' "$value" | LC_ALL=C tr '\000-\037\177' '?'
 }
 
-narrate() {
-    # EN: grassetto bianco (principale) — primo argomento
-    # IT: corsivo dim (secondario, rientrato) — secondo argomento
-    # CHIAMATA: narrate "EN text" "IT text"
-    echo -e "${BOLD}${WHITE}${1}${RESET}"
-    echo -e "${ITALIC}${DIM}  ↳ ${2}${RESET}"
+sc_reset() {
+    SC_LANG=${SC_LANG:-en}
+    declare -ga SC_SELECTED=()
+    declare -ga SC_F_MODULE=() SC_F_KIND=() SC_F_PRIORITY=() SC_F_CONFIDENCE=()
+    declare -ga SC_F_OBJECT=() SC_F_KEY=() SC_F_EVIDENCE=()
+    declare -gA SC_MODULE_STATUS=() SC_MODULE_REASON=() SC_MODULE_RC=() SC_MODULE_VERSION=()
+    declare -ga SC_SCOPE=()
+    local module
+    for module in $SC_ALL_MODULES; do
+        SC_MODULE_STATUS[$module]=not-run
+        SC_MODULE_REASON[$module]=''
+        SC_MODULE_RC[$module]=''
+        SC_MODULE_VERSION[$module]=''
+    done
+    for module in ${1:-$SC_ALL_MODULES}; do
+        case $module in rkhunter|lynis|integrity|aur|aur-health) SC_SELECTED+=("$module");; *) return 2;; esac
+    done
+    SC_INCOMPLETE=1 SC_COMPLETED=0 SC_URGENT=0 SC_REVIEW=0 SC_SUGGESTIONS=0
+    SC_ASSESSMENT=unknown
+    SC_HEALTH_NOTE=''
 }
 
-status_ok()   { echo -e "${GREEN}  ✔  ${1}${RESET}"; }
-status_warn() { echo -e "${YELLOW}  ⚠  ${1}${RESET}"; }
-status_err()  { echo -e "${RED}  ✖  ${1}${RESET}"; }
-status_info() { echo -e "${CYAN}  ➤  ${1}${RESET}"; }
-
-severity_color() {
-    case "$1" in
-        high)   printf '%s' "$RED"    ;;
-        medium) printf '%s' "$YELLOW" ;;
-        low)    printf '%s' "$CYAN"   ;;
-        *)      printf '%s' "$DIM"    ;;
-    esac
+sc_module_set() {
+    local module=$1 status=$2 reason=${3-}
+    case $module in rkhunter|lynis|integrity|aur|aur-health) ;; *) return 2;; esac
+    case $status in not-run|running|completed|partial|failed|skipped) ;; *) return 2;; esac
+    SC_MODULE_STATUS[$module]=$status
+    SC_MODULE_REASON[$module]=$reason
 }
 
-think() {
-    printf "${DIM}  %s " "$1"
-    for _ in 1 2 3; do printf "."; sleep 0.4; done
-    echo -e "${RESET}"
-}
-
-log() {
-    [[ -n "$LOG_FILE" ]] && echo "[$(date '+%H:%M:%S')] $*" >> "$LOG_FILE"
-}
-
-log_classified() {
-    local severity="$1" category="$2" message="$3" hint="$4" raw="$5"
-    [[ -z "$LOG_FILE" ]] && return
-    {
-        echo "  [${severity}] [${category}]"
-        echo "    Message : ${message}"
-        echo "    Hint    : ${hint}"
-        echo "    Raw     : ${raw}"
-    } >> "$LOG_FILE"
-}
-
-# =============================================================================
-#  BANNER
-# =============================================================================
-show_banner() {
-    clear
-    # SEC = rosso bold, CHECK = bianco bold
-    local SR="\033[1;31m"   # rosso bold
-    local SW="\033[1;37m"   # bianco bold
-    local R="\033[0m"
-    echo ""
-    echo -e "  ${SR}███████╗███████╗ ██████╗${R} ${SW}██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗${R}"
-    echo -e "  ${SR}██╔════╝██╔════╝██╔════╝${R} ${SW}██╔════╝██║  ██║██╔════╝██╔════╝██║ ██╔╝${R}"
-    echo -e "  ${SR}███████╗█████╗  ██║     ${R} ${SW}██║     ███████║█████╗  ██║     █████╔╝ ${R}"
-    echo -e "  ${SR}╚════██║██╔══╝  ██║     ${R} ${SW}██║     ██╔══██║██╔══╝  ██║     ██╔═██╗ ${R}"
-    echo -e "  ${SR}███████║███████╗╚██████╗${R} ${SW}╚██████╗██║  ██║███████╗╚██████╗██║  ██╗${R}"
-    echo -e "  ${SR}╚══════╝╚══════╝ ╚═════╝${R} ${SW} ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝${R}"
-    echo -e "${RESET}"
-    echo -e "  ${CYAN}${BOLD}Security & Integrity Checker for Arch Linux${RESET}  ${DIM}v${VERSION} | KlodCripta${RESET}"
-    [[ "${SECCHECK_DEBUG:-0}" == "1" ]] && echo -e "  ${YELLOW}${BOLD}  ⚑  DEBUG MODE ACTIVE — SECCHECK_DEBUG=1${RESET}" || true
-    separator
-    echo ""
-}
-
-# =============================================================================
-#  CHECK ROOT — auto-riesecuzione con sudo
-# =============================================================================
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo ""
-        status_warn "Privilegi di root richiesti / Root privileges required"
-        narrate \
-            "Re-launching automatically with sudo..." \
-            "Rilancio automatico con sudo..."
-        echo ""
-        exec sudo "$0" "$@"
-    fi
-}
-
-# =============================================================================
-#  CHECK DISTRO — solo Arch Linux e derivate
-# =============================================================================
-check_distro() {
-    separator
-    narrate \
-        "Checking system compatibility..." \
-        "Verifico la compatibilità del sistema..."
-    echo ""
-
-    local distro_id=""
-    local distro_name="Unknown"
-
-    if [[ -f /etc/os-release ]]; then
-        distro_id=$(grep "^ID=" /etc/os-release | cut -d= -f2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
-        distro_name=$(grep "^PRETTY_NAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
-        local id_like=""
-        id_like=$(grep "^ID_LIKE=" /etc/os-release | cut -d= -f2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
-
-        # Verifica Arch o derivate (EndeavourOS, Manjaro, Garuda, CachyOS, ecc.)
-        if [[ "$distro_id" == "arch" ]] || \
-           [[ "$id_like" == *"arch"* ]] || \
-           command -v pacman &>/dev/null; then
-            status_ok "Compatible system${RESET} ${ITALIC}${DIM}/ Sistema compatibile: ${distro_name}"
-            log "System: ${distro_name} (id: ${distro_id})"
-            echo ""
+sc_add_finding() {
+    local module=$1 kind=$2 priority=$3 confidence=$4 object=$5 key=$6 evidence=$7 i
+    case $module in rkhunter|lynis|integrity|aur|aur-health) ;; *) return 2;; esac
+    case $priority in urgent|review|suggestion) ;; *) return 2;; esac
+    object=$(sc_text "$object")
+    evidence=$(sc_text "$evidence")
+    # Compare array elements: do not evaluate untrusted associative subscripts.
+    for ((i=0; i<${#SC_F_MODULE[@]}; i++)); do
+        if [[ ${SC_F_MODULE[i]} == "$module" && ${SC_F_KEY[i]} == "$key" &&
+              ${SC_F_OBJECT[i]} == "$object" && ${SC_F_EVIDENCE[i]} == "$evidence" ]]; then
             return 0
         fi
+    done
+    SC_F_MODULE+=("$module") SC_F_KIND+=("$kind") SC_F_PRIORITY+=("$priority")
+    SC_F_CONFIDENCE+=("$confidence") SC_F_OBJECT+=("$object")
+    SC_F_KEY+=("$key") SC_F_EVIDENCE+=("$evidence")
+}
+
+sc_assess() {
+    local module priority
+    SC_COMPLETED=0 SC_INCOMPLETE=0 SC_URGENT=0 SC_REVIEW=0 SC_SUGGESTIONS=0
+    for module in "${SC_SELECTED[@]}"; do
+        if [[ ${SC_MODULE_STATUS[$module]} == completed ]]; then
+            ((SC_COMPLETED+=1))
+        else
+            SC_INCOMPLETE=1
+        fi
+    done
+    ((${#SC_SELECTED[@]})) || SC_INCOMPLETE=1
+    for priority in "${SC_F_PRIORITY[@]}"; do
+        case $priority in urgent) ((SC_URGENT+=1));; review) ((SC_REVIEW+=1));;
+            suggestion) ((SC_SUGGESTIONS+=1));; esac
+    done
+    if ((SC_URGENT)); then SC_ASSESSMENT=urgent
+    elif ((SC_REVIEW)); then SC_ASSESSMENT=review
+    elif ((SC_SUGGESTIONS)); then SC_ASSESSMENT=advice
+    elif ((SC_INCOMPLETE)); then SC_ASSESSMENT=unknown
+    else SC_ASSESSMENT=clear
     fi
-
-    # Distro non supportata
-    echo ""
-    status_err "Sistema non supportato / Unsupported system"
-    narrate \
-        "SecCheck officially supports only Arch Linux and Arch-based distributions." \
-        "SecCheck supporta ufficialmente solo Arch Linux e le sue derivate."
-    narrate \
-        "Detected system: ${distro_name}" \
-        "Sistema rilevato: ${distro_name}"
-    echo ""
-    exit 0
 }
 
-# =============================================================================
-#  LOG SETUP — chiamato solo prima di una scansione
-# =============================================================================
-setup_log() {
-    mkdir -p "$LOG_DIR" || {
-        echo -e "${RED}  ✖  Impossibile creare ${LOG_DIR}${RESET}" >&2
-        exit 1
-    }
-    chmod 700 "$LOG_DIR" 2>/dev/null || true
-    : > "$LOG_FILE" || {
-        echo -e "${RED}  ✖  Impossibile creare il file log: ${LOG_FILE}${RESET}" >&2
-        exit 1
-    }
-    chmod 600 "$LOG_FILE" 2>/dev/null || true
-    {
-        echo "=============================================="
-        echo "  SECCHECK Security Report — v${VERSION}"
-        echo "  Date   : $(date '+%A %d %B %Y, %H:%M:%S')"
-        echo "  Host   : $(hostnamectl --static 2>/dev/null || hostname 2>/dev/null || uname -n)"
-        echo "  Kernel : $(uname -r)"
-        echo "  User   : $(whoami)"
-        echo "=============================================="
-        echo ""
-    } >> "$LOG_FILE"
+# ---- Scanner boundaries: fixed locale, private output, bounded execution -----
+sc_capture() {
+    local output=$1 errors=$2 seconds=$3
+    shift 3
+    LC_ALL=C timeout --kill-after=5s "${seconds}s" "$@" <&- >"$output" 2>"$errors"
 }
 
-# =============================================================================
-#  DIPENDENZE — solo rkhunter e lynis (repo ufficiali Arch)
-# =============================================================================
-check_deps() {
-    separator
-    narrate \
-        "Checking for required security tools..." \
-        "Verifico la presenza degli strumenti necessari..."
-    echo ""
+sc_version() {
+    local value
+    value=$(LC_ALL=C timeout 5 "$@" 2>/dev/null) || true
+    sc_text "${value%%$'\n'*}"
+}
 
-    local missing=()
-    command -v rkhunter &>/dev/null || missing+=("rkhunter")
-    command -v lynis    &>/dev/null || missing+=("lynis")
-    # pacman è sempre disponibile su Arch — nessun controllo necessario
+sc_parse_rkhunter() {
+    local line lower key priority object
+    SC_PARSE_UNKNOWN=0
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line#\[??:??:??\] }
+        lower=${line,,}
+        # Examine findings before descriptive prefixes; [ Warning ] is significant.
+        if [[ $lower == *warning:* || $lower == *'[ warning ]'* || $lower == *'[warning]'* ||
+              $lower == *'[ infected ]'* || $lower == *'infected file'* ]]; then
+            key=rkh_warning priority=review object=''
+            case $lower in
+                *'possible rootkit'*|*'rootkit found'*|*'infected file'*|*'[ infected ]'*)
+                    key=rkh_signature; priority=urgent;;
+                *'properties have changed'*|*'hash value'*|*'hash changed'*) key=rkh_properties;;
+            esac
+            # A display hint, never an executable argument or proof of file identity.
+            if [[ $line =~ (/[^[:space:]]+) ]]; then object=${BASH_REMATCH[1]}; fi
+            sc_add_finding rkhunter suspicious "$priority" unconfirmed "$object" "$key" "$line"
+        fi
+        if [[ $lower == *'test skipped'* || $lower == *'skipped due to'* || $lower == *'[ skipped ]'* ]]; then
+            SC_PARSE_UNKNOWN=1
+        fi
+    done < "$1"
+}
 
-    if [[ ${#missing[@]} -eq 0 ]]; then
-        status_ok "rkhunter — found  ${ITALIC}${DIM}/ trovato"
-        status_ok "lynis    — found  ${ITALIC}${DIM}/ trovato"
-        status_ok "pacman   — available  ${ITALIC}${DIM}/ disponibile"
-        echo ""
+sc_run_rkhunter() {
+    if ! command -v rkhunter >/dev/null; then sc_module_set rkhunter skipped missing_rkhunter; return 0; fi
+    sc_module_set rkhunter running ''
+    SC_MODULE_VERSION[rkhunter]=$(sc_version rkhunter --version)
+    local out="$SC_RUN_DIR/rkhunter.stdout" err="$SC_RUN_DIR/rkhunter.stderr"
+    local raw="$SC_RUN_DIR/rkhunter.log" parsed rc unknown=0 before=${#SC_F_MODULE[@]}
+    sc_capture "$out" "$err" 1200 rkhunter --check --nocolors --sk --lang en --logfile "$raw"
+    rc=$?; SC_MODULE_RC[rkhunter]=$rc
+    parsed=$out
+    [[ -s $raw ]] && parsed=$raw
+    sc_parse_rkhunter "$parsed"
+    unknown=$SC_PARSE_UNKNOWN
+    # Both streams can contain unique evidence. Neither may erase uncertainty.
+    if [[ $parsed != "$out" ]]; then
+        sc_parse_rkhunter "$out"
+        SC_PARSE_UNKNOWN=$((SC_PARSE_UNKNOWN || unknown))
+    fi
+    if ((rc <= 1)) && grep -Eq 'System checks summary|Info: End date is' "$parsed" "$out"; then
+        if [[ -s $err ]] || ((SC_PARSE_UNKNOWN)) || ((rc == 1 && ${#SC_F_MODULE[@]} == before)); then
+            sc_module_set rkhunter partial check_details
+        else sc_module_set rkhunter completed ''; fi
+    elif [[ -s $out || -s $raw ]]; then sc_module_set rkhunter partial unfinished
+    else sc_module_set rkhunter failed command_failed
+    fi
+}
+
+sc_parse_lynis() {
+    local line value id description details solution _remainder priority key
+    SC_PARSE_UNKNOWN=0
+    while IFS= read -r line || [[ -n $line ]]; do
+        case $line in
+            'warning[]='*) priority=review; key=lynis_warning;;
+            'suggestion[]='*) priority=suggestion; key=lynis_suggestion;;
+            *) continue;;
+        esac
+        value=${line#*=}
+        IFS='|' read -r id description details solution _remainder <<< "$value"
+        if [[ -z $id || -z $description || $value != *'|'* ]]; then SC_PARSE_UNKNOWN=1; continue; fi
+        sc_add_finding lynis hardening "$priority" observation "$id" "$key" \
+            "$description${details:+ | $details}${solution:+ | $solution}"
+    done < "$1"
+}
+
+sc_run_lynis() {
+    if ! command -v lynis >/dev/null; then sc_module_set lynis skipped missing_lynis; return 0; fi
+    sc_module_set lynis running ''
+    SC_MODULE_VERSION[lynis]=$(sc_version lynis --version)
+    local out="$SC_RUN_DIR/lynis.stdout" err="$SC_RUN_DIR/lynis.stderr"
+    local report="$SC_RUN_DIR/lynis-report.dat" rc
+    sc_capture "$out" "$err" 1200 lynis audit system --quick --no-colors --quiet \
+        --logfile "$SC_RUN_DIR/lynis.log" --report-file "$report"
+    rc=$?; SC_MODULE_RC[lynis]=$rc
+    if [[ ! -s $report ]]; then sc_module_set lynis failed no_report; return 0; fi
+    sc_parse_lynis "$report"
+    if ((rc == 0 || rc == 78)) && ((SC_PARSE_UNKNOWN == 0)) &&
+        grep -q '^lynis_version=' "$report" && grep -q '^report_datetime_start=' "$report" &&
+        grep -q '^report_datetime_end=.' "$report" && [[ ! -s $err ]]; then
+        sc_module_set lynis completed ''
+    else sc_module_set lynis partial unfinished
+    fi
+}
+
+sc_parse_integrity() {
+    local line lower object detail key mode=${2:-pacman}
+    local re_pacman='^(warning: |backup file: )?[^:]+: (/.+) \((.*)\)$'
+    local re_paccheck="^[^:]+: '(.+)' (.*)$"
+    SC_PARSE_SEEN=0 SC_PARSE_UNKNOWN=0 SC_PARSE_ERRORS=0
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ -z $line ]] && continue
+        lower=${line,,}; object='' detail=''
+        if [[ $lower == *'error:'* || $lower == *'read error'* || $lower == *'mtree data not available'* ||
+              $lower == *'error reading mtree'* || $lower == *'permission denied'* ]]; then
+            SC_PARSE_ERRORS=1
+        fi
+        if [[ $line =~ $re_pacman ]]; then
+            object=${BASH_REMATCH[2]}; detail=${BASH_REMATCH[3]}
+        elif [[ $line =~ $re_paccheck ]]; then
+            object=${BASH_REMATCH[1]}; detail=${BASH_REMATCH[2]}
+        elif [[ $line =~ ^[^:]+:\ [0-9]+\ total\ files?,\ [0-9]+\ altered\ files?$ ||
+                $line == *': all files match mtree sha256sums' || $line == *': all files present and unmodified' ]]; then
+            ((SC_PARSE_SEEN+=1)); continue
+        else
+            SC_PARSE_UNKNOWN=1; continue
+        fi
+        ((SC_PARSE_SEEN+=1))
+        key=integrity_metadata
+        case ${detail,,} in
+            *'missing file'*|*'no such file'*) key=integrity_missing;;
+            *'sha256sum mismatch'*) key=integrity_content;;
+        esac
+        sc_add_finding integrity integrity review observation "$object" "$key" "$mode: $line"
+    done < "$1"
+}
+
+sc_run_integrity() {
+    if ! command -v pacman >/dev/null; then sc_module_set integrity skipped missing_pacman; return 0; fi
+    sc_module_set integrity running ''
+    SC_MODULE_VERSION[integrity]=$(sc_version pacman --version)
+    local rc partial=0 out="$SC_RUN_DIR/pacman.stdout" err="$SC_RUN_DIR/pacman.stderr"
+    local before=${#SC_F_MODULE[@]} seen unknown errors
+    sc_capture "$out" "$err" 1200 pacman -Qkk
+    rc=$?; SC_MODULE_RC[integrity]="pacman=$rc"
+    cat -- "$out" "$err" > "$SC_RUN_DIR/pacman-combined.txt"
+    sc_parse_integrity "$SC_RUN_DIR/pacman-combined.txt" pacman
+    seen=$SC_PARSE_SEEN unknown=$SC_PARSE_UNKNOWN errors=$SC_PARSE_ERRORS
+    if ((rc > 1 || seen == 0 || unknown || errors || (rc == 1 && ${#SC_F_MODULE[@]} == before))); then partial=1; fi
+    if ! command -v paccheck >/dev/null; then
+        sc_module_set integrity partial missing_paccheck
         return 0
     fi
+    out="$SC_RUN_DIR/paccheck.stdout" err="$SC_RUN_DIR/paccheck.stderr"
+    before=${#SC_F_MODULE[@]}
+    sc_capture "$out" "$err" 1800 paccheck --sha256sum --require-mtree --backup
+    rc=$?; SC_MODULE_RC[integrity]+=" paccheck=$rc"
+    cat -- "$out" "$err" > "$SC_RUN_DIR/paccheck-combined.txt"
+    sc_parse_integrity "$SC_RUN_DIR/paccheck-combined.txt" paccheck
+    if ((rc > 1 || SC_PARSE_SEEN == 0 || SC_PARSE_UNKNOWN || SC_PARSE_ERRORS ||
+         (rc == 1 && ${#SC_F_MODULE[@]} == before))); then partial=1; fi
+    if ((partial)); then sc_module_set integrity partial check_details
+    else sc_module_set integrity completed ''; fi
+    SC_SCOPE+=("integrity: pacman metadata + paccheck SHA-256 against local package MTREE; includes backup files; excludes NoExtract/NoUpgrade")
+}
 
-    status_warn "Strumenti mancanti / Missing tools:"
-    for pkg in "${missing[@]}"; do
-        echo -e "    ${YELLOW}→ ${pkg}${RESET}"
-    done
-    echo ""
-    narrate \
-        "Both tools are available in the official Arch Linux repositories." \
-        "Entrambi i tool sono disponibili nei repository ufficiali di Arch Linux."
-    echo ""
+# ---- Atomic Arch: static, bounded inspection, no code from scanned files ------
+sc_aur_init() {
+    SC_AUR_PARTIAL=0 SC_AUR_COUNT=0 SC_AUR_ROOT_COUNT=0
+    SC_AUR_MAX_FILES=20000 SC_AUR_TEXT_LIMIT=2097152 SC_AUR_SECONDS=180
+    SC_AUR_STARTED=$SECONDS
+    SC_AUR_PACKAGE_RE='(^|[^[:alnum:]_.-])(atomic-lockfile|js-digest|lockfile-js)([^[:alnum:]_.-]|$)'
+    declare -ga SC_AUR_HOMES=()
+}
 
-    read -rp "$(echo -e "  ${BOLD}Installo i tool mancanti con pacman? / Install missing tools with pacman? [s/n]: ${RESET}")" answer
-    echo ""
+sc_known_hash() {
+    case ${1,,} in
+        6144d433f8a0316869877b5f834c801251bbb936e5f1577c5680878c7443c98b) return 0;;
+        *) return 1;;
+    esac
+}
 
-    if [[ "$answer" =~ ^[ssSyY]$ ]]; then
-        narrate \
-            "Installing..." \
-            "Procedo con l'installazione..."
-        echo ""
-        if pacman -S --needed --noconfirm "${missing[@]}"; then
-            echo ""
-            status_ok "Installation complete  ${ITALIC}${DIM}/ Installazione completata"
-            log "Installed: ${missing[*]}"
-        else
-            status_err "Installazione fallita / Installation failed"
-            log "ERROR: Failed to install ${missing[*]}"
-            exit 1
-        fi
-    else
-        echo ""
-        narrate \
-            "Installation cancelled. Cannot continue without the required tools." \
-            "Installazione annullata. Impossibile continuare senza i tool richiesti."
-        exit 0
+sc_check_known_file() {
+    local file=$1 size digest
+    [[ -e $file ]] || return 0
+    if [[ -L $file || ! -f $file || ! -r $file ]]; then SC_AUR_PARTIAL=1; return 0; fi
+    size=$(stat -c '%s' -- "$file" 2>/dev/null) || { SC_AUR_PARTIAL=1; return 0; }
+    if ((size > 67108864)); then SC_AUR_PARTIAL=1; return 0; fi
+    digest=$(timeout --kill-after=1s 4s sha256sum -- "$file" 2>/dev/null) || { SC_AUR_PARTIAL=1; return 0; }
+    digest=${digest%% *}
+    if sc_known_hash "$digest"; then
+        sc_add_finding aur suspicious urgent match "$file" aur_hash "SHA256=$digest; Atomic Arch/deps"
     fi
 }
 
-# =============================================================================
-#  PARSER ENGINE — RKHUNTER
-# =============================================================================
-classify_rkhunter_line() {
-    local line="$1"
-    local l lw
-    l="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')"
-    lw="$l"
-    [[ "$lw" == "warning: "* ]] && lw="${lw#warning: }"
-
-    # FASE 1 — descrittive/operative (non sono rilevamenti)
-    case "$lw" in
-        "checking "*|"checking for"*|"checking if"*|\
-        "searching for"*|"performing "*|"running test"*|"running "*|\
-        "testing for "*|"starting "*|"inspection started"*|\
-        "scan running"*|"hash tables"*|"boot process"*)
-            printf 'info|info|Descriptive scan output|Riga descrittiva del controllo in corso\n'
-            return ;;
+sc_inspect_aur_file() {
+    local file=$1 context=${2:-cache} name=${1##*/} data size token executable='' line home candidate=0
+    if [[ -L $file || ! -f $file || ! -r $file ]]; then SC_AUR_PARTIAL=1; return 0; fi
+    case $name in deps|install-deps|linux) sc_check_known_file "$file";; esac
+    if [[ $context == executable ]]; then sc_check_known_file "$file"; return 0; fi
+    case $name in
+        PKGBUILD|install|*.install|package.json|package-lock.json|npm-shrinkwrap.json|bun.lock|*.service|*.desktop|*.log) ;;
+        *) [[ $file == */.npm/_cacache/index-v5/* || $context == startup ]] || return 0;;
     esac
-    case "$l" in
-        *"[ info ]"*|*"info:"*)
-            printf 'info|info|Descriptive scan output|Riga descrittiva\n'
-            return ;;
-    esac
-
-    # FASE 2 — environment/missing/skipped
-    case "$lw" in
-        *"optional application"*|*"not installed"*|"test skipped"*|\
-        *"skipped due to"*|"disabled test"*|*"missing command"*|*"not enabled"*)
-            printf 'info|environment_or_missing_tools|Check incomplete or optional tool missing|Non si tratta di una minaccia ma di un controllo parziale\n'
-            return ;;
-    esac
-
-    # FASE 3 — risultati puliti
-    case "$lw" in
-        *"not found"*|*"none found"*|*"nothing found"*|*"no issues"*|*"[ ok ]"*|*"[ok]"*)
-            printf 'info|clean_or_neutral|No significant anomaly reported by this check|Nessuna azione necessaria\n'
-            return ;;
-    esac
-
-    # FASE 4 — rootkit signature forti
-    case "$lw" in
-        *"warning:"*" rootkit"*|*"possible rootkit"*|*"suspect rootkit"*|\
-        *"rootkit found"*|*"infected:"*|*"infected file detected"*)
-            printf 'high|rootkit_signature|Possible match with a known rootkit signature|Verifica manuale raccomandata: questo risultato non va ignorato\n'
-            return ;;
-    esac
-
-    # FASE 5 — classificazione per famiglia
-    case "$lw" in
-        *"kernel module"*|*"suspicious module"*|*"loaded module"*)
-            printf 'medium|kernel_modules|Kernel module anomaly detected|Non prova da sola una compromissione, ma richiede attenzione\n'
-            return ;;
-        *"hidden file"*|*"hidden files"*|*"hidden directory"*|*"hidden directories"*)
-            printf 'medium|hidden_artifacts|Hidden file or directory detected|La posizione del file è l elemento determinante da valutare\n'
-            return ;;
-        *"promiscuous"*|*"sniffer"*|*"promisc"*)
-            printf 'medium|sniffer_or_promisc|Promiscuous interface or sniffing-related condition detected|Verificare se associata a software di rete noto\n'
-            return ;;
-        *"listening port"*|*"network interface"*|*"suspicious port"*)
-            printf 'medium|network_anomaly|Network service or interface requires identification|Attribuire il servizio a un processo noto prima di trarre conclusioni\n'
-            return ;;
-        *"startup file"*|*"system startup"*|*"init file"*|\
-        *"boot file"*|*"bootloader"*|*"boot sector"*)
-            printf 'medium|startup_config|Startup or boot-related anomaly detected|Area sensibile: controllare se il cambiamento è atteso\n'
-            return ;;
-        *"suspicious string"*|*"suspicious entry"*|*"suspicious file"*)
-            printf 'medium|suspicious_strings|Suspicious content or reference detected|Da solo non prova nulla; verificare nel contesto del sistema\n'
-            return ;;
-        *"file properties have changed"*|*"properties changed"*|\
-        *"hash value"*|*"sha256"*|*"md5"*|\
-        *"command replaced"*|*"script replaced"*)
-            printf 'low|file_properties|System file properties or hashes differ from expected values|Comune dopo aggiornamenti; verificare solo se inatteso\n'
-            return ;;
-        *"permission"*|*"owner"*|*"group changed"*)
-            printf 'low|permissions_ownership|Permissions or ownership differ from expected values|Controllare soprattutto file critici\n'
-            return ;;
-        *"hosts file"*|*"localhost"*|*"dns"*|*"name resolution"*|*"resolv"*)
-            printf 'low|network_config|Network configuration anomaly detected|Verificare configurazione e modifiche recenti\n'
-            return ;;
-        *"warning"*)
-            printf 'medium|heuristic_warning|Generic warning reported by rkhunter|Valutare il contesto; comune su sistemi rolling release\n'
-            return ;;
-    esac
-
-    printf 'info|info|Informational output|Dettaglio registrato nel report completo\n'
-}
-
-adjust_severity_with_context() {
-    local severity="$1" category="$2" raw_line="$3"
-    local l
-    l="$(printf '%s' "$raw_line" | tr '[:upper:]' '[:lower:]')"
-
-    case "$category" in
-        hidden_artifacts)
-            case "$l" in
-                *"/tmp/"*|*"/var/tmp/"*|*"/dev/"*|*"/run/"*|*"/.cache/"*)
-                    [[ "$severity" == "medium" ]] && severity="low" ;;
-                *"/bin/"*|*"/sbin/"*|*"/usr/bin/"*|*"/usr/sbin/"*|*"/etc/"*|*"/boot/"*)
-                    [[ "$severity" == "low" ]] && severity="medium" ;;
-            esac ;;
-        file_properties)
-            case "$l" in
-                *"/bin/login"*|*"/bin/passwd"*|*"/bin/su"*|\
-                *"/usr/bin/passwd"*|*"/usr/bin/sudo"*|*"/usr/bin/doas"*|\
-                *"/usr/sbin/sshd"*|*"/etc/passwd"*|*"/etc/shadow"*|*"/etc/sudoers"*)
-                    [[ "$severity" == "low" ]] && severity="medium" ;;
-            esac ;;
-        network_anomaly|sniffer_or_promisc)
-            case "$l" in
-                *"sshd"*|*"networkmanager"*|*"systemd-resolved"*|\
-                *"dhclient"*|*"dhcpcd"*|*"wpa_supplicant"*)
-                    [[ "$severity" == "medium" ]] && severity="low" ;;
-            esac ;;
-        permissions_ownership)
-            case "$l" in
-                *"/etc/passwd"*|*"/etc/shadow"*|*"/etc/sudoers"*|\
-                *"/etc/ssh"*|*"/boot"*)
-                    [[ "$severity" == "low" ]] && severity="medium" ;;
-            esac ;;
-    esac
-
-    printf '%s\n' "$severity"
-}
-
-# =============================================================================
-#  PARSER ENGINE — LYNIS
-# =============================================================================
-classify_lynis_line() {
-    local line="$1"
-    local l fragment
-    l="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')"
-
-    # Estrae un frammento leggibile dalla riga (rimuove prefissi verbose lynis)
-    # Lynis stampa spesso: "  [WARNING] Description text here"
-    fragment="$(printf '%s' "$line" | sed 's/^[[:space:]]*//' | cut -c1-60)"
-    [[ -z "$fragment" ]] && fragment="$line"
-
-    # Lynis usa [WARNING], [SUGGESTION], [OK], [FOUND], [NOT FOUND]
-    case "$l" in
-        # Risultati puliti
-        *"[ok]"*|*"[ ok ]"*|*"not found"*|*"no issues"*)
-            printf 'info|clean_or_neutral|No issue reported by lynis|Nessuna azione necessaria
-'
-            return ;;
-        # Warning espliciti — include frammento reale
-        *"[warning]"*)
-            printf 'medium|hardening_warning|%s|Verificare la raccomandazione nel report lynis
-' "$fragment"
-            return ;;
-        # Suggerimenti — include frammento reale
-        *"[suggestion]"*)
-            printf 'low|hardening_suggestion|%s|Opportunità di hardening — azione opzionale
-' "$fragment"
-            return ;;
-        # Anomalie/trovato — include frammento reale
-        *"[found]"*|*"found:"*)
-            printf 'medium|hardening_found|%s|Verificare il dettaglio nel report completo
-' "$fragment"
-            return ;;
-        # Righe descrittive/intestazioni
-        *"performing tests"*|*"checking "*|*"starting "*|*"test:"*|        *"---"*|*"==="*)
-            printf 'info|info|Descriptive lynis output|Riga descrittiva
-'
-            return ;;
-    esac
-
-    printf 'info|info|Informational lynis output|Dettaglio nel report completo
-'
-}
-
-# =============================================================================
-#  PARSER ENGINE — PACMAN INTEGRITY (pacman -Qkk)
-# =============================================================================
-classify_pacman_line() {
-    local line="$1"
-    local l
-    l="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')"
-
-    case "$l" in
-        # File mancante
-        *"missing file"*|*"file mancante"*)
-            printf 'medium|integrity_missing|System file missing|Un file di sistema non è presente dove atteso\n'
-            return ;;
-        # Hash/dimensione modificata
-        *"size"*"mismatch"*|*"md5"*"mismatch"*|*"sha256"*"mismatch"*)
-            printf 'medium|integrity_modified|System file modified|Il file differisce dalla versione attesa dal pacchetto\n'
-            return ;;
-        # Warning generico di integrità
-        *"warning"*)
-            printf 'low|integrity_warning|Package integrity warning|Verificare il file segnalato\n'
-            return ;;
-        # Riga con errore esplicito
-        *"error"*)
-            printf 'medium|integrity_error|Package integrity check error|Errore durante la verifica; controllare il file\n'
-            return ;;
-    esac
-
-    # Se la riga contiene il nome di un file con ": " → probabilmente un'anomalia
-    if echo "$l" | grep -q "^[a-z0-9_-]*: /"; then
-        printf 'low|integrity_anomaly|Package file anomaly|Il file potrebbe differire dalla versione del pacchetto\n'
-        return
+    size=$(stat -c '%s' -- "$file" 2>/dev/null) || { SC_AUR_PARTIAL=1; return 0; }
+    if ((size > SC_AUR_TEXT_LIMIT)); then SC_AUR_PARTIAL=1; fi
+    data=$(set -o pipefail; timeout --kill-after=1s 3s head -c "$SC_AUR_TEXT_LIMIT" -- "$file" 2>/dev/null | tr -d '\000') || {
+        SC_AUR_PARTIAL=1; return 0;
+    }
+    if [[ $data =~ $SC_AUR_PACKAGE_RE ]]; then
+        token=${BASH_REMATCH[2]}
+        # Only the token and path are retained, not potentially secret log contents.
+        sc_add_finding aur exposure review observation "$file" aur_reference "$token; scope=$context"
     fi
-
-    printf 'info|info|Informational pacman output|Dettaglio nel report completo\n'
-}
-
-# =============================================================================
-#  REGISTER & PARSE
-# =============================================================================
-register_result() {
-    local source="$1" severity="$2" category="$3"
-    local message="$4" hint="$5" raw="$6"
-
-    # Debug mode: mostra ogni classificazione in tempo reale
-    if [[ "${SECCHECK_DEBUG:-0}" == "1" ]]; then
-        if [[ "$severity" == "info" ]]; then
-            echo -e "  ${DIM}[DBG:${source}] info/${category} → ${raw:0:60}${RESET}" >&2
-        else
-            echo -e "  \033[38;5;208m[DBG:${source}] ${severity}/${category} → ${raw:0:60}\033[0m" >&2
-        fi
-    fi
-
-    if [[ "$severity" == "info" ]]; then
-        (( INFO_COUNT++ )) || true
-        return
-    fi
-
-    case "$severity" in
-        high)   (( HIGH_COUNT++   )) || true ;;
-        medium) (( MEDIUM_COUNT++ )) || true ;;
-        low)    (( LOW_COUNT++    )) || true ;;
-    esac
-
-    case "$category" in
-        rootkit_signature)
-            HAS_ROOTKIT_SIG=1 ;;
-        kernel_modules)
-            # HAS_KERNEL solo se HIGH — un MEDIUM kernel non è conferma sufficiente
-            [[ "$severity" == "high" ]] && HAS_KERNEL=1 ;;
-        hidden_artifacts)
-            HAS_HIDDEN=1 ;;
-        network_anomaly|sniffer_or_promisc)
-            # HAS_NETWORK solo se HIGH — un MEDIUM network non è conferma sufficiente
-            [[ "$severity" == "high" ]] && HAS_NETWORK=1 ;;
-        startup_config)
-            HAS_STARTUP=1 ;;
-        integrity_missing|integrity_modified|integrity_error)
-            HAS_INTEGRITY=1 ;;
-        hardening_warning|hardening_found)
-            HAS_HARDENING=1 ;;
-    esac
-
-    CLASSIFIED_RESULTS+=("${severity}|${category}|${source}|${message}|${hint}")
-    log_classified "$severity" "$category" "$message" "$hint" "$raw"
-}
-
-parse_output() {
-    local source="$1" file="$2"
-
-    while IFS= read -r line; do
-        [[ -z "${line// }" ]] && continue
-
-        local result severity category message hint rest
-        case "$source" in
-            rkhunter) result="$(classify_rkhunter_line "$line")" ;;
-            lynis)    result="$(classify_lynis_line    "$line")" ;;
-            pacman)   result="$(classify_pacman_line   "$line")" ;;
-            *) continue ;;
-        esac
-
-        severity="${result%%|*}";  rest="${result#*|}"
-        category="${rest%%|*}";    rest="${rest#*|}"
-        message="${rest%%|*}"
-        hint="${rest#*|}"
-
-        # Override contestuale (solo per rkhunter)
-        [[ "$source" == "rkhunter" ]] && \
-            severity="$(adjust_severity_with_context "$severity" "$category" "$line")"
-
-        register_result "$source" "$severity" "$category" "$message" "$hint" "$line"
-
-    done < "$file"
-}
-
-# =============================================================================
-#  SEMAFORO — indicatore visivo stato complessivo
-# =============================================================================
-show_traffic_light() {
-    local risk_level="$1"
-
-    # Pallini: ● attivo (colorato), ○ inattivo (grigio)
-    # Posizioni: [verde] [giallo] [arancione] [rosso]
-    local dot_on="●"
-    local dot_off="${DIM}○${RESET}"
-
-    local g y o r label
-
-    case "$risk_level" in
-        clean)
-            g="${GREEN}${dot_on}${RESET}"
-            y="$dot_off" o="$dot_off" r="$dot_off"
-            label="${GREEN}${BOLD}VERDE${RESET}     — sistema in stato coerente"
-            ;;
-        attention)
-            g="$dot_off"
-            y="${YELLOW}${dot_on}${RESET}"
-            o="$dot_off" r="$dot_off"
-            label="${YELLOW}${BOLD}GIALLO${RESET}    — avvisi tecnici da valutare"
-            ;;
-        review)
-            g="$dot_off" y="$dot_off"
-            o="${ORANGE}${dot_on}${RESET}"
-            r="$dot_off"
-            label="${ORANGE}${BOLD}● ARANCIONE${RESET} — alcune anomalie richiedono verifica"
-            ;;
-        relevant_anomaly)
-            g="$dot_off" y="$dot_off" o="$dot_off"
-            r="${RED}${dot_on}${RESET}"
-            label="${RED}${BOLD}ROSSO${RESET}     — anomalia rilevante confermata"
-            ;;
-    esac
-
-    echo -e "  ${DIM}Semaforo sicurezza / Security traffic light${RESET}"
-    echo -e "  ${g}  ${y}  ${o}  ${r}    ${label}"
-}
-
-# =============================================================================
-#  DISPLAY ENGINE — output sintetico a schermo, dettaglio completo nel log
-# =============================================================================
-
-# Conta risultati per fonte (non-info)
-count_results_for() {
-    local source="$1" count=0
-    for entry in "${CLASSIFIED_RESULTS[@]:-}"; do
-        local src rest
-        rest="${entry#*|}"; rest="${rest#*|}"; src="${rest%%|*}"
-        [[ "$src" == "$source" ]] && (( count++ )) || true
-    done
-    printf '%s\n' "$count"
-}
-
-# Stampa massimo N esempi per fonte, con contatore "...and X more"
-# Priorità: high prima, poi medium, poi low
-# Per HIGH rkhunter isolato aggiunge tag [low confidence]
-print_limited_results_for() {
-    local source="$1"
-    local max="${2:-5}"
-    local shown=0 total=0
-
-    total="$(count_results_for "$source")"
-    (( total == 0 )) && return
-
-    # Determina se siamo nel caso HIGH rkhunter isolato (low confidence)
-    local rkh_isolated=0
-    if [[ "$source" == "rkhunter" ]]; then
-        local h_rkh=0 h_other=0
-        for entry in "${CLASSIFIED_RESULTS[@]:-}"; do
-            local sev src rest
-            sev="${entry%%|*}"; rest="${entry#*|}"
-            rest="${rest#*|}";  src="${rest%%|*}"
-            [[ "$sev" != "high" ]] && continue
-            [[ "$src" == "rkhunter" ]] && (( h_rkh++ )) || true
-            [[ "$src" != "rkhunter" ]] && (( h_other++ )) || true
-        done
-        (( h_rkh >= 1 && h_other == 0 && HAS_KERNEL == 0 && HAS_NETWORK == 0 )) && rkh_isolated=1
-    fi
-
-    for sev_filter in high medium low; do
-        for entry in "${CLASSIFIED_RESULTS[@]:-}"; do
-            local sev cat src msg hint rest
-            sev="${entry%%|*}";  rest="${entry#*|}"
-            cat="${rest%%|*}";   rest="${rest#*|}"
-            src="${rest%%|*}";   rest="${rest#*|}"
-            msg="${rest%%|*}";   hint="${rest#*|}"
-            [[ "$src" != "$source" ]] && continue
-            [[ "$sev" != "$sev_filter" ]] && continue
-            (( shown >= max )) && break 2
-            local col confidence_tag=""
-            col="$(severity_color "$sev")"
-            # Aggiunge tag low confidence per HIGH rkhunter isolato
-            if [[ "$sev" == "high" && "$rkh_isolated" == "1" ]]; then
-                # Tag confidence in grigio/dim — NON rosso, non allarmante
-                confidence_tag=" ${DIM}(low confidence — rkhunter only)${RESET}"
-            fi
-            # [HIGH/MEDIUM/LOW] colorato per severity, testo sempre bianco
-            local prefix=""
-            [[ "$sev" == "high" ]]   && prefix=" ✖" || true
-            [[ "$sev" == "medium" ]] && prefix=" ⚠" || true
-            [[ "$sev" == "low" ]]    && prefix=" ↓" || true
-            echo -e "  ${col}${BOLD}[${sev^^}]${prefix}${RESET} ${WHITE}${msg}${RESET}${confidence_tag}"
-            (( shown++ )) || true
-        done
-    done
-
-    local remaining=$(( total - shown ))
-    if (( remaining > 0 )); then
-        echo -e "  ${DIM}...e altri ${remaining} / ...and ${remaining} more (see full report)${RESET}"
-    fi
-}
-
-# Riepilogo sintetico per modulo: contatori + esempi limitati
-print_module_summary() {
-    local source="$1"
-    local label="$2"
-    local max_examples="${3:-3}"
-
-    local h=0 m=0 l=0
-    for entry in "${CLASSIFIED_RESULTS[@]:-}"; do
-        local sev src rest
-        sev="${entry%%|*}"; rest="${entry#*|}"
-        rest="${rest#*|}";  src="${rest%%|*}"
-        [[ "$src" != "$source" ]] && continue
-        case "$sev" in
-            high)   (( h++ )) || true ;;
-            medium) (( m++ )) || true ;;
-            low)    (( l++ )) || true ;;
-        esac
-    done
-
-    local total=$(( h + m + l ))
-
-    if (( total == 0 )); then
-        echo -e "  ${GREEN}✔${RESET}  ${BOLD}${label}${RESET}  ${DIM}Nessuna anomalia / No findings${RESET}"
-        return
-    fi
-
-    # Label modulo in bold bianco, contatori colorati per severity
-    # HIGH=rosso, MEDIUM=giallo, LOW=ciano — colore segue la severity, non il modulo
-    local h_str m_str l_str
-    (( h > 0 )) && h_str="${RED}High: ${h}${RESET}" || h_str="${DIM}High: 0${RESET}"
-    (( m > 0 )) && m_str="${YELLOW}Medium: ${m}${RESET}" || m_str="${DIM}Medium: 0${RESET}"
-    (( l > 0 )) && l_str="${CYAN}Low: ${l}${RESET}" || l_str="${DIM}Low: 0${RESET}"
-    echo -e "  ${BOLD}${WHITE}${label}${RESET}  →  ${h_str}  ${m_str}  ${l_str}"
-    print_limited_results_for "$source" "$max_examples"
-}
-
-# =============================================================================
-#  MODULO 1 — RKHUNTER
-# =============================================================================
-run_rkhunter() {
-    separator
-    echo -e "  ${CYAN}${BOLD}MODULE 1 — rkhunter${RESET}  ${DIM}Anomaly & rootkit analysis  ${ITALIC}/ Analisi anomalie e rootkit${RESET}"
-    separator
-    echo ""
-    narrate \
-        "rkhunter inspects system binaries, kernel modules and configuration" \
-        "rkhunter analizza i binari di sistema, i moduli del kernel e la configurazione"
-    narrate \
-        "for known rootkits, backdoors and anomalies." \
-        "alla ricerca di rootkit, backdoor e anomalie note."
-    echo ""
-
-    narrate \
-        "Updating the threat database before scanning..." \
-        "Aggiorno il database delle minacce prima di procedere..."
-    think "Updating / Aggiornamento"
-    rkhunter --update --nocolors &>/dev/null || true
-    status_ok "Database updated  ${ITALIC}${DIM}/ Database aggiornato"
-    echo ""
-
-    narrate \
-        "Starting scan. This may take a few minutes." \
-        "Avvio la scansione. Potrebbe richiedere qualche minuto."
-    think "Scanning / Scansione in corso"
-
-    TEMP_RKH=$(mktemp /tmp/seccheck_rkh.XXXXXX)
-    log "--- rkhunter START ---"
-    rkhunter --check --nocolors --sk 2>/dev/null > "$TEMP_RKH" || true
-    cat "$TEMP_RKH" >> "$LOG_FILE"
-    log "--- rkhunter END ---"
-
-    parse_output "rkhunter" "$TEMP_RKH"
-
-    echo ""
-    separator
-
-    local total
-    total="$(count_results_for "rkhunter")"
-
-    if (( total == 0 )); then
-        status_ok "Nessun elemento rilevante / No relevant findings"
-        log "rkhunter: CLEAN"
-    else
-        print_limited_results_for "rkhunter" 5
-        if (( total > 0 )); then
-            echo ""
-            echo -e "  ${BOLD}${WHITE}Common warnings after rolling updates may be false positives.${RESET}"
-            echo -e "  ${ITALIC}${DIM}  ↳ Avvisi comuni dopo aggiornamenti rolling possono essere falsi positivi.${RESET}"
-        fi
-        log "rkhunter: ${total} findings"
-    fi
-    echo ""
-}
-
-# =============================================================================
-#  MODULO 2 — LYNIS
-# =============================================================================
-run_lynis() {
-    separator
-    echo -e "  ${CYAN}${BOLD}MODULE 2 — lynis${RESET}  ${DIM}Security audit & hardening  ${ITALIC}/ Audit sicurezza e hardening${RESET}"
-    separator
-    echo ""
-    narrate \
-        "lynis performs a full system audit: configurations, permissions," \
-        "lynis esegue un audit completo del sistema: configurazioni, permessi,"
-    narrate \
-        "active services, kernel parameters and general security posture." \
-        "servizi attivi, parametri del kernel e postura generale di sicurezza."
-    echo ""
-    narrate \
-        "Running in --quick mode to reduce time while maintaining coverage." \
-        "Esecuzione in modalità --quick per ridurre i tempi mantenendo la copertura."
-    think "Auditing / Audit in corso"
-
-    TEMP_LYN=$(mktemp /tmp/seccheck_lyn.XXXXXX)
-    log "--- lynis START ---"
-    lynis audit system --quick --no-colors --quiet 2>/dev/null > "$TEMP_LYN" || true
-    cat "$TEMP_LYN" >> "$LOG_FILE"
-    log "--- lynis END ---"
-
-    parse_output "lynis" "$TEMP_LYN"
-
-    echo ""
-    separator
-
-    local total
-    total="$(count_results_for "lynis")"
-
-    # Conta separatamente warning e suggestions per lynis
-    local lyn_warn=0 lyn_sugg=0
-    for entry in "${CLASSIFIED_RESULTS[@]:-}"; do
-        local sev cat src rest
-        sev="${entry%%|*}"; rest="${entry#*|}"
-        cat="${rest%%|*}";  rest="${rest#*|}"
-        src="${rest%%|*}"
-        [[ "$src" != "lynis" ]] && continue
-        [[ "$cat" == "hardening_warning" || "$cat" == "hardening_found" ]] && (( lyn_warn++ )) || true
-        [[ "$cat" == "hardening_suggestion" ]] && (( lyn_sugg++ )) || true
-    done
-
-    if (( total == 0 )); then
-        status_ok "Nessun elemento rilevante / No relevant findings"
-        log "lynis: CLEAN"
-    else
-        echo -e "  ${YELLOW}Warnings: ${lyn_warn}${RESET}  ${CYAN}Suggestions: ${lyn_sugg}${RESET}"
-        echo ""
-        print_limited_results_for "lynis" 5
-        echo ""
-        echo -e "  ${DIM}I suggerimenti lynis indicano opportunità di hardening, non anomalie critiche.${RESET}"
-        echo -e "  ${DIM}Lynis suggestions indicate hardening opportunities, not critical anomalies.${RESET}"
-        log "lynis: ${total} findings (warn:${lyn_warn} sugg:${lyn_sugg})"
-    fi
-    echo ""
-}
-
-# =============================================================================
-#  MODULO 3 — INTEGRITÀ PACMAN
-# =============================================================================
-run_pacman_integrity() {
-    separator
-    echo -e "  ${CYAN}${BOLD}MODULE 3 — package integrity${RESET}  ${DIM}pacman -Qkk  ${ITALIC}/ Integrità pacchetti${RESET}"
-    separator
-    echo ""
-    narrate \
-        "Checking system file integrity by comparing installed files" \
-        "Verifico l'integrità dei file di sistema confrontando i file installati"
-    narrate \
-        "against package metadata: sizes, hashes and permissions." \
-        "con i metadati dei pacchetti: dimensioni, hash e permessi."
-    echo ""
-    narrate \
-        "This check is Arch-native and requires no external dependencies." \
-        "Questo controllo è nativo Arch e non richiede dipendenze esterne."
-    think "Checking integrity / Verifica integrità"
-
-    TEMP_PAC=$(mktemp /tmp/seccheck_pac.XXXXXX)
-    log "--- pacman integrity START ---"
-    # -Qkk: verifica file con controllo hash (più approfondito di -Qk)
-    # 2>&1 cattura anche gli avvisi su stderr
-    pacman -Qkk 2>&1 | grep -v "^$" > "$TEMP_PAC" || true
-    # Filtra solo le righe con anomalie (esclude i pacchetti OK)
-    grep -v ": all files present and unmodified" "$TEMP_PAC" > "${TEMP_PAC}.filtered" 2>/dev/null || true
-    cat "$TEMP_PAC" >> "$LOG_FILE"
-    log "--- pacman integrity END ---"
-
-    parse_output "pacman" "${TEMP_PAC}.filtered"
-    rm -f "${TEMP_PAC}.filtered"
-
-    echo ""
-    separator
-
-    local total
-    total="$(count_results_for "pacman")"
-
-    # Conta per tipo di anomalia integrità
-    local pac_miss=0 pac_mod=0 pac_other=0
-    for entry in "${CLASSIFIED_RESULTS[@]:-}"; do
-        local sev cat src rest
-        sev="${entry%%|*}"; rest="${entry#*|}"
-        cat="${rest%%|*}";  rest="${rest#*|}"
-        src="${rest%%|*}"
-        [[ "$src" != "pacman" ]] && continue
-        case "$cat" in
-            integrity_missing) (( pac_miss++ )) || true ;;
-            integrity_modified|integrity_error) (( pac_mod++ )) || true ;;
-            *) (( pac_other++ )) || true ;;
-        esac
-    done
-
-    if (( total == 0 )); then
-        status_ok "Integrità verificata / Integrity verified"
-        log "pacman integrity: CLEAN"
-    else
-        [[ $pac_miss  -gt 0 ]] && echo -e "  ${RED}File mancanti / Missing files: ${pac_miss}${RESET}"
-        [[ $pac_mod   -gt 0 ]] && echo -e "  ${YELLOW}File modificati / Modified files: ${pac_mod}${RESET}"
-        [[ $pac_other -gt 0 ]] && echo -e "  ${CYAN}Altri avvisi / Other warnings: ${pac_other}${RESET}"
-        echo ""
-        print_limited_results_for "pacman" 5
-        echo ""
-        echo -e "  ${DIM}Modifiche a file di configurazione sono spesso legittime.${RESET}"
-        echo -e "  ${DIM}Configuration file changes are often legitimate.${RESET}"
-        log "pacman integrity: ${total} findings (miss:${pac_miss} mod:${pac_mod})"
-    fi
-    echo ""
-}
-
-# =============================================================================
-#  RISK CALCULATOR & SUMMARY
-# =============================================================================
-show_summary() {
-    # Calcolo risk level
-    local distinct_medium=0 seen_cats="|"
-    for entry in "${CLASSIFIED_RESULTS[@]:-}"; do
-        local sev cat rest
-        sev="${entry%%|*}"; rest="${entry#*|}"
-        cat="${rest%%|*}"
-        if [[ "$sev" == "medium" && "$seen_cats" != *"|${cat}|"* ]]; then
-            seen_cats="${seen_cats}${cat}|"
-            (( distinct_medium++ )) || true
-        fi
-    done
-
-    local risk_level="clean"
-    local risk_message="Nessuna anomalia significativa rilevata."
-
-    # ── Conta HIGH per fonte ────────────────────────────────────────────────────
-    local high_rkh=0 high_lyn=0 high_pac=0
-    for entry in "${CLASSIFIED_RESULTS[@]:-}"; do
-        local sev src rest
-        sev="${entry%%|*}"; rest="${entry#*|}"
-        rest="${rest#*|}";  src="${rest%%|*}"
-        [[ "$sev" != "high" ]] && continue
-        case "$src" in
-            rkhunter) (( high_rkh++ )) || true ;;
-            lynis)    (( high_lyn++ )) || true ;;
-            pacman)   (( high_pac++ )) || true ;;
-        esac
-    done
-
-    # ── Conta MEDIUM per fonte ────────────────────────────────────────────────
-    local med_rkh=0 med_lyn=0 med_pac=0
-    for entry in "${CLASSIFIED_RESULTS[@]:-}"; do
-        local sev src rest
-        sev="${entry%%|*}"; rest="${entry#*|}"
-        rest="${rest#*|}";  src="${rest%%|*}"
-        [[ "$sev" != "medium" ]] && continue
-        case "$src" in
-            rkhunter) (( med_rkh++ )) || true ;;
-            lynis)    (( med_lyn++ )) || true ;;
-            pacman)   (( med_pac++ )) || true ;;
-        esac
-    done
-
-    # ── REGOLE VERDETTO ───────────────────────────────────────────────────────
-    #
-    # REGOLA 1 — CRITICAL: più HIGH da fonti diverse, o HIGH confermato
-    #   da indicatori forti correlati (kernel + network insieme)
-    #
-    # REGOLA 2 — REVIEW: HIGH rkhunter isolato (nessun altro HIGH,
-    #   nessun flag kernel/network) → probabile falso positivo su Arch.
-    #   I MEDIUM da soli NON promuovono mai a relevant_anomaly.
-    #
-    # REGOLA 3 — REVIEW: combinazioni di MEDIUM da categorie diverse
-    #   su fonti diverse (non solo volume grezzo)
-    #
-    # REGOLA 4 — ATTENTION: solo LOW o MEDIUM generici isolati
-
-    local cross_source_high=$(( (high_rkh > 0 ? 1 : 0) + (high_lyn > 0 ? 1 : 0) + (high_pac > 0 ? 1 : 0) ))
-
-    if (( cross_source_high >= 2 )); then
-        # HIGH confermato da più fonti indipendenti → segnale serio
-        risk_level="relevant_anomaly"
-        risk_message="Anomalie rilevate su più aree del sistema. Analisi manuale necessaria."
-
-    elif (( high_rkh >= 1 || high_lyn >= 1 || high_pac >= 1 )); then
-        # Qualsiasi HIGH da fonte singola su Arch rolling → probabile falso positivo
-        # Non escalare a relevant_anomaly senza conferma da fonti diverse
-        risk_level="review"
-        risk_message="Potential anomaly detected. On Arch this warning may be a false positive — verification recommended."
-
-    elif (( distinct_medium >= 3 )); then
-        # Molte categorie medium diverse su più aree
-        risk_level="review"
-        risk_message="Diversi elementi da verificare in aree distinte del sistema."
-
-    elif (( (med_rkh > 0 ? 1 : 0) + (med_lyn > 0 ? 1 : 0) + (med_pac > 0 ? 1 : 0) >= 2 )); then
-        # MEDIUM su almeno 2 fonti diverse
-        risk_level="review"
-        risk_message="Elementi da verificare rilevati su più moduli."
-
-    elif (( MEDIUM_COUNT >= 1 )); then
-        risk_level="attention"
-        risk_message="Presenti avvisi tecnici da valutare nel contesto del sistema."
-
-    elif (( LOW_COUNT >= 1 )); then
-        risk_level="attention"
-        risk_message="Presenti avvisi tecnici comuni. Verifica consigliata solo se inattesi."
-    fi
-
-    # Contatori per fonte e categoria
-    local rkh_h=0 rkh_m=0 rkh_l=0
-    local lyn_h=0 lyn_m=0 lyn_l=0
-    local pac_h=0 pac_m=0 pac_l=0
-
-    for entry in "${CLASSIFIED_RESULTS[@]:-}"; do
-        local sev src rest
-        sev="${entry%%|*}"; rest="${entry#*|}"
-        rest="${rest#*|}";  src="${rest%%|*}"
-        case "$src" in
-            rkhunter)
-                case "$sev" in
-                    high)   (( rkh_h++ )) || true ;;
-                    medium) (( rkh_m++ )) || true ;;
-                    low)    (( rkh_l++ )) || true ;;
-                esac ;;
-            lynis)
-                case "$sev" in
-                    high)   (( lyn_h++ )) || true ;;
-                    medium) (( lyn_m++ )) || true ;;
-                    low)    (( lyn_l++ )) || true ;;
-                esac ;;
-            pacman)
-                case "$sev" in
-                    high)   (( pac_h++ )) || true ;;
-                    medium) (( pac_m++ )) || true ;;
-                    low)    (( pac_l++ )) || true ;;
-                esac ;;
-        esac
-    done
-
-    echo ""
-    separator
-    echo -e "  ${CYAN}${BOLD}SUMMARY${RESET}  ${ITALIC}${DIM}/ Riepilogo${RESET}"
-    separator
-    echo ""
-
-    # Dashboard sintetica per modulo
-    print_module_summary "rkhunter" "Anomalies & Rootkit" 3
-    echo ""
-    print_module_summary "lynis"    "Hardening & Audit  " 3
-    echo ""
-    print_module_summary "pacman"   "System Integrity   " 3
-    echo ""
-    separator
-
-    # Verdetto visivo — gerarchia colori:
-    # clean      → sfondo verde
-    # attention  → giallo testo (no sfondo)
-    # review     → giallo bold con simbolo ⚠ (no sfondo rosso)
-    # anomaly    → sfondo rosso SOLO per anomalie confermate da più fonti
-    case "$risk_level" in
-        clean)
-            echo -e "  ${BG_GREEN}${BOLD}  ✔  SISTEMA PULITO / SYSTEM CLEAN  ${RESET}" ;;
-        attention)
-            echo -e "  ${YELLOW}${BOLD}  ⚠  ATTENZIONE / ATTENTION  ${RESET}" ;;
-        review)
-            echo -e "  ${YELLOW}${BOLD}  ⚠  ALCUNE ANOMALIE RICHIEDONO VERIFICA / ANOMALIES REQUIRE REVIEW  ${RESET}" ;;
-        relevant_anomaly)
-            echo -e "  ${BG_RED}${BOLD}  ✖  ANOMALIA RILEVANTE / RELEVANT ANOMALY  ${RESET}" ;;
-    esac
-
-    echo ""
-    show_traffic_light "$risk_level"
-    echo ""
-    echo -e "  ${WHITE}${risk_message}${RESET}"
-    # Versione italiana del risk_message in corsivo
-    case "$risk_level" in
-        review)
-            echo -e "  ${ITALIC}${DIM}  ↳ Rilevata una potenziale anomalia. Su Arch questo tipo di avviso può essere un falso positivo — verifica consigliata prima di trarre conclusioni.${RESET}" ;;
-        attention)
-            echo -e "  ${ITALIC}${DIM}  ↳ Presenti avvisi tecnici — verifica consigliata solo se inattesi nel contesto.${RESET}" ;;
-        relevant_anomaly)
-            echo -e "  ${ITALIC}${DIM}  ↳ Anomalie rilevanti rilevate — analisi manuale raccomandata.${RESET}" ;;
-    esac
-    echo ""
-
-    # Messaggio orientativo — sempre dim/neutro, mai colorato in rosso
-    case "$risk_level" in
-        clean)
-            echo -e "  ${DIM}Sistema in stato coerente — nessuna anomalia rilevante.${RESET}" ;;
-        attention)
-            echo -e "  ${DIM}Avvisi tecnici presenti — verifica solo se inattesi.${RESET}" ;;
-        review)
-            echo -e "  ${BOLD}${WHITE}Check the full report to evaluate the flagged elements.${RESET}"
-            echo -e "  ${ITALIC}${DIM}  ↳ Consulta il report completo per valutare gli elementi segnalati.${RESET}"
-            ;;
-        relevant_anomaly)
-            echo -e "  ${DIM}Analisi manuale raccomandata. Verifica le aree segnalate.${RESET}" ;;
-    esac
-
-    echo ""
-    status_info "Full report:  ${ITALIC}${DIM}/ Report completo${RESET}"
-    echo -e "  ${DIM}${LOG_FILE}${RESET}"
-    echo ""
-
-    {
-        echo ""
-        echo "=============================================="
-        echo "  SUMMARY"
-        echo "=============================================="
-        echo "  rkhunter  — High: ${rkh_h}  Medium: ${rkh_m}  Low: ${rkh_l}"
-        echo "  lynis     — High: ${lyn_h}  Medium: ${lyn_m}  Low: ${lyn_l}"
-        echo "  pacman    — High: ${pac_h}  Medium: ${pac_m}  Low: ${pac_l}"
-        echo "  Informational: ${INFO_COUNT}"
-        echo "  Risk level: ${risk_level}"
-        echo "  Verdict: ${risk_message}"
-        echo "  Generated: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "=============================================="
-    } >> "$LOG_FILE"
-
-    # Espone il risk level per la fase 2 — DEVE stare qui, dopo il calcolo
-    SECCHECK_RISK_LEVEL="$risk_level"
-
-    separator
-    echo ""
-}
-
-
-# =============================================================================
-#  FASE 2 — VERIFICA CONTESTUALE GUIDATA
-# =============================================================================
-
-# Analizza un singolo pacchetto con tutti i suoi file sospetti raggruppati
-# Restituisce: 0=ok/falso_positivo 1=da_verificare 2=sospetto
-contextual_check_package() {
-    local pkg="$1"
-    local -a files=("${@:2}")
-
-    echo ""
-    echo -e "  ${BOLD}Package:${RESET}  ${CYAN}${BOLD}${pkg}${RESET}  ${DIM}(${#files[@]} files analyzed  ${ITALIC}/ file analizzati)${RESET}"
-
-    # Verifica integrità del pacchetto con output dettagliato
-    local qkk_out
-    qkk_out="$(pacman -Qkk "$pkg" 2>&1)"
-    local exit_code=$?
-
-    # Conta file totali e alterati
-    local total_files=0 altered_files=0
-    local summary_line
-    summary_line="$(echo "$qkk_out" | grep -E "^[0-9]+ file" | tail -1)"
-    if [[ -n "$summary_line" ]]; then
-        total_files="$(echo "$summary_line" | grep -oP '^\d+')"
-        altered_files="$(echo "$summary_line" | grep -oP '\d+ file (alterati|altered)' | grep -oP '^\d+')"
-        [[ -z "$altered_files" ]] && altered_files=0
-    fi
-
-    # Righe di anomalia reale (escludi riepilogo e righe ok)
-    local real_issues
-    real_issues="$(echo "$qkk_out" | grep -vE         "^[0-9]+ file|all files present|tutti i file|^$|Controllo dei file|Checking files"         | grep -vE "^\s*$" | head -5)"
-
-    local verdict=0   # 0=ok 1=da_verificare 2=sospetto
-
-    if (( altered_files == 0 && exit_code == 0 )); then
-        # Pacchetto completamente integro
-        echo -e "  ${GREEN}✔${RESET}  Integrità verificata — ${total_files} file, 0 alterati"
-        log "  [ctx] ${pkg}: integrity OK (${total_files} files, 0 altered)"
-        verdict=0
-
-    elif (( altered_files == 0 && exit_code != 0 )); then
-        # Exit code non-zero ma 0 file alterati → discrepanze minori (permessi, timestamp)
-        # Comune su Arch dopo aggiornamenti — non è una vera anomalia
-        if [[ -n "$real_issues" ]]; then
-            local issue_type
-            issue_type="$(echo "$real_issues" | head -1 | grep -oiP 'permess|timestamp|mtime|orario|time|size|dimensione' | head -1)"
-            if [[ -n "$issue_type" ]]; then
-                echo -e "  ${DIM}↳  Discrepanza minore (${issue_type}) — comune dopo aggiornamenti Arch${RESET}"
-                log "  [ctx] ${pkg}: minor discrepancy (${issue_type})"
-                verdict=0
-            else
-                echo -e "  ${YELLOW}⚠${RESET}  Discrepanza rilevata — 0 file alterati, dettaglio:"
-                echo -e "  ${DIM}  → $(echo "$real_issues" | head -1)${RESET}"
-                log "  [ctx] ${pkg}: discrepancy, 0 altered: ${real_issues}"
-                verdict=1
-            fi
-        else
-            echo -e "  ${DIM}↳  Verifica completata — nessuna modifica critica rilevata${RESET}"
-            verdict=0
-        fi
-
-    elif (( altered_files > 0 )); then
-        # File realmente modificati
-        echo -e "  ${YELLOW}⚠${RESET}  ${altered_files} file modificati su ${total_files} totali"
-        if [[ -n "$real_issues" ]]; then
-            echo -e "  ${DIM}  → $(echo "$real_issues" | head -2 | tr '
-' ' ')${RESET}"
-        fi
-        log "  [ctx] ${pkg}: ${altered_files} altered files"
-        verdict=2
-    fi
-
-    # Classificazione percorso per i file segnalati
-    local has_config=0 has_binary=0
-    for f in "${files[@]}"; do
-        case "$f" in
-            /etc/*|/usr/share/*|/var/lib/*) has_config=1 ;;
-            /usr/bin/*|/usr/sbin/*|/bin/*|/sbin/*|/usr/lib/*) has_binary=1 ;;
-        esac
-    done
-
-    if (( has_config == 1 && has_binary == 0 )); then
-        echo -e "  ${DIM}↳  File di configurazione — modifiche spesso legittime${RESET}"
-    fi
-
-    # Verdetto contestuale
-    echo ""
-    echo -e "  ${CYAN}${BOLD}Assessment:${RESET}  ${ITALIC}${DIM}/ Valutazione${RESET}"
-    case $verdict in
-        0)
-            echo -e "  ${GREEN}→ Compatibile con comportamento normale${RESET} ${DIM}(probabile falso positivo)${RESET}"
-            log "  [ctx] ${pkg}: assessment = likely false positive"
-            ;;
-        1)
-            echo -e "  ${YELLOW}→ Discrepanza minore rilevata${RESET} ${DIM}— non critica, verifica consigliata solo se inattesa${RESET}"
-            log "  [ctx] ${pkg}: assessment = unconfirmed anomaly"
-            ;;
-        2)
-            echo -e "  ${YELLOW}→ Anomalia da verificare${RESET} ${DIM}— file modificati rispetto al pacchetto installato${RESET}"
-            log "  [ctx] ${pkg}: assessment = anomaly requires verification"
-            ;;
-    esac
-
-    return $verdict
-}
-
-# Funzione principale fase 2
-run_contextual_check() {
-    local risk_level="$1"
-
-    # Attiva solo se ci sono sospetti rilevanti
-    [[ "$risk_level" == "clean" ]] && return 0
-    [[ "$risk_level" == "attention" && $MEDIUM_COUNT -eq 0 ]] && return 0
-
-    echo ""
-    separator
-    echo -e "  ${CYAN}${BOLD}CONTEXTUAL VERIFICATION${RESET}  ${ITALIC}${DIM}/ Verifica contestuale${RESET}"
-    separator
-    echo ""
-    narrate \
-        "Some flagged elements may warrant further investigation." \
-        "Sono stati rilevati elementi che potrebbero meritare approfondimento."
-    narrate \
-        "This analysis checks packages, files and paths involved" \
-        "Questa analisi controlla pacchetti, file e percorsi coinvolti"
-    narrate \
-        "to help you distinguish false positives from real anomalies." \
-        "per aiutarti a distinguere falsi positivi da anomalie reali."
-    echo ""
-
-    read -rp "$(echo -e "  ${BOLD}Run contextual check? / Vuoi eseguire la verifica contestuale? [s/n]: ${RESET}")" answer
-    echo ""
-    if [[ ! "$answer" =~ ^[ssSyY]$ ]]; then
-        echo -e "  ${DIM}Verifica saltata. Consulta il report per i dettagli.${RESET}"
-        echo ""
-        return 0
-    fi
-
-    log "--- CONTEXTUAL CHECK START ---"
-
-    # Contatori contestuali — basati sui verdetti reali di contextual_check_package
-    # Questi SOSTITUISCONO real_altered nel decision engine finale
-    local CTX_OK_COUNT=0
-    local CTX_REVIEW_COUNT=0
-    local CTX_SUSPICIOUS_COUNT=0
-
-    # Contatori medium per fonte (usati nel confidence score)
-    local med_rkh=0 med_pac=0
-    for entry in "${CLASSIFIED_RESULTS[@]:-}"; do
-        local sev src rest
-        sev="${entry%%|*}"; rest="${entry#*|}"; rest="${rest#*|}"; src="${rest%%|*}"
-        [[ "$sev" != "medium" ]] && continue
-        case "$src" in rkhunter) (( med_rkh++ )) || true ;; pacman) (( med_pac++ )) || true ;; esac
-    done
-
-    # ── Raccoglie sospetti rkhunter e raggruppa per pacchetto ─────────────────
-    declare -A pkg_files   # pkg → lista file separati da spazio
-    local rkhunter_paths=()
-
-    if [[ -n "${TEMP_RKH:-}" && -f "$TEMP_RKH" ]]; then
+    if [[ $name == *.service ]]; then
         while IFS= read -r line; do
-            local path
-            path="$(echo "$line" | grep -oP '/[a-zA-Z0-9_/.-]+'                   | grep -E '^/(usr|bin|sbin|lib|etc|opt|boot)' | head -1)"
-            [[ -n "$path" && -e "$path" ]] || continue
-            # Evita duplicati
-            local dup=0
-            for p in "${rkhunter_paths[@]:-}"; do [[ "$p" == "$path" ]] && dup=1; done
-            (( dup == 0 )) && rkhunter_paths+=("$path")
-        done < <(grep -iE "warning|infected|suspicious" "$TEMP_RKH" 2>/dev/null | head -10 || true)
-    fi
-
-    # Raggruppa per pacchetto proprietario
-    for path in "${rkhunter_paths[@]:-}"; do
-        local owner
-        owner="$(pacman -Qo "$path" 2>/dev/null | awk '{print $(NF-1)}')"
-        if [[ -n "$owner" ]]; then
-            pkg_files["$owner"]="${pkg_files[$owner]:-} $path"
-        else
-            pkg_files["__unknown__"]="${pkg_files[__unknown__]:-} $path"
-        fi
-    done
-
-    # ── Analisi sospetti rkhunter per pacchetto ───────────────────────────────
-    if [[ ${#rkhunter_paths[@]} -gt 0 ]]; then
-        echo -e "  ${CYAN}${BOLD}rkhunter suspects analysis${RESET}  ${ITALIC}${DIM}/ Analisi sospetti rkhunter${RESET}"
-        local pkg_count=0
-        for pkg in "${!pkg_files[@]}"; do
-            (( pkg_count >= 4 )) && break
-            local files_str="${pkg_files[$pkg]}"
-            read -ra files_arr <<< "$files_str"
-
-            if [[ "$pkg" == "__unknown__" ]]; then
-                echo ""
-                echo -e "  ${YELLOW}⚠${RESET}  File senza pacchetto proprietario / Files with no owner:"
-                for f in "${files_arr[@]}"; do
-                    [[ -n "$f" ]] && echo -e "  ${DIM}  → ${f}${RESET}"
-                done
-                log "  [ctx] unowned files: ${files_str}"
-                # File senza proprietario → sospetto
-                (( CTX_SUSPICIOUS_COUNT++ )) || true
-            else
-                contextual_check_package "$pkg" "${files_arr[@]}"
-                case $? in
-                    0) (( CTX_OK_COUNT++      )) || true ;;
-                    1) (( CTX_REVIEW_COUNT++  )) || true ;;
-                    2) (( CTX_SUSPICIOUS_COUNT++ )) || true ;;
-                esac
+            if [[ $line =~ ^[[:space:]]*ExecStart[[:space:]]*=[[:space:]]*[-:@+!]*\"([^\"]+)\" ]]; then
+                executable=${BASH_REMATCH[1]}; break
+            elif [[ $line =~ ^[[:space:]]*ExecStart[[:space:]]*=[[:space:]]*[-:@+!]*(/[^[:space:]]+) ]]; then
+                executable=${BASH_REMATCH[1]}; break
             fi
-            (( pkg_count++ )) || true
-        done
-
-        if (( ${#pkg_files[@]} == 0 )); then
-            narrate                 "Nessun percorso specifico estratto dall output rkhunter."                 "No specific paths extracted from rkhunter output."
-            narrate                 "Su Arch i warning rkhunter senza file specifici sono spesso rumore di fondo."                 "On Arch, rkhunter warnings without specific files are often background noise."
+        done <<< "$data"
+        [[ $executable == /var/lib/* || $executable == /home/* || $executable == /root/* ]] && candidate=1
+        for home in "${SC_AUR_HOMES[@]}"; do [[ $executable == "$home/"* ]] && candidate=1; done
+        if ((candidate)); then
+            if grep -Eq '^Restart[[:space:]]*=[[:space:]]*always[[:space:]]*$' <<< "$data" &&
+                grep -Eq '^RestartSec[[:space:]]*=[[:space:]]*30s?[[:space:]]*$' <<< "$data"; then
+                sc_add_finding aur suspicious review unconfirmed "$file" aur_service "ExecStart=$executable; Restart=always; RestartSec=30"
+            fi
+            sc_check_known_file "$executable"
         fi
     fi
+}
 
-    # ── Analisi anomalie pacman -Qkk ─────────────────────────────────────────
-    if [[ -n "${TEMP_PAC:-}" && -f "$TEMP_PAC" ]]; then
-        # Filtra solo righe con anomalie reali (non "X file totali, 0 alterati")
-        local pac_real_issues
-        pac_real_issues="$(grep -vE             "all files present|tutti i file|^[a-z0-9_-]+: [0-9]+ file totali, 0 file|^\s*$"             "$TEMP_PAC" 2>/dev/null | head -6 || true)"
+sc_collect_homes() {
+    local name _password uid _gid _gecos home _shell existing duplicate
+    while IFS=: read -r name _password uid _gid _gecos home _shell; do
+        [[ $uid =~ ^[0-9]+$ && $home == /* ]] || continue
+        ((uid == 0 || (uid >= 1000 && uid < 65534))) || continue
+        duplicate=0
+        for existing in "${SC_AUR_HOMES[@]}"; do [[ $existing == "$home" ]] && duplicate=1; done
+        ((duplicate)) || SC_AUR_HOMES+=("$home")
+    done < "$1"
+}
 
-        if [[ -n "$pac_real_issues" ]]; then
-            echo ""
-            echo -e "  ${CYAN}${BOLD}Package discrepancies detected${RESET}  ${ITALIC}${DIM}/ Discrepanze rilevate${RESET}"
-            echo -e "  ${DIM}Each item will be evaluated contextually — a discrepancy is not necessarily an anomaly.${RESET}"
-            echo -e "  ${ITALIC}${DIM}  ↳ Ogni voce verrà valutata contestualmente — una discrepanza non è necessariamente un'anomalia.${RESET}"
-
-            declare -A pac_pkgs
-            while IFS= read -r issue_line; do
-                [[ -z "${issue_line// }" ]] && continue
-                local ipath
-                ipath="$(echo "$issue_line" | grep -oP '/[a-zA-Z0-9_/.-]+' | head -1)"
-                if [[ -n "$ipath" && -e "$ipath" ]]; then
-                    local iowner
-                    iowner="$(pacman -Qo "$ipath" 2>/dev/null | awk '{print $(NF-1)}')"
-                    [[ -n "$iowner" ]] && pac_pkgs["$iowner"]="${pac_pkgs[$iowner]:-} $ipath"                                       || pac_pkgs["__unknown__"]="${pac_pkgs[__unknown__]:-} $ipath"
-                else
-                    # Riga senza percorso — mostra sinteticamente
-                    echo -e "  ${DIM}→ ${issue_line}${RESET}"
-                    case "${issue_line,,}" in
-                        *"missing"*) echo -e "  ${DIM}  File mancante — verificare se rimosso intenzionalmente${RESET}" ;;
-                        *"size"*|*"md5"*|*"sha256"*) echo -e "  ${DIM}  Hash/dimensione modificato — potrebbe essere file di config${RESET}" ;;
-                    esac
-                fi
-            done <<< "$pac_real_issues"
-
-            local p_count=0
-            for pkg in "${!pac_pkgs[@]}"; do
-                (( p_count >= 3 )) && break
-                read -ra farr <<< "${pac_pkgs[$pkg]}"
-                if [[ "$pkg" == "__unknown__" ]]; then
-                    echo -e "\n  ${YELLOW}⚠${RESET}  File senza proprietario: ${pac_pkgs[$pkg]}"
-                    (( CTX_SUSPICIOUS_COUNT++ )) || true
-                else
-                    contextual_check_package "$pkg" "${farr[@]}"
-                    case $? in
-                        0) (( CTX_OK_COUNT++       )) || true ;;
-                        1) (( CTX_REVIEW_COUNT++   )) || true ;;
-                        2) (( CTX_SUSPICIOUS_COUNT++ )) || true ;;
-                    esac
-                fi
-                (( p_count++ )) || true
-            done
+sc_scan_aur_root() {
+    local root=$1 context=$2 file rc index errors depth
+    [[ -e $root ]] || return 0
+    if ((SC_AUR_COUNT >= SC_AUR_MAX_FILES || SECONDS - SC_AUR_STARTED >= SC_AUR_SECONDS)); then
+        SC_AUR_PARTIAL=1; SC_SCOPE+=("budget exhausted: $(sc_text "$root")"); return 0
+    fi
+    if [[ -L $root || ! -d $root || ! -r $root || ! -x $root ]]; then
+        SC_AUR_PARTIAL=1; SC_SCOPE+=("unreadable/skipped: $(sc_text "$root")"); return 0
+    fi
+    ((SC_AUR_ROOT_COUNT+=1))
+    index="$SC_RUN_DIR/aur-files.$SC_AUR_ROOT_COUNT"
+    errors="$SC_RUN_DIR/aur-find.$SC_AUR_ROOT_COUNT.stderr"
+    # NUL delimiters preserve spaces/newlines. Symlinks are never followed.
+    (set -o pipefail; timeout --kill-after=2s 15s find -P "$root" -maxdepth 12 -type f -print0 2>"$errors" |
+        head -z -n "$((SC_AUR_MAX_FILES+1))") > "$index"
+    rc=$?
+    if ((rc)) || [[ -s $errors ]]; then SC_AUR_PARTIAL=1; fi
+    # find succeeds when maxdepth prunes a directory. Record that bound explicitly.
+    depth="$SC_RUN_DIR/aur-depth.$SC_AUR_ROOT_COUNT"
+    timeout --kill-after=2s 8s find -P "$root" -mindepth 12 -maxdepth 12 -type d -print -quit > "$depth" 2>> "$errors"
+    rc=$?
+    if ((rc)) || [[ -s $errors || -s $depth ]]; then
+        SC_AUR_PARTIAL=1
+        SC_SCOPE+=("depth-bound/unreadable traversal: $(sc_text "$root")")
+    fi
+    SC_SCOPE+=("$context: $(sc_text "$root")")
+    while IFS= read -r -d '' file; do
+        if ((SC_AUR_COUNT >= SC_AUR_MAX_FILES || SECONDS - SC_AUR_STARTED >= SC_AUR_SECONDS)); then
+            SC_AUR_PARTIAL=1; break
         fi
+        ((SC_AUR_COUNT+=1))
+        sc_inspect_aur_file "$file" "$context"
+    done < "$index"
+}
+
+sc_parse_aur_history() {
+    local line data size
+    [[ -f $1 && -r $1 && ! -L $1 ]] || { SC_AUR_PARTIAL=1; return 0; }
+    size=$(stat -c '%s' -- "$1" 2>/dev/null) || { SC_AUR_PARTIAL=1; return 0; }
+    ((size > 16777216)) && SC_AUR_PARTIAL=1
+    data=$(timeout --kill-after=1s 4s head -c 16777216 -- "$1") || { SC_AUR_PARTIAL=1; return 0; }
+    while IFS= read -r line; do
+        if [[ $line =~ ^\[2026-06-(11|12)T[^]]+\].*\[ALPM\]\ (installed|upgraded)\ (gnome-randr-rust|workbench|rtspeccy-git|exodus-wallet-bin)\  ]]; then
+            sc_add_finding aur exposure review observation "${BASH_REMATCH[3]}" aur_history "$line"
+        fi
+    done <<< "$data"
+}
+
+sc_run_aur() {
+    sc_module_set aur running ''
+    sc_aur_init
+    local rc root home target
+    SC_MODULE_VERSION[aur]="Atomic Arch $SC_RULESET"
+    if command -v pacman >/dev/null; then
+        sc_capture "$SC_RUN_DIR/foreign-packages.txt" "$SC_RUN_DIR/foreign-packages.stderr" 30 pacman -Qm
+        rc=$?
+        ((rc <= 1)) && [[ ! -s $SC_RUN_DIR/foreign-packages.stderr ]] || SC_AUR_PARTIAL=1
+    else SC_AUR_PARTIAL=1
     fi
-
-    # ── Correlazione lynis ────────────────────────────────────────────────────
-    local lyn_count
-    lyn_count="$(count_results_for "lynis")"
-    echo ""
-    if (( lyn_count == 0 )); then
-        echo -e "  ${GREEN}✔${RESET}  ${DIM}Lynis non ha rilevato anomalie correlate — riduce la probabilità di compromissione reale.${RESET}"
-        log "  [ctx] lynis: clean — reduces compromise probability"
-    else
-        echo -e "  ${YELLOW}⚠${RESET}  ${DIM}Lynis ha rilevato ${lyn_count} elemento/i — valutare insieme agli altri sospetti.${RESET}"
-        log "  [ctx] lynis: ${lyn_count} correlated findings"
-    fi
-
-    # ── OVERALL ASSESSMENT — basato SOLO sui contatori contestuali ─────────────
-    # Logica a stati pulita: CTX_OK / CTX_REVIEW / CTX_SUSPICIOUS + lynis.
-    # real_altered e HIGH_COUNT non determinano il verdetto finale.
-    echo ""
-    separator
-    echo -e "  ${CYAN}${BOLD}Overall assessment${RESET}  ${ITALIC}${DIM}/ Valutazione complessiva${RESET}"
-    separator
-    echo ""
-
-    local score=0
-    local prob_label="" prob_label_it="" prob_color=""
-    local recommendation_en="" recommendation_it=""
-
-    if (( CTX_SUSPICIOUS_COUNT > 0 && lyn_count > 0 )); then
-        score=75; prob_label="High"; prob_label_it="Alta"; prob_color="$RED"
-        recommendation_en="Act — anomalies corroborated by contextual checks and other modules."
-        recommendation_it="Intervenire — anomalie corroborate dalla verifica contestuale e da altri moduli."
-
-    elif (( CTX_SUSPICIOUS_COUNT > 0 )); then
-        score=45; prob_label="Medium"; prob_label_it="Media"; prob_color="$YELLOW"
-        recommendation_en="Review — suspicious elements found, but without strong cross-confirmation."
-        recommendation_it="Verificare — elementi sospetti rilevati, senza conferma incrociata forte."
-
-    elif (( CTX_REVIEW_COUNT > 0 && lyn_count > 0 )); then
-        score=35; prob_label="Medium"; prob_label_it="Media"; prob_color="$YELLOW"
-        recommendation_en="Review — some elements merit attention."
-        recommendation_it="Verificare — alcuni elementi meritano attenzione."
-
-    elif (( CTX_REVIEW_COUNT > 0 )); then
-        score=20; prob_label="Low"; prob_label_it="Bassa"; prob_color="$GREEN"
-        recommendation_en="Monitor — minor inconsistencies detected, likely non-critical."
-        recommendation_it="Monitorare — rilevate discrepanze minori, probabilmente non critiche."
-
-    else
-        score=10; prob_label="Low"; prob_label_it="Bassa"; prob_color="$GREEN"
-        recommendation_en="No urgent action — findings compatible with normal system behavior."
-        recommendation_it="Nessuna azione urgente — elementi compatibili con il normale comportamento del sistema."
-    fi
-
-    local bar="" filled=$(( score / 10 ))
-    for (( i=0; i<10; i++ )); do
-        (( i < filled )) && bar+="${prob_color}█${RESET}" || bar+="${DIM}░${RESET}"
+    sc_parse_aur_history /var/log/pacman.log
+    for root in /var/lib/pacman/local /usr/lib/node_modules /usr/local/lib/node_modules /tmp /var/tmp; do
+        sc_scan_aur_root "$root" cache
     done
-
-    echo -e "  Confidence score:  ${bar}  ${prob_color}${BOLD}${score}/100${RESET}"
-    echo -e "  ${DIM}(${CTX_OK_COUNT} ok, ${CTX_REVIEW_COUNT} review, ${CTX_SUSPICIOUS_COUNT} suspicious, lynis findings: ${lyn_count})${RESET}"
-    echo ""
-    echo -e "  ${BOLD}${WHITE}Probability of real compromise:${RESET} ${prob_color}${BOLD}${prob_label}${RESET}"
-    echo -e "  ${ITALIC}${DIM}  ↳ Probabilità di compromissione reale: ${prob_label_it}${RESET}"
-    echo ""
-    echo -e "  ${BOLD}${WHITE}Recommendation:${RESET} ${WHITE}${recommendation_en}${RESET}"
-    echo -e "  ${ITALIC}${DIM}  ↳ Raccomandazione: ${recommendation_it}${RESET}"
-    echo ""
-
-    if (( lyn_count == 0 && CTX_SUSPICIOUS_COUNT == 0 )); then
-        echo -e "  ${DIM}Note: on Arch Linux, isolated rkhunter warnings and minor package discrepancies${RESET}"
-        echo -e "  ${DIM}are frequently compatible with false positives or normal post-update changes.${RESET}"
-        echo -e "  ${ITALIC}${DIM}  ↳ Su Arch Linux, avvisi rkhunter isolati e discrepanze minori dei pacchetti${RESET}"
-        echo -e "  ${ITALIC}${DIM}    sono spesso compatibili con falsi positivi o normali modifiche post-aggiornamento.${RESET}"
-    fi
-
-    log "  [ctx] CTX_OK=${CTX_OK_COUNT} CTX_REVIEW=${CTX_REVIEW_COUNT} CTX_SUSPICIOUS=${CTX_SUSPICIOUS_COUNT} lynis=${lyn_count} score=${score}"
-    log "--- CONTEXTUAL CHECK END ---"
-    echo ""
-    separator
-    echo ""
+    for root in /etc/systemd/system /etc/xdg/autostart /etc/cron.d /var/spool/cron; do
+        sc_scan_aur_root "$root" startup
+    done
+    sc_collect_homes /etc/passwd
+    for home in "${SC_AUR_HOMES[@]}"; do
+        for target in .cache/yay .cache/paru .cache/pikaur .cache/pacaur .cache/aura .npm .bun/install/cache .bun/install/global; do
+            sc_scan_aur_root "$home/$target" cache
+        done
+        for target in .config/systemd/user .config/autostart; do sc_scan_aur_root "$home/$target" startup; done
+        sc_scan_aur_root "$home/.local/bin" executable
+    done
+    for root in "${SC_EXTRA_AUR_PATHS[@]-}"; do [[ -n $root ]] && sc_scan_aur_root "$root" cache; done
+    for target in hidden_pids hidden_names hidden_inodes; do
+        if [[ -e /sys/fs/bpf/$target ]]; then
+            sc_add_finding aur suspicious review unconfirmed "/sys/fs/bpf/$target" aur_bpf "$target"
+        fi
+    done
+    SC_SCOPE+=("AUR rules=$SC_RULESET; files=$SC_AUR_COUNT; limit=$SC_AUR_MAX_FILES; max-depth=12; max-text=$SC_AUR_TEXT_LIMIT; time-budget=${SC_AUR_SECONDS}s")
+    SC_SCOPE+=("AUR exclusions: compressed archives, arbitrary project/custom-cache paths (use --aur-path), removed history, live kernel/memory, remote/encrypted/unmounted homes; no execution can be ruled out by an absent artifact")
+    if ((SC_AUR_PARTIAL)); then sc_module_set aur partial bounded_scope
+    else sc_module_set aur completed ''; fi
+    return 0
 }
 
+# ---- Online AUR project health: optional Python stdlib + curl ---------------
+sc_run_aur_health() {
+    SC_HEALTH_NOTE=''
+    if [[ ${SC_OFFLINE:-0} == 1 ]]; then sc_module_set aur-health skipped offline; return 0; fi
+    local tool rc priority key object evidence state note
+    for tool in python3 curl pacman vercmp; do
+        if ! command -v "$tool" >/dev/null; then sc_module_set aur-health skipped missing_health_tools; return 0; fi
+    done
+    sc_module_set aur-health running ''
+    SC_MODULE_VERSION[aur-health]='AUR RPC v5 + public package page'
+    # This path is internal; the CLI deliberately offers no arbitrary root-state path.
+    local state_dir=${SC_STATE_DIR:-/var/lib/seccheck}
+    if [[ -L $state_dir ]]; then sc_module_set aur-health failed health_state; return 0; fi
+    if [[ ! -e $state_dir ]]; then (umask 077; mkdir -- "$state_dir") || { sc_module_set aur-health failed health_state; return 0; }; fi
+    if [[ ! -d $state_dir || $(stat -c '%u' -- "$state_dir") != "$EUID" ]]; then
+        sc_module_set aur-health failed health_state; return 0
+    fi
+    chmod 700 -- "$state_dir" || { sc_module_set aur-health failed health_state; return 0; }
+    timeout --kill-after=5s 300s python3 -I - "$SC_RUN_DIR" "$state_dir" > "$SC_RUN_DIR/aur-health.stdout" 2> "$SC_RUN_DIR/aur-health.stderr" <<'PY'
+import fcntl
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+from html.parser import HTMLParser
 
-# =============================================================================
-#  LEGGI ULTIMO REPORT
-# =============================================================================
-read_last_report() {
-    separator
-    narrate \
-        "Looking for the latest available report..." \
-        "Cerco l'ultimo report disponibile..."
-    echo ""
+run, state = map(pathlib.Path, sys.argv[1:])
+os.umask(0o077)
+started = time.monotonic()
+now = int(time.time())
+partial = False
+findings = []
+notes = []
+package_re = re.compile(r'[A-Za-z0-9@_+.-]{1,255}\Z')
+user_re = re.compile(r'[A-Za-z0-9_.+@-]{1,255}\Z')
 
-    local last
-    last=$(ls -t "${LOG_DIR}"/seccheck_*.log 2>/dev/null | head -1 || true)
+def issue(key, name, evidence, priority='review'):
+    findings.append((priority, key, name, evidence))
 
-    if [[ -z "$last" ]]; then
-        status_warn "Nessun report trovato in ${LOG_DIR} / No reports found in ${LOG_DIR}"
+def load_json(path):
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 8388608:
+        raise ValueError('invalid JSON file')
+    return json.loads(path.read_text())
+
+def text(value):
+    return ''.join(c if c.isprintable() else '?' for c in str(value))
+
+def fetch(url, stem):
+    if time.monotonic() - started > 260:
+        raise ValueError('request budget exhausted')
+    result = subprocess.run(['curl', '--disable', '--proto', '=https', '--tlsv1.2',
+        '--fail', '--silent', '--show-error', '--connect-timeout', '5', '--max-time', '20',
+        '--max-filesize', '2097152', '--header', 'Accept-Language: en-US',
+        '--user-agent', 'SecCheck/2.0 (AUR maintenance check)', url],
+        capture_output=True, timeout=23)
+    (run / (stem + '.raw')).write_bytes(result.stdout[:2097152])
+    (run / (stem + '.stderr')).write_bytes(result.stderr[:65536])
+    if result.returncode or len(result.stdout) > 2097152:
+        raise ValueError('AUR request failed')
+    return result.stdout.decode('utf-8')
+
+class MaintainerRow(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.in_row = self.in_cell = False
+        self.parts = []
+        self.rows = 0
+        self.cells = self.closed_cells = self.closed_rows = 0
+        self.malformed = False
+    def handle_starttag(self, tag, attrs):
+        if tag == 'tr' and 'pkgmaint' in dict(attrs).get('class', '').split():
+            if self.in_row: self.malformed = True
+            self.in_row = True
+            self.rows += 1
+        elif tag == 'td' and self.in_row:
+            if self.in_cell: self.malformed = True
+            self.in_cell = True
+            self.cells += 1
+    def handle_endtag(self, tag):
+        if tag == 'tr':
+            if self.in_row:
+                if self.in_cell: self.malformed = True
+                self.closed_rows += 1
+            self.in_row = self.in_cell = False
+        elif tag == 'td' and self.in_row:
+            if not self.in_cell: self.malformed = True
+            else: self.closed_cells += 1
+            self.in_cell = False
+    def handle_data(self, data):
+        if self.in_cell: self.parts.append(data)
+
+def co_from_page(html, maintainer):
+    parser = MaintainerRow()
+    parser.feed(html)
+    parser.close()
+    value = ' '.join(''.join(parser.parts).split())
+    match = re.fullmatch(r'([^\s()]+)(?:\s*\(([^()]*)\))?', value)
+    if parser.malformed or parser.rows != 1 or parser.closed_rows != 1 or parser.cells != 1 or \
+            parser.closed_cells != 1 or parser.in_row or parser.in_cell or not match or match[1] != (maintainer or 'None'):
+        raise ValueError('maintainer page unavailable or disagrees with RPC')
+    result = [] if not match[2] else [x.strip() for x in match[2].split(',')]
+    if not all(user_re.fullmatch(x) for x in result):
+        raise ValueError('unknown co-maintainer format')
+    return sorted(set(result))
+
+def validate_package(pkg):
+    for key in ('Name', 'PackageBase', 'Version', 'Maintainer', 'LastModified', 'OutOfDate'):
+        if key not in pkg: raise ValueError('missing metadata field: ' + key)
+    for key in ('Name', 'PackageBase'):
+        if not isinstance(pkg[key], str) or not package_re.fullmatch(pkg[key]):
+            raise ValueError('invalid package identity')
+    if not isinstance(pkg['Version'], str) or not re.fullmatch(r'[^\s\x00-\x1f\x7f]{1,255}', pkg['Version']):
+        raise ValueError('invalid version')
+    if pkg['Maintainer'] is not None and (not isinstance(pkg['Maintainer'], str) or not user_re.fullmatch(pkg['Maintainer'])):
+        raise ValueError('invalid maintainer')
+    if type(pkg['LastModified']) is not int or not 0 < pkg['LastModified'] <= now + 86400:
+        raise ValueError('invalid last-modified timestamp')
+    if pkg['OutOfDate'] is not None and (type(pkg['OutOfDate']) is not int or not 0 < pkg['OutOfDate'] <= now + 86400):
+        raise ValueError('invalid out-of-date timestamp')
+    if 'CoMaintainers' in pkg and (not isinstance(pkg['CoMaintainers'], list) or
+            not all(isinstance(x, str) and user_re.fullmatch(x) for x in pkg['CoMaintainers'])):
+        raise ValueError('invalid co-maintainers')
+
+def execute():
+    global partial
+    lock = os.open(state / 'aur-health.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise ValueError('another AUR health scan is updating the baseline')
+    baseline_path = state / 'aur-maintainers.json'
+    baseline = {'schema': 1, 'observed_at': 0, 'packages': {}}
+    first = not baseline_path.exists()
+    if baseline_path.is_symlink(): raise ValueError('unsafe baseline')
+    if not first:
+        baseline = load_json(baseline_path)
+        if baseline.get('schema') != 1 or not isinstance(baseline.get('packages'), dict):
+            raise ValueError('invalid baseline schema')
+        for name, previous in baseline['packages'].items():
+            if not package_re.fullmatch(name) or not isinstance(previous, dict):
+                raise ValueError('invalid baseline package')
+            if previous.get('maintainer') is not None and not user_re.fullmatch(previous['maintainer']):
+                raise ValueError('invalid baseline maintainer')
+            if not isinstance(previous.get('co_maintainers'), list) or not all(
+                    isinstance(x, str) and user_re.fullmatch(x) for x in previous['co_maintainers']):
+                raise ValueError('invalid baseline co-maintainers')
+    result = subprocess.run(['pacman', '-Qm'], capture_output=True, text=True, timeout=30,
+                            env=dict(os.environ, LC_ALL='C'))
+    (run / 'aur-health-inventory.txt').write_text(result.stdout)
+    if result.returncode not in (0, 1) or result.stderr or (result.returncode == 1 and result.stdout.strip()):
+        raise ValueError('foreign package inventory failed')
+    installed = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not package_re.fullmatch(fields[0]):
+            raise ValueError('unknown inventory format')
+        installed[fields[0]] = fields[1]
+    names = sorted(installed)
+    if len(names) > 2000:
+        partial = True
+        notes.append('inventory exceeds 2000-package limit')
+    current = dict(baseline['packages'])
+    observed = {}
+    page_cache = {}
+    for start in range(0, min(len(names), 2000), 50):
+        batch = names[start:start+50]
+        try:
+            data = json.loads(fetch('https://aur.archlinux.org/rpc/v5/info?' +
+                urllib.parse.urlencode([('arg[]', name) for name in batch]), 'aur-rpc.' + str(start//50)))
+            if not isinstance(data, dict) or data.get('version') != 5 or data.get('type') != 'multiinfo' or \
+                    not isinstance(data.get('results'), list) or data.get('resultcount') != len(data['results']):
+                raise ValueError('invalid AUR RPC response')
+            packages = {}
+            for pkg in data['results']:
+                validate_package(pkg)
+                if pkg['Name'] not in batch or pkg['Name'] in packages:
+                    raise ValueError('unexpected or duplicate package identity')
+                packages[pkg['Name']] = pkg
+        except (ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
+            partial = True; notes.append(text(error)); continue
+        for name in batch:
+            if name not in packages:
+                issue('health_removed' if name in baseline['packages'] else 'health_unlisted', name,
+                      'No exact match in a valid AUR RPC response',
+                      'review' if name in baseline['packages'] else 'suggestion')
+                continue
+            pkg = packages[name]
+            maintainer = pkg['Maintainer']
+            if maintainer is None: issue('health_orphan', name, 'AUR Maintainer=null')
+            if pkg['OutOfDate'] is not None: issue('health_flagged', name, 'AUR OutOfDate=' + str(pkg['OutOfDate']))
+            days = max(0, (now - pkg['LastModified']) // 86400)
+            if days >= 365: issue('health_inactive', name, 'LastModified=' + str(pkg['LastModified']) + '; days=' + str(days), 'suggestion')
+            compared = subprocess.run(['vercmp', installed[name], pkg['Version']], capture_output=True, text=True, timeout=5)
+            if compared.returncode or compared.stdout.strip() not in ('-1', '0', '1'):
+                partial = True; notes.append('version comparison failed: ' + name)
+            elif compared.stdout.strip() == '-1':
+                issue('health_upgrade', name, 'installed=' + installed[name] + '; AUR=' + pkg['Version'], 'suggestion')
+            previous = baseline['packages'].get(name)
+            if previous and previous['maintainer'] != maintainer:
+                issue('health_maintainer', name, str(previous['maintainer']) + ' -> ' + str(maintainer) +
+                      '; previous observation=' + str(previous.get('seen_at', baseline.get('observed_at', '?'))))
+            try:
+                if 'CoMaintainers' in pkg:
+                    co = sorted(set(pkg['CoMaintainers']))
+                else:
+                    if pkg['PackageBase'] not in page_cache:
+                        page_cache[pkg['PackageBase']] = fetch('https://aur.archlinux.org/packages/' +
+                            urllib.parse.quote(name, safe=''), 'aur-page.' + str(len(page_cache)))
+                    co = co_from_page(page_cache[pkg['PackageBase']], maintainer)
+                item = dict(base=pkg['PackageBase'], maintainer=maintainer, co_maintainers=co, seen_at=now)
+                previous = baseline['packages'].get(name)
+                if previous:
+                    period = '; previous observation=' + str(previous.get('seen_at', baseline.get('observed_at', '?')))
+                    added = sorted(set(co) - set(previous['co_maintainers']))
+                    removed = sorted(set(previous['co_maintainers']) - set(co))
+                    if added: issue('health_co_added', name, ', '.join(added) + period)
+                    if removed: issue('health_co_removed', name, ', '.join(removed) + period)
+                current[name] = observed[name] = item
+            except (ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
+                partial = True; notes.append(name + ': ' + text(error))
+                observed[name] = dict(base=pkg['PackageBase'], maintainer=maintainer, co_maintainers=None, seen_at=now)
+    (run / 'aur-health-observed.json').write_text(json.dumps(dict(observed_at=now, packages=observed), indent=2) + '\n')
+    if not partial:
+        # A complete snapshot is atomically replaced, never merged from a failed query.
+        fd, temporary = tempfile.mkstemp(prefix='aur-maintainers.', suffix='.next', dir=state)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(dict(schema=1, observed_at=now, packages=current), stream, indent=2)
+            stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
+        os.replace(temporary, baseline_path)
+    notes.append('foreign=' + str(len(names)) + '; AUR observed=' + str(len(observed)) +
+                 '; age-threshold=365 days; max-packages=2000; request-budget=260s; baseline=' +
+                 ('preserved' if partial else 'updated'))
+    return 'health_baseline' if first else 'health_compared'
+
+try:
+    note = execute()
+except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
+    partial = True; note = 'health_unavailable'; notes.append(text(error))
+with (run / 'aur-health-findings.tsv').open('w') as stream:
+    for finding in findings: stream.write('\t'.join(map(text, finding)) + '\n')
+(run / 'aur-health-scope.txt').write_text('\n'.join(map(text, notes)) + '\n')
+print(('partial' if partial else 'completed') + '\t' + note)
+PY
+    rc=$?; SC_MODULE_RC[aur-health]=$rc
+    if [[ -f $SC_RUN_DIR/aur-health-findings.tsv ]]; then
+        while IFS=$'\t' read -r priority key object evidence; do
+            [[ -n $key ]] && sc_add_finding aur-health maintenance "$priority" observation "$object" "$key" "$evidence"
+        done < "$SC_RUN_DIR/aur-health-findings.tsv"
+    fi
+    if ((rc)) || [[ -s $SC_RUN_DIR/aur-health.stderr ]]; then
+        sc_module_set aur-health partial health_unavailable
     else
-        status_info "Report: ${last}"
-        echo ""
-        separator
-        cat "$last"
-        separator
+        IFS=$'\t' read -r state note < "$SC_RUN_DIR/aur-health.stdout"
+        if [[ $state == completed ]]; then sc_module_set aur-health completed ''; SC_HEALTH_NOTE=$note
+        else sc_module_set aur-health partial health_unavailable; fi
     fi
-    echo ""
+    if [[ -r $SC_RUN_DIR/aur-health-scope.txt ]]; then
+        while IFS= read -r evidence; do SC_SCOPE+=("AUR health: $(sc_text "$evidence")"); done < "$SC_RUN_DIR/aur-health-scope.txt"
+    fi
+    return 0
 }
 
-# =============================================================================
-#  RESET SESSION — chiamato prima di ogni scansione
-# =============================================================================
-reset_session() {
-    HIGH_COUNT=0; MEDIUM_COUNT=0; LOW_COUNT=0; INFO_COUNT=0
-    HAS_ROOTKIT_SIG=0; HAS_KERNEL=0; HAS_HIDDEN=0
-    HAS_NETWORK=0; HAS_STARTUP=0; HAS_INTEGRITY=0; HAS_HARDENING=0
-    CLASSIFIED_RESULTS=()
-    SECCHECK_RISK_LEVEL="clean"
-    TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-    LOG_FILE="${LOG_DIR}/seccheck_${TIMESTAMP}.log"
-    setup_log
+# ---- Language: authored explanations, never translate upstream evidence -----
+sc_t() {
+    local en it
+    case $1 in
+        tagline) en='Understand the signals. Choose your next step.'; it="Comprendi i segnali. Scegli il prossimo passo.";;
+        scope) en='READ-ONLY SECURITY CHECKS  /  ARCH LINUX'; it="CONTROLLI DI SICUREZZA  /  ARCH LINUX";;
+        welcome) en='Choose what to check'; it="Scegli cosa controllare";;
+        menu_full) en='Full scan'; it="Scansione completa";;
+        menu_rkhunter) en='Rootkit indicators'; it="Indicatori di rootkit";;
+        menu_lynis) en='System configuration'; it="Configurazione del sistema";;
+        menu_integrity) en='Installed package files'; it="File dei pacchetti installati";;
+        menu_aur) en='AUR / Atomic Arch traces'; it="Tracce AUR / Atomic Arch";;
+        menu_deps) en='Check / install dependencies'; it="Verifica / installa dipendenze";;
+        menu_update) en='Update rkhunter signatures'; it="Aggiorna firme di rkhunter";;
+        menu_demo) en='Explore a sample result'; it="Esplora un risultato di esempio";;
+        exit) en='Exit'; it="Esci";;
+        choose) en='Choice'; it="Scelta";;
+        invalid) en='Choose one of the listed options.'; it="Scegli una delle opzioni indicate.";;
+        scanning) en='Checking'; it="Controllo";;
+        wait) en='Some checks can take several minutes. Ctrl+C stops the scan and keeps its report.'; it="Alcuni controlli richiedono diversi minuti. Ctrl+C interrompe la scansione e conserva il rapporto.";;
+        result) en='YOUR RESULT'; it="IL TUO RISULTATO";;
+        urgent) en='URGENT'; it="URGENTE";;
+        review) en='REVIEW NEEDED'; it="DA VERIFICARE";;
+        advice) en='IMPROVEMENTS AVAILABLE'; it="MIGLIORAMENTI POSSIBILI";;
+        unknown) en='RESULT UNDETERMINED'; it="ESITO NON DETERMINABILE";;
+        clear) en='NO FINDINGS IN THESE CHECKS'; it="NESSUNA SEGNALAZIONE NEI CONTROLLI";;
+        why_urgent) en='A strong indicator needs investigation. A finding alone does not establish that malware ran.'; it="Un indicatore forte richiede attenzione. Una segnalazione, da sola, non dimostra che il malware sia stato eseguito.";;
+        why_review) en='There are changes or traces to explain. They may have a legitimate cause.'; it="Ci sono modifiche o tracce da chiarire. Potrebbero avere una causa legittima.";;
+        why_advice) en='There are software maintenance or configuration suggestions. These are not evidence of an infection.'; it="Ci sono consigli sulla manutenzione del software o sulla configurazione. Non sono prove di infezione.";;
+        why_unknown) en='Some checks could not finish. Missing results cannot establish a clean outcome.'; it="Alcuni controlli non sono terminati. I risultati mancanti non permettono di escludere problemi.";;
+        why_clear) en='No signals were found within the stated scope. This is not a guarantee that the system is safe.'; it="Nessun segnale trovato nei limiti indicati. Questo non garantisce che il sistema sia sicuro.";;
+        coverage) en='COVERAGE'; it="COPERTURA";;
+        complete) en='COMPLETE FOR SELECTED CHECKS'; it="COMPLETA PER I CONTROLLI SCELTI";;
+        incomplete) en='INCOMPLETE'; it="INCOMPLETA";;
+        scope_selected) en='Selected modules only; other modules were not run.'; it="Solo i moduli selezionati; gli altri non sono stati eseguiti.";;
+        scope_full) en='All five modules selected. Each has its own detection limits.'; it="Selezionati tutti e cinque i moduli. Ogni controllo ha limiti propri.";;
+        coverage_note) en='Coverage describes checks completed, not a percentage of security.'; it="La copertura indica i controlli conclusi, non una percentuale di sicurezza.";;
+        module) en='Module'; it="Modulo";;
+        status) en='Status'; it="Stato";;
+        findings) en='Findings'; it="Segnali";;
+        rkhunter) en='Rootkit / rkhunter'; it="Rootkit / rkhunter";;
+        lynis) en='Configuration / Lynis'; it="Configurazione / Lynis";;
+        integrity) en='Package integrity'; it="Integrità pacchetti";;
+        aur) en='AUR / Atomic Arch'; it="AUR / Atomic Arch";;
+        aur-health) en='AUR / Project health'; it="AUR / Manutenzione";;
+        health_network) en='AUR project health sends foreign package names to aur.archlinux.org. Use --offline to skip online metadata.'; it="Il controllo manutenzione invia i nomi dei pacchetti esterni ad aur.archlinux.org. Usa --offline per saltare i dati online.";;
+        offline) en='Online AUR metadata skipped (--offline).'; it="Dati AUR online non consultati (--offline).";;
+        missing_health_tools) en='AUR metadata requires python, curl, pacman and vercmp.'; it="I dati AUR richiedono python, curl, pacman e vercmp.";;
+        health_state) en='Cannot safely open the private AUR comparison history.'; it="Impossibile aprire in sicurezza lo storico privato dei confronti AUR.";;
+        health_unavailable) en='Some AUR metadata or history could not be verified. The previous baseline was preserved; consult the technical report.'; it="Alcuni dati o lo storico AUR non sono verificabili. La base precedente è stata conservata; consulta il rapporto tecnico.";;
+        health_baseline) en='First AUR snapshot recorded. Maintainer changes before this observation are unknown; comparison starts with the next complete scan.'; it="Registrata la prima fotografia AUR. I cambi di maintainer precedenti sono sconosciuti; il confronto inizia dalla prossima scansione completa.";;
+        health_compared) en='AUR maintainers compared with the previous complete scan. Changes are observations, not evidence of malicious intent.'; it="Maintainer AUR confrontati con la precedente scansione completa. I cambi sono osservazioni, non prove di intenzioni malevole.";;
+        health_orphan) en='AUR lists no primary maintainer: this package is orphaned. This differs from an unused local dependency. Check support and consider a maintained alternative if needed.'; it="AUR non indica un maintainer principale: il pacchetto è orfano. Non significa che sia una dipendenza locale inutilizzata. Verifica il supporto e valuta, se serve, un'alternativa mantenuta.";;
+        health_flagged) en='Someone flagged the AUR recipe as out of date. This is a report by a user, not a verified vulnerability or proof that every installed version is obsolete.'; it="La ricetta AUR è segnalata come non aggiornata. È una segnalazione di un utente, non una vulnerabilità verificata o la prova che ogni versione installata sia obsoleta.";;
+        health_upgrade) en='AUR advertises a newer package version than the installed one. Review the build changes before updating. VCS packages may use dynamic versions.'; it="AUR indica una versione del pacchetto più nuova di quella installata. Esamina le modifiche allo script prima di aggiornare. I pacchetti VCS possono usare versioni dinamiche.";;
+        health_inactive) en='The AUR recipe has not changed for at least 365 days. This does not prove abandonment: stable software may need no packaging changes. Check upstream activity and open issues.'; it="La ricetta AUR non cambia da almeno 365 giorni. Questo non prova un abbandono: un software stabile può non richiedere modifiche al pacchetto. Controlla il progetto originale e i problemi aperti.";;
+        health_unlisted) en='This foreign package has no current exact match in AUR. It may be a local/custom package or a renamed/removed package. Its previous AUR presence is unknown.'; it="Questo pacchetto esterno non ha una corrispondenza attuale in AUR. Potrebbe essere locale, personalizzato, rinominato o rimosso. Non e nota la sua eventuale presenza passata su AUR.";;
+        health_removed) en='A previous scan found this package in AUR; the current valid response does not. Check whether it was renamed, merged or deleted before deciding what to do.'; it="Una scansione precedente aveva trovato il pacchetto su AUR; la risposta valida attuale non lo contiene. Verifica se è stato rinominato, unito o eliminato prima di decidere come procedere.";;
+        health_maintainer) en='The primary maintainer differs from the previous observation. Adoption and handovers can be legitimate. Review the package page and recent build-script changes before the next update.'; it="Il maintainer principale è cambiato rispetto all'osservazione precedente. Adozioni e passaggi di gestione possono essere legittimi. Esamina pagina AUR e modifiche recenti allo script prima del prossimo aggiornamento.";;
+        health_co_added) en='New co-maintainers appeared since the previous observation. They can help maintain the build recipe. Review the handover and recent changes; an addition alone is not a threat.'; it="Sono comparsi nuovi co-maintainer dall'osservazione precedente. Possono contribuire alla ricetta del pacchetto. Controlla il passaggio di gestione e le modifiche recenti; l'aggiunta da sola non è una minaccia.";;
+        health_co_removed) en='Co-maintainers from the previous observation are no longer listed. Review the current support situation; removal alone is not malicious.'; it="Alcuni co-maintainer della precedente osservazione non risultano più presenti. Verifica la situazione del supporto; una rimozione da sola non indica un attacco.";;
+        not-run) en='Not selected'; it="Non selezionato";;
+        running) en='Running'; it="In corso";;
+        completed) en='Completed'; it="Completato";;
+        partial) en='Partial'; it="Parziale";;
+        failed) en='Failed'; it="Fallito";;
+        skipped) en='Unavailable'; it="Non disponibile";;
+        missing_rkhunter) en='Install rkhunter to run this module.'; it="Installa rkhunter per eseguire questo modulo.";;
+        missing_lynis) en='Install lynis to run this module.'; it="Installa lynis per eseguire questo modulo.";;
+        missing_pacman) en='pacman is unavailable.'; it="pacman non disponibile.";;
+        missing_paccheck) en='SHA-256 checks unavailable: install pacutils.'; it="Controllo SHA-256 non disponibile: installa pacutils.";;
+        check_details) en='Warnings, read errors or an unknown output format reduced coverage. Read the raw logs.'; it="Avvisi, errori di lettura o un formato inatteso hanno limitato il controllo. Consulta i log originali.";;
+        unfinished) en='The scanner did not report a normal completion.'; it="Lo scanner non ha comunicato una conclusione regolare.";;
+        command_failed) en='The command failed without usable results.'; it="Il comando non ha prodotto risultati utilizzabili.";;
+        no_report) en='The scanner did not produce a usable report.'; it="Lo scanner non ha prodotto un rapporto utilizzabile.";;
+        bounded_scope) en='Some paths or history were unavailable, or a time/file limit was reached.'; it="Alcuni percorsi o lo storico non erano disponibili, oppure e stato raggiunto un limite di tempo o file.";;
+        interrupted) en='Interrupted by the user.'; it="Interrotto dall'utente.";;
+        next) en='WHAT TO DO NEXT'; it="COSA FARE ADESSO";;
+        next_urgent) en='Review the urgent evidence first. Avoid sensitive activity on this system while a strong indicator remains unexplained. Preserve the report and seek qualified help; do not delete files blindly.'; it="Leggi prima le prove delle segnalazioni urgenti. Evita attività sensibili su questo sistema finché un indicatore forte resta da chiarire. Conserva il rapporto e chiedi aiuto qualificato; non cancellare file alla cieca.";;
+        next_review) en='Open the findings and check whether the changes match software you installed or settings you changed. Investigate unexplained executable changes and startup entries before removing anything.'; it="Apri i dettagli e verifica se le modifiche corrispondono a software installati o impostazioni cambiate da te. Approfondisci i cambiamenti inspiegati agli eseguibili e gli avvii automatici prima di rimuovere qualcosa.";;
+        next_advice) en='Read each package or configuration suggestion. Check project status and build changes before updating; preserve settings before editing them.'; it="Leggi i consigli sui pacchetti o sulla configurazione. Verifica lo stato dei progetti e le modifiche agli script prima di aggiornare; conserva le impostazioni prima di cambiarle.";;
+        next_unknown) en='Read the module reasons below. Install missing tools or resolve read errors, then repeat the affected checks.'; it="Leggi le cause indicate per i moduli. Installa gli strumenti mancanti o risolvi gli errori di lettura, poi ripeti i controlli interessati.";;
+        next_clear) en='Keep software current, review AUR build scripts before installation and keep reliable backups.'; it="Mantieni aggiornato il software, controlla gli script AUR prima di installarli e conserva copie affidabili dei tuoi dati.";;
+        incomplete_next) en='Also resolve the incomplete modules: the current result does not cover them fully.'; it="Completa anche i moduli rimasti parziali: il risultato attuale non li copre interamente.";;
+        signals) en='SIGNALS BY PRIORITY'; it="SEGNALI PER PRIORITÀ";;
+        priority_urgent) en='Urgent'; it="Urgenti";;
+        priority_review) en='To review'; it="Da verificare";;
+        priority_suggestion) en='Suggestions'; it="Consigli";;
+        count_note) en='Bars show counts of findings, not likelihood of infection.'; it="Le barre mostrano il numero di segnali, non la probabilità di infezione.";;
+        details) en='FINDING DETAILS'; it="DETTAGLI DELLE SEGNALAZIONI";;
+        none) en='No findings were recorded.'; it="Nessuna segnalazione registrata.";;
+        evidence) en='Source evidence (original language)'; it="Prova dalla fonte (lingua originale)";;
+        object) en='Object'; it="Elemento";;
+        confidence_match) en='Known byte sequence matched'; it="Corrispondenza con byte noti";;
+        confidence_unconfirmed) en='Indicator requiring verification'; it="Indicatore da confermare";;
+        confidence_observation) en='Observation; cause not established'; it="Osservazione; causa da chiarire";;
+        rkh_signature) en='rkhunter reported a possible rootkit signature. It remains unresolved even if package checks pass. Check the exact signature and its context with expert help.'; it="rkhunter segnala una possibile firma di rootkit. Resta da chiarire anche se i pacchetti superano il controllo. Verifica la firma precisa e il contesto con aiuto esperto.";;
+        rkh_properties) en='rkhunter found changed file properties. Updates can cause this, but the change needs checking. Do not reset its baseline before investigating.'; it="rkhunter ha trovato proprietà di file cambiate. Gli aggiornamenti possono causarlo, ma occorre verificare. Non azzerare la base di confronto prima di approfondire.";;
+        rkh_warning) en='rkhunter raised an alert. Read the specific evidence: hidden files and configuration warnings can have legitimate explanations.'; it="rkhunter ha prodotto un avviso. Leggi la prova specifica: file nascosti e avvisi di configurazione possono avere spiegazioni legittime.";;
+        lynis_warning) en='Lynis found a configuration issue. Use its test ID and evidence to decide what to change; this does not independently confirm malware.'; it="Lynis segnala un problema di configurazione. Usa il codice del test e i dettagli per decidere cosa cambiare; questo non conferma da solo la presenza di malware.";;
+        lynis_suggestion) en='Lynis suggests stronger settings. Assess compatibility and the purpose of this machine before applying the suggestion.'; it="Lynis suggerisce impostazioni più robuste. Valuta compatibilità e uso di questo computer prima di applicare il consiglio.";;
+        integrity_metadata) en='Size, permissions or another file property differs from the local package record. This is not a content hash result. Explain the change, especially for executables.'; it="Dimensione, permessi o altre proprietà differiscono dai dati locali del pacchetto. Questo non è un confronto crittografico del contenuto. Chiarisci la modifica, soprattutto per gli eseguibili.";;
+        integrity_content) en='File contents differ from the local package SHA-256 record. Configuration edits can be intentional; an unexplained executable change needs investigation. The package record itself is not proof of trusted provenance.'; it="Il contenuto differisce dallo SHA-256 registrato localmente dal pacchetto. Una configurazione può essere modificata volontariamente; un eseguibile cambiato senza spiegazione richiede attenzione. I dati del pacchetto non ne garantiscono la provenienza.";;
+        integrity_missing) en='A packaged file is missing. Check exclusions, package state and recent changes. Missing does not by itself mean malicious.'; it="Manca un file previsto dal pacchetto. Verifica esclusioni, stato del pacchetto e modifiche recenti. Un file mancante non dimostra da solo un attacco.";;
+        aur_reference) en='A documented campaign package name appears in this file. It may be a cached reference. Check the version, installation history and lifecycle scripts without executing them.'; it="In questo file compare il nome di un pacchetto associato alla campagna. Potrebbe essere un riferimento in cache. Verifica versione, storico e script di installazione senza eseguirli.";;
+        aur_hash) en='This file matches the documented Atomic Arch payload SHA-256. Preserve it as evidence and seek incident-response help. Presence is established; execution is not established by this check.'; it="Questo file corrisponde allo SHA-256 del payload Atomic Arch documentato. Conservalo come prova e chiedi assistenza per analizzare l'incidente. Il controllo ne rileva la presenza, non dimostra l'esecuzione.";;
+        aur_history) en='A package was installed or updated during the reported campaign dates. This is an exposure clue, not proof that this exact build was malicious.'; it="Un pacchetto è stato installato o aggiornato nelle date della campagna. È un indizio di esposizione, non la prova che quella specifica versione fosse malevola.";;
+        aur_service) en='This service resembles a documented persistence pattern. Legitimate services can also match. Review the executable, its owner and installation history without running it.'; it="Questo servizio ricorda uno schema di persistenza documentato. Anche un servizio legittimo può corrispondere. Verifica eseguibile, proprietario e storico senza avviarlo.";;
+        aur_bpf) en='A BPF object has a name reported in the campaign. A name alone is not a rootkit diagnosis. Have its provenance and contents examined.'; it="Un oggetto BPF ha un nome riportato nella campagna. Il nome da solo non identifica un rootkit. Fai verificare provenienza e contenuto.";;
+        file_config) en='Configuration/backup path: an intentional edit is possible, but must be verified.'; it="Percorso di configurazione o backup: la modifica può essere voluta, ma va verificata.";;
+        demo) en='DEMO - INVENTED RESULTS. No system scan was performed.'; it="DEMO - RISULTATI DI ESEMPIO. Nessuna scansione del sistema eseguita.";;
+        report) en='Private report'; it="Rapporto privato";;
+        report_info) en='Reports contain paths and technical logs. Review them before sharing. Root permission is required to read scan reports.'; it="I rapporti contengono percorsi e log tecnici. Controllali prima di condividerli. Per leggere i rapporti delle scansioni servono permessi di root.";;
+        scope_report) en='TECHNICAL SCOPE / ORIGINAL LOGS'; it="AMBITO TECNICO / LOG ORIGINALI";;
+        limits) en='Live checks cannot exclude hidden rootkits, past execution or data theft. AUR checks cover only bundled indicators and listed paths.'; it="I controlli dal sistema avviato non escludono rootkit nascosti, esecuzioni passate o furti di dati. Il modulo AUR copre solo gli indicatori inclusi e i percorsi indicati.";;
+        result_menu) en='1  Findings   2  Full report   3  Repeat scan   0  Main menu'; it="1  Dettagli   2  Rapporto   3  Ripeti scansione   0  Menu";;
+        more) en='More findings are available in the full report.'; it="Le altre segnalazioni sono disponibili nel rapporto completo.";;
+        unsupported) en='Scanning requires Arch Linux or an Arch derivative with pacman.'; it="La scansione richiede Arch Linux o una derivata con pacman.";;
+        root) en='This action requires root. SecCheck will request permission through sudo.'; it="Questa azione richiede root. SecCheck chiederà i permessi tramite sudo.";;
+        need_root) en='Run this command with sudo to scan noninteractively.'; it="Esegui questo comando con sudo per una scansione non interattiva.";;
+        storage_error) en='Cannot create a private report directory. Scan not started.'; it="Impossibile creare una cartella privata per i rapporti. Scansione non avviata.";;
+        save_error) en='Report could not be saved completely. Check free space and permissions.'; it="Rapporto non salvato completamente. Controlla spazio libero e permessi.";;
+        deps) en='TOOLS AND PURPOSE'; it="STRUMENTI E FUNZIONE";;
+        available) en='available'; it="disponibile";;
+        absent) en='missing'; it="mancante";;
+        install_question) en='Install missing scanner packages with pacman? [y/N]'; it="Installare con pacman gli strumenti mancanti? [s/N]";;
+        install_note) en='pacman will show its own transaction confirmation. No AUR helper is used.'; it="pacman mostrerà la propria conferma della transazione. Non viene usato un helper AUR.";;
+        install_failed) en='Installation did not complete.'; it="Installazione non completata.";;
+        signatures_updated) en='rkhunter signatures updated.'; it="Firme di rkhunter aggiornate.";;
+        signatures_current) en='rkhunter signatures are already current.'; it="Le firme di rkhunter sono già aggiornate.";;
+        signatures_failed) en='Signature update failed. Read the saved update log.'; it="Aggiornamento delle firme fallito. Consulta il log salvato.";;
+        language_needed) en='Use --lang en or --lang it for noninteractive use.'; it="Usa --lang en o --lang it per l'uso non interattivo.";;
+        usage) en='Usage:'; it="Uso:";;
+        batch_usage) en='Batch scans: exit 0=no review/urgent findings, 1=findings, 2=incomplete; other codes=setup error.'; it="Scansioni CLI: uscita 0=nessun segnale urgente/da verificare, 1=segnali, 2=incompleta; altri codici=errore iniziale.";;
+        *) en=$1; it=$1;;
+    esac
+    local value=$en
+    [[ ${SC_LANG:-en} != it ]] || value=$it
+    if [[ ${SC_ASCII:-0} == 1 ]]; then sc_ascii_text "$value"; else printf '%s' "$value"; fi
 }
 
-# =============================================================================
-#  MENU
-# =============================================================================
-show_menu() {
-    echo ""
-    separator
-    echo -e "  ${CYAN}${BOLD}MAIN MENU${RESET}  ${ITALIC}${DIM}/ Menu principale${RESET}"
-    separator
-    echo -e "  ${ORANGE}[1]${RESET}  ${BOLD}Full scan${RESET}  ${ITALIC}${DIM}/ Scansione completa${RESET}"
-    echo -e "       ${DIM}rkhunter + lynis + pacman integrity${RESET}"
-    echo -e "  ${ORANGE}[2]${RESET}  ${BOLD}rkhunter only${RESET}  ${ITALIC}${DIM}/ Solo rkhunter${RESET}"
-    echo -e "  ${ORANGE}[3]${RESET}  ${BOLD}lynis only${RESET}  ${ITALIC}${DIM}/ Solo lynis${RESET}"
-    echo -e "  ${ORANGE}[4]${RESET}  ${BOLD}Package integrity${RESET}  ${ITALIC}${DIM}/ Integrità pacchetti (pacman -Qkk)${RESET}"
-    echo -e "  ${ORANGE}[5]${RESET}  ${BOLD}Read last report${RESET}  ${ITALIC}${DIM}/ Leggi ultimo report${RESET}"
-    echo -e "  ${ORANGE}[0]${RESET}  ${BOLD}Exit${RESET}  ${ITALIC}${DIM}/ Esci${RESET}"
-    separator
-    echo ""
-    read -rp "$(echo -e "  ${BOLD}Choice / Scelta: ${RESET}")" MENU_CHOICE
-    echo ""
+sc_ascii_text() {
+    local value=$1
+    value=${value//à/a}; value=${value//è/e}; value=${value//é/e}; value=${value//ì/i}
+    value=${value//ò/o}; value=${value//ù/u}; value=${value//À/A}; value=${value//È/E}; value=${value//’/\'}
+    printf '%s' "$value" | LC_ALL=C tr '\200-\377' '?'
 }
 
-# =============================================================================
-#  MAIN
-# =============================================================================
-main() {
-    show_banner
-    check_root "$@"
-    check_distro
-    check_deps
+# ---- Petrolio terminal rendering: no cursor tricks, real counts only --------
+sc_ui_init() {
+    SC_WIDTH=${COLUMNS:-80}
+    if [[ -t 1 ]] && command -v tput >/dev/null; then SC_WIDTH=$(tput cols 2>/dev/null) || SC_WIDTH=80; fi
+    [[ $SC_WIDTH =~ ^[0-9]{1,4}$ ]] || SC_WIDTH=80
+    ((SC_WIDTH < 24)) && SC_WIDTH=24
+    ((SC_WIDTH > 120)) && SC_WIDTH=120
+    SC_C_PRIMARY='' SC_C_MUTED='' SC_C_RED='' SC_C_AMBER='' SC_C_GREEN='' SC_C_RESET='' SC_C_BOLD=''
+    if [[ -t 1 && ${TERM:-dumb} != dumb && ${SC_NO_COLOR:-0} == 0 && ! ${NO_COLOR+x} ]]; then
+        SC_C_RESET=$'\e[0m' SC_C_BOLD=$'\e[1m'
+        SC_C_PRIMARY=$'\e[38;5;80m' SC_C_MUTED=$'\e[38;5;109m'
+        SC_C_RED=$'\e[38;5;203m' SC_C_AMBER=$'\e[38;5;222m' SC_C_GREEN=$'\e[38;5;114m'
+        if [[ ${COLORTERM:-} == truecolor || ${COLORTERM:-} == 24bit ]]; then
+            SC_C_PRIMARY=$'\e[38;2;122;205;216m' SC_C_MUTED=$'\e[38;2;140;168;185m'
+        fi
+    fi
+    SC_RULE_CHAR='─' SC_BAR_CHAR='━' SC_EMPTY_CHAR='─' SC_DOT='●'
+    if [[ ${SC_ASCII:-0} == 1 || ${TERM:-} == dumb || ${LC_ALL:-${LC_CTYPE:-${LANG:-C}}} != *[Uu][Tt][Ff]* ]]; then
+        SC_ASCII=1; SC_RULE_CHAR='-' SC_BAR_CHAR='#' SC_EMPTY_CHAR='.' SC_DOT='*'
+    fi
+}
 
-    while true; do
-        show_menu
-        case "$MENU_CHOICE" in
-            1)
-                reset_session
-                run_rkhunter
-                run_lynis
-                run_pacman_integrity
-                show_summary
-                run_contextual_check "$SECCHECK_RISK_LEVEL"
-                ;;
-            2)
-                reset_session
-                run_rkhunter
-                show_summary
-                run_contextual_check "$SECCHECK_RISK_LEVEL"
-                ;;
-            3)
-                reset_session
-                run_lynis
-                show_summary
-                run_contextual_check "$SECCHECK_RISK_LEVEL"
-                ;;
-            4)
-                reset_session
-                run_pacman_integrity
-                show_summary
-                run_contextual_check "$SECCHECK_RISK_LEVEL"
-                ;;
-            5)
-                read_last_report
-                ;;
-            0)
-                echo ""
-                narrate \
-                    "Exiting SecCheck. Keep your system safe." \
-                    "Uscita da SecCheck. Tieni il tuo sistema sotto controllo."
-                echo ""
-                exit 0
-                ;;
-            *)
-                status_warn "Scelta non valida / Invalid choice"
-                ;;
+sc_repeat() { local i; for ((i=0;i<$2;i++)); do printf '%s' "$1"; done; }
+
+sc_line() {
+    local value=${1-} color=${2-} word line='' width=$((SC_WIDTH-4))
+    value=$(sc_text "$value")
+    if [[ ${SC_ASCII:-0} == 1 ]]; then value=$(sc_ascii_text "$value"); fi
+    local -a words=()
+    read -r -a words <<< "$value"
+    for word in "${words[@]}"; do
+        if ((${#line}+${#word}+1 > width)) && [[ -n $line ]]; then
+            printf '  %s%s%s\n' "$color" "$line" "$SC_C_RESET"; line=''
+        fi
+        while ((${#word} > width)); do
+            printf '  %s%s%s\n' "$color" "${word:0:width}" "$SC_C_RESET"; word=${word:width}
+        done
+        [[ -z $word ]] || line+="${line:+ }$word"
+    done
+    [[ -z $line ]] || printf '  %s%s%s\n' "$color" "$line" "$SC_C_RESET"
+}
+
+sc_rule() { printf '  %s' "$SC_C_MUTED"; sc_repeat "$SC_RULE_CHAR" "$((SC_WIDTH-4))"; printf '%s\n' "$SC_C_RESET"; }
+sc_cell() { printf '%s%*s' "$1" "$(( $2 - ${#1} ))" ''; }
+sc_heading() { printf '\n'; sc_line "$(sc_t "$1")" "$SC_C_PRIMARY$SC_C_BOLD"; sc_rule; }
+sc_header() {
+    printf '\n'; sc_rule
+    sc_line "S E C C H E C K   /   $SC_VERSION" "$SC_C_PRIMARY$SC_C_BOLD"
+    sc_line "$(sc_t scope)" "$SC_C_MUTED"
+    sc_rule; sc_line "$(sc_t tagline)"; printf '\n'
+    [[ ${SC_DEMO:-0} == 0 ]] || sc_line "$(sc_t demo)" "$SC_C_AMBER"
+}
+
+sc_status_color() {
+    case $1 in urgent|failed) printf '%s' "$SC_C_RED";; review|advice|partial) printf '%s' "$SC_C_AMBER";;
+        clear|completed) printf '%s' "$SC_C_GREEN";; *) printf '%s' "$SC_C_MUTED";; esac
+}
+
+sc_render_summary() {
+    local module count i color label bar total=${#SC_SELECTED[@]}
+    sc_heading result
+    color=$(sc_status_color "$SC_ASSESSMENT")
+    sc_line "$SC_DOT  $(sc_t "$SC_ASSESSMENT")" "$color$SC_C_BOLD"
+    sc_line "$(sc_t "why_$SC_ASSESSMENT")"
+    sc_heading coverage
+    if ((SC_INCOMPLETE)); then label=$(sc_t incomplete); color=$SC_C_MUTED
+    else label=$(sc_t complete); color=$SC_C_PRIMARY; fi
+    sc_line "$SC_COMPLETED/$total  $label" "$color"
+    bar="$(sc_repeat "$SC_BAR_CHAR" "$SC_COMPLETED")$(sc_repeat "$SC_EMPTY_CHAR" "$((total-SC_COMPLETED))")"
+    sc_line "[$bar]" "$color"
+    if ((total < 5)); then sc_line "$(sc_t scope_selected)"; else sc_line "$(sc_t scope_full)"; fi
+    sc_line "$(sc_t coverage_note)" "$SC_C_MUTED"
+    printf '\n'
+    if ((SC_WIDTH >= 64)); then
+        printf '  %s%-24s %-17s %7s%s\n' "$SC_C_MUTED" "$(sc_t module)" "$(sc_t status)" "$(sc_t findings)" "$SC_C_RESET"
+        sc_rule
+    fi
+    for module in $SC_ALL_MODULES; do
+        count=0
+        for i in "${SC_F_MODULE[@]}"; do [[ $i == "$module" ]] && ((count+=1)); done
+        color=$(sc_status_color "${SC_MODULE_STATUS[$module]}")
+        if ((SC_WIDTH >= 64)); then
+            printf '  '; sc_cell "$(sc_t "$module")" 24; printf ' %s' "$color"
+            sc_cell "$(sc_t "${SC_MODULE_STATUS[$module]}")" 17; printf '%s %7d\n' "$SC_C_RESET" "$count"
+        else
+            sc_line "$(sc_t "$module")" "$SC_C_PRIMARY"
+            sc_line "$(sc_t "${SC_MODULE_STATUS[$module]}") / $(sc_t findings): $count" "$color"
+        fi
+        [[ -z ${SC_MODULE_REASON[$module]} ]] || sc_line "$(sc_t "${SC_MODULE_REASON[$module]}")" "$SC_C_MUTED"
+    done
+    [[ -z ${SC_HEALTH_NOTE:-} ]] || sc_line "$(sc_t "$SC_HEALTH_NOTE")" "$SC_C_MUTED"
+    sc_heading signals
+    local max=$SC_URGENT slots=$((SC_WIDTH-29)) n priority
+    ((SC_REVIEW > max)) && max=$SC_REVIEW; ((SC_SUGGESTIONS > max)) && max=$SC_SUGGESTIONS
+    ((slots < 4)) && slots=4; ((slots > 24)) && slots=24
+    for priority in urgent review suggestion; do
+        case $priority in urgent) count=$SC_URGENT;; review) count=$SC_REVIEW;; suggestion) count=$SC_SUGGESTIONS;; esac
+        n=0; ((max)) && n=$(((count*slots+max-1)/max))
+        sc_line "$(sc_t "priority_$priority"): $count  $(sc_repeat "$SC_BAR_CHAR" "$n")" "$(sc_status_color "$priority")"
+    done
+    sc_line "$(sc_t count_note)" "$SC_C_MUTED"
+    sc_heading next
+    sc_line "$(sc_t "next_$SC_ASSESSMENT")"
+    ((SC_INCOMPLETE == 0)) || sc_line "$(sc_t incomplete_next)" "$SC_C_AMBER"
+    sc_line "$(sc_t limits)" "$SC_C_MUTED"
+}
+
+sc_render_details() {
+    local limit=${1:-0} i shown=0 priority object
+    sc_heading details
+    ((${#SC_F_MODULE[@]})) || { sc_line "$(sc_t none)"; return 0; }
+    for priority in urgent review suggestion; do
+        for ((i=0;i<${#SC_F_MODULE[@]};i++)); do
+            [[ ${SC_F_PRIORITY[i]} == "$priority" ]] || continue
+            if ((limit && shown >= limit)); then sc_line "$(sc_t more)"; return 0; fi
+            ((shown+=1)); object=${SC_F_OBJECT[i]}
+            printf '\n'
+            sc_line "#$((i+1)) / $(sc_t "priority_$priority") / $(sc_t "${SC_F_MODULE[i]}")" "$(sc_status_color "$priority")"
+            sc_line "$(sc_t "confidence_${SC_F_CONFIDENCE[i]}")" "$SC_C_MUTED"
+            [[ -z $object ]] || sc_line "$(sc_t object): $object"
+            sc_line "$(sc_t "${SC_F_KEY[i]}")"
+            if [[ ${SC_F_MODULE[i]} == integrity && ( $object == /etc/* || ${SC_F_EVIDENCE[i]} == *'backup file:'* ) ]]; then
+                sc_line "$(sc_t file_config)"
+            fi
+            sc_line "$(sc_t evidence): ${SC_F_EVIDENCE[i]}" "$SC_C_MUTED"
+        done
+    done
+}
+
+# ---- Private run reports ----------------------------------------------------
+sc_prepare_run() {
+    local parent=${1:-/var/log/seccheck} owner
+    [[ ! -L $parent ]] || return 1
+    if [[ ! -e $parent ]]; then (umask 077; mkdir -- "$parent") || return 1; fi
+    [[ -d $parent ]] || return 1
+    owner=$(stat -c '%u' -- "$parent") || return 1
+    [[ $owner == "$EUID" ]] || return 1
+    chmod 700 -- "$parent" || return 1
+    SC_RUN_DIR=$(umask 077; mktemp -d "$parent/run.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX") || return 1
+    SC_STARTED=$(date -u +%FT%TZ)
+}
+
+sc_render_report() {
+    sc_header; sc_render_summary; sc_render_details
+    sc_heading scope_report
+    sc_line "SecCheck=$SC_VERSION; started=${SC_STARTED:-demo}; rules=$SC_RULESET; rules-date=$SC_RULESET_DATE"
+    local module value
+    for module in "${SC_SELECTED[@]}"; do
+        sc_line "$module: version=${SC_MODULE_VERSION[$module]}; exit=${SC_MODULE_RC[$module]}; reason=${SC_MODULE_REASON[$module]}"
+    done
+    for value in "${SC_SCOPE[@]}"; do sc_line "$value"; done
+    sc_line 'Indicator sources: https://ioctl.fail/preliminary-analysis-of-aur-malware/'
+    sc_line 'https://www.sonatype.com/blog/atomic-arch-npm-campaign-adds-malicious-dependency'
+    sc_line "$(sc_t report_info)"
+}
+
+sc_save_report() (
+    umask 077
+    SC_NO_COLOR=1
+    sc_ui_init; SC_WIDTH=100; SC_ASCII=0
+    SC_RULE_CHAR='-' SC_BAR_CHAR='#' SC_EMPTY_CHAR='.' SC_DOT='*'
+    local module i
+    sc_render_report > "$SC_RUN_DIR/report.txt" || return 1
+    {
+        printf 'module\tkind\tpriority\tconfidence\tobject\tkey\tevidence\n'
+        for ((i=0;i<${#SC_F_MODULE[@]};i++)); do
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${SC_F_MODULE[i]}" "${SC_F_KIND[i]}" \
+                "${SC_F_PRIORITY[i]}" "${SC_F_CONFIDENCE[i]}" "${SC_F_OBJECT[i]}" "${SC_F_KEY[i]}" "${SC_F_EVIDENCE[i]}"
+        done
+    } > "$SC_RUN_DIR/findings.tsv" || return 1
+    {
+        printf 'module\tstatus\treason\texit\tversion\n'
+        for module in $SC_ALL_MODULES; do
+            printf '%s\t%s\t%s\t%s\t%s\n' "$module" "${SC_MODULE_STATUS[$module]}" \
+                "${SC_MODULE_REASON[$module]}" "${SC_MODULE_RC[$module]}" "${SC_MODULE_VERSION[$module]}"
+        done
+    } > "$SC_RUN_DIR/modules.tsv" || return 1
+)
+
+# ---- CLI and interactive workflow ------------------------------------------
+sc_is_arch() {
+    local key value
+    [[ -r ${1:-/etc/os-release} ]] || return 1
+    while IFS='=' read -r key value; do
+        value=${value#\"}; value=${value%\"}; value=${value#\'}; value=${value%\'}
+        case $key in
+            ID) [[ $value == arch ]] && return 0;;
+            ID_LIKE) [[ " $value " == *' arch '* ]] && return 0;;
+        esac
+    done < "${1:-/etc/os-release}"
+    return 1
+}
+
+sc_help() {
+    printf '%s bash seccheck.sh [options]\n\n' "$(sc_t usage)"
+    printf '%s\n' '  --lang en|it' '  --scan full|rkhunter|lynis|integrity|aur|aur-health' \
+        '  --aur-path /absolute/path   (repeatable)' '  --offline' '  --no-color' '  --ascii' \
+        '  --demo [review|urgent|incomplete|clean]' '  --help' '  --version'
+    printf '\n%s\n' "$(sc_t batch_usage)"
+    printf '%s\n' "$(sc_t health_network)"
+}
+
+sc_parse_args() {
+    SC_LANG='' SC_SCAN='' SC_DEMO=0 SC_SCENARIO=review SC_NO_COLOR=0 SC_ASCII=0 SC_ACTION='' SC_OFFLINE=0
+    declare -ga SC_EXTRA_AUR_PATHS=()
+    while (($#)); do
+        case $1 in
+            --lang) (($# >= 2)) || return 64; case $2 in en|it) SC_LANG=$2;; *) return 64;; esac; shift;;
+            --scan) (($# >= 2)) || return 64; case $2 in full|rkhunter|lynis|integrity|aur|aur-health) SC_SCAN=$2;; *) return 64;; esac; shift;;
+            --aur-path) (($# >= 2)) && [[ $2 == /* ]] || return 64; SC_EXTRA_AUR_PATHS+=("$2"); shift;;
+            --no-color) SC_NO_COLOR=1;;
+            --offline) SC_OFFLINE=1;;
+            --ascii) SC_ASCII=1;;
+            --demo) SC_DEMO=1
+                if (($# > 1)) && [[ $2 != --* ]]; then
+                    case $2 in review|urgent|incomplete|clean) SC_SCENARIO=$2;; *) return 64;; esac; shift
+                fi;;
+            --help|-h) SC_ACTION=help;;
+            --version) SC_ACTION=version;;
+            --install-tools) SC_ACTION=install;;
+            --update-signatures) SC_ACTION=update;;
+            *) return 64;;
+        esac
+        shift
+    done
+    [[ $SC_DEMO == 0 || ( -z $SC_SCAN && -z $SC_ACTION ) ]] || return 64
+}
+
+sc_choose_language() {
+    local answer
+    printf '\n  S E C C H E C K   /   %s\n\n  1  English\n  2  Italiano\n\n' "$SC_VERSION"
+    while :; do
+        printf '  > '
+        IFS= read -r answer || return 1
+        case $answer in 1) SC_LANG=en; return 0;; 2) SC_LANG=it; return 0;; *) printf '  1 / 2\n';; esac
+    done
+}
+
+sc_elevate() {
+    local action=$1 path
+    local -a args=(--lang "$SC_LANG")
+    case $action in scan) args+=(--scan "$SC_SCAN");; install) args+=(--install-tools);; update) args+=(--update-signatures);; esac
+    [[ ${SC_NO_COLOR:-0} == 0 && ! ${NO_COLOR+x} ]] || args+=(--no-color)
+    [[ ${SC_ASCII:-0} == 0 ]] || args+=(--ascii)
+    [[ ${SC_OFFLINE:-0} == 0 ]] || args+=(--offline)
+    for path in "${SC_EXTRA_AUR_PATHS[@]}"; do args+=(--aur-path "$path"); done
+    path=$(readlink -f -- "${BASH_SOURCE[0]}") || return 77
+    sudo -- bash "$path" "${args[@]}"
+}
+
+sc_require_scan_host() {
+    if ! sc_is_arch || ! command -v pacman >/dev/null; then sc_line "$(sc_t unsupported)"; return 78; fi
+}
+
+sc_demo() {
+    sc_reset
+    local module
+    for module in "${SC_SELECTED[@]}"; do sc_module_set "$module" completed ''; SC_MODULE_VERSION[$module]=demo; done
+    SC_SCOPE=('Demo data only; no commands or filesystem inspection.')
+    case ${1:-review} in
+        clean) ;;
+        incomplete) sc_module_set rkhunter skipped missing_rkhunter; sc_module_set integrity partial missing_paccheck;;
+        urgent)
+            sc_add_finding aur suspicious urgent match /home/example/.cache/sample/deps aur_hash 'DEMO: documented SHA-256 match'
+            sc_module_set rkhunter partial unfinished;;
+        review)
+            sc_add_finding integrity integrity review observation /etc/example.conf integrity_content 'DEMO: SHA-256 differs from local package record'
+            sc_add_finding aur exposure review observation /home/example/.cache/yay/sample/PKGBUILD aur_reference 'DEMO: atomic-lockfile reference'
+            sc_add_finding lynis hardening suggestion observation SSH-DEMO lynis_suggestion 'DEMO: review SSH configuration'
+            sc_add_finding aur-health maintenance review observation example-app health_maintainer 'DEMO: old-owner -> new-owner'
+            sc_add_finding aur-health maintenance suggestion observation example-tool health_inactive 'DEMO: days=420';;
+    esac
+    sc_assess; sc_header; sc_render_summary; sc_render_details 6
+}
+
+sc_update_signatures() {
+    local rc
+    if ! command -v rkhunter >/dev/null; then printf '%s\n' "$(sc_t missing_rkhunter)"; return 1; fi
+    sc_capture "$SC_RUN_DIR/rkhunter-update.stdout" "$SC_RUN_DIR/rkhunter-update.stderr" 300 rkhunter --update --nocolors --lang en
+    rc=$?
+    case $rc in
+        0) printf '%s\n' "$(sc_t signatures_current)";;
+        2) printf '%s\n' "$(sc_t signatures_updated)";;
+        *) printf '%s\n' "$(sc_t signatures_failed)"; return 1;;
+    esac
+}
+
+sc_dependencies() {
+    local tool label answer
+    local -a missing=()
+    sc_heading deps
+    for tool in rkhunter lynis paccheck python3 curl; do
+        label=$(sc_t available)
+        if ! command -v "$tool" >/dev/null; then
+            label=$(sc_t absent)
+            case $tool in paccheck) missing+=(pacutils);; python3) missing+=(python);; *) missing+=("$tool");; esac
+        fi
+        case $tool in rkhunter) sc_line "$tool / $(sc_t menu_rkhunter): $label";;
+            lynis) sc_line "$tool / $(sc_t menu_lynis): $label";;
+            paccheck) sc_line "pacutils (paccheck) / SHA-256: $label";;
+            *) sc_line "$tool / $(sc_t aur-health): $label";; esac
+    done
+    ((${#missing[@]})) || return 0
+    [[ -t 0 ]] || return 1
+    sc_line "$(sc_t install_question)"
+    IFS= read -r answer || return 0
+    case $answer in y|Y|s|S) ;; *) return 0;; esac
+    sc_require_scan_host || return $?
+    if ((EUID != 0)); then sc_line "$(sc_t root)"; sc_elevate install; return $?; fi
+    sc_line "$(sc_t install_note)"
+    pacman -S --needed -- "${missing[@]}" || { sc_line "$(sc_t install_failed)"; return 1; }
+}
+
+sc_abort() {
+    trap - INT TERM
+    local module
+    if [[ ${SC_RUN_ACTIVE:-0} == 1 ]]; then
+        for module in "${SC_SELECTED[@]}"; do
+            [[ ${SC_MODULE_STATUS[$module]} == running || ${SC_MODULE_STATUS[$module]} == not-run ]] && sc_module_set "$module" partial interrupted
+        done
+        sc_assess
+        sc_save_report || printf '%s\n' "$(sc_t save_error)" >&2
+        printf '\n'; sc_line "$(sc_t interrupted)"; sc_line "$(sc_t report): $SC_RUN_DIR/report.txt"
+    fi
+    exit 130
+}
+
+sc_scan_once() {
+    local modules=$SC_SCAN module step=0
+    [[ $modules != full ]] || modules=$SC_ALL_MODULES
+    sc_reset "$modules"
+    sc_prepare_run || { sc_line "$(sc_t storage_error)"; return 73; }
+    SC_RUN_ACTIVE=1
+    trap sc_abort INT TERM
+    sc_header; sc_line "$(sc_t wait)" "$SC_C_MUTED"
+    if [[ $SC_SCAN == full || $SC_SCAN == aur-health ]]; then sc_line "$(sc_t health_network)" "$SC_C_MUTED"; fi
+    for module in "${SC_SELECTED[@]}"; do
+        ((step+=1)); printf '\n'
+        sc_line "[$step/${#SC_SELECTED[@]}] $(sc_t scanning): $(sc_t "$module")" "$SC_C_PRIMARY"
+        case $module in rkhunter) sc_run_rkhunter;; lynis) sc_run_lynis;; integrity) sc_run_integrity;; aur) sc_run_aur;; aur-health) sc_run_aur_health;; esac
+        sc_line "$(sc_t "${SC_MODULE_STATUS[$module]}")" "$(sc_status_color "${SC_MODULE_STATUS[$module]}")"
+    done
+    sc_assess
+    SC_RUN_ACTIVE=0
+    trap - INT TERM
+    sc_render_summary
+    sc_save_report || { sc_line "$(sc_t save_error)"; return 73; }
+    printf '\n'; sc_line "$(sc_t report): $SC_RUN_DIR/report.txt" "$SC_C_PRIMARY"
+    sc_line "$(sc_t report_info)" "$SC_C_MUTED"
+    ((SC_INCOMPLETE == 0)) || return 2
+    ((SC_URGENT == 0 && SC_REVIEW == 0)) || return 1
+    return 0
+}
+
+sc_run_requested() {
+    local rc answer
+    sc_require_scan_host || return $?
+    if ((EUID != 0)); then
+        if [[ ! -t 0 ]]; then printf '%s\n' "$(sc_t need_root)" >&2; return 77; fi
+        sc_line "$(sc_t root)"; sc_elevate scan; return $?
+    fi
+    while :; do
+        sc_scan_once; rc=$?
+        [[ -t 0 && $rc -le 2 ]] || return "$rc"
+        while :; do
+            printf '\n'; sc_line "$(sc_t result_menu)"
+            printf '  > '; IFS= read -r answer || return "$rc"
+            case $answer in
+                1) sc_render_details 20;;
+                2) sc_render_report;;
+                3) break;;
+                0) return "$rc";;
+                *) sc_line "$(sc_t invalid)";;
+            esac
+        done
+    done
+}
+
+sc_menu() {
+    local answer
+    while :; do
+        SC_DEMO=0; sc_header; sc_heading welcome
+        sc_line "$(sc_t health_network)" "$SC_C_MUTED"; printf '\n'
+        sc_line "1  $(sc_t menu_full)" "$SC_C_PRIMARY"
+        sc_line "2  $(sc_t menu_rkhunter)"; sc_line "3  $(sc_t menu_lynis)"
+        sc_line "4  $(sc_t menu_integrity)"; sc_line "5  $(sc_t menu_aur)"
+        printf '\n'; sc_line "6  $(sc_t menu_deps)"; sc_line "7  $(sc_t menu_update)"
+        sc_line "8  $(sc_t menu_demo)"; sc_line "9  $(sc_t aur-health)"; sc_line "0  $(sc_t exit)"
+        printf '\n  %s > ' "$(sc_t choose)"; IFS= read -r answer || return 0
+        case $answer in
+            1) SC_SCAN=full; sc_run_requested;;
+            2) SC_SCAN=rkhunter; sc_run_requested;;
+            3) SC_SCAN=lynis; sc_run_requested;;
+            4) SC_SCAN=integrity; sc_run_requested;;
+            5) SC_SCAN=aur; sc_run_requested;;
+            6) sc_dependencies;;
+            7) sc_update_action;;
+            8) SC_DEMO=1; sc_demo review;;
+            9) SC_SCAN=aur-health; sc_run_requested;;
+            0) return 0;;
+            *) sc_line "$(sc_t invalid)";;
         esac
     done
 }
 
-# Guard: esegue main solo se lanciato direttamente (non con source)
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    main "$@"
-fi
+sc_update_action() {
+    sc_require_scan_host || return $?
+    if ((EUID != 0)); then sc_line "$(sc_t root)"; sc_elevate update; return $?; fi
+    sc_prepare_run || { sc_line "$(sc_t storage_error)"; return 73; }
+    sc_update_signatures
+    local rc=$?
+    sc_line "$(sc_t report): $SC_RUN_DIR"
+    return "$rc"
+}
+
+sc_main() {
+    if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
+        printf 'SecCheck requires Bash 4.4+.\n' >&2; return 64
+    fi
+    set -o pipefail
+    umask 077
+    sc_parse_args "$@" || { printf 'SecCheck: invalid arguments / argomenti non validi. --help\n' >&2; return 64; }
+    case $SC_ACTION in help) sc_help; return 0;; version) printf 'SecCheck %s\n' "$SC_VERSION"; return 0;; esac
+    if [[ -z $SC_LANG ]]; then
+        if [[ -t 0 ]]; then sc_choose_language || return 0
+        else printf '%s\n' "$(sc_t language_needed)" >&2; return 64; fi
+    fi
+    sc_ui_init
+    if ((SC_DEMO)); then sc_demo "$SC_SCENARIO"; return 0; fi
+    case $SC_ACTION in install) sc_dependencies; return $?;; update) sc_update_action; return $?;; esac
+    if [[ -n $SC_SCAN ]]; then sc_run_requested; return $?; fi
+    [[ -t 0 ]] || { sc_help; return 64; }
+    sc_menu
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then sc_main "$@"; fi
