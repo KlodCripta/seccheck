@@ -472,6 +472,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 
 run, state = map(pathlib.Path, sys.argv[1:])
@@ -483,6 +484,8 @@ findings = []
 notes = []
 diagnostics = []
 baseline_note = 'health_not_updated'
+next_request = started
+requests_stopped = False
 package_re = re.compile(r'[A-Za-z0-9@_+.-]{1,255}\Z')
 user_re = re.compile(r'[A-Za-z0-9_.+@-]{1,255}\Z')
 
@@ -500,31 +503,91 @@ def text(value):
 class RequestError(ValueError):
     pass
 
-def fetch(url, stem):
-    if time.monotonic() - started > 260:
-        raise ValueError('request budget exhausted')
-    (run / (stem + '.request.txt')).write_text(url + '\n')
+def http_response(headers_path):
+    status, headers = 0, {}
+    if not headers_path.exists(): return status, headers
+    with headers_path.open('rb') as stream: raw = stream.read(65537)
+    if len(raw) > 65536: raise ValueError('AUR response headers exceed 64 KiB')
+    for line in raw.decode('iso-8859-1').splitlines():
+        match = re.match(r'HTTP/\S+\s+(\d{3})(?:\s|$)', line)
+        if match:
+            # A proxy CONNECT response can precede the actual HTTP response.
+            status, headers = int(match[1]), {}
+        elif ':' in line:
+            key, value = line.split(':', 1)
+            headers[key.lower().strip()] = value.strip()
+    return status, headers
+
+def retry_delay(value):
+    # Respect Retry-After seconds and HTTP dates. Missing/invalid values use a
+    # conservative fallback; never shorten a long server-requested delay.
+    if value.isascii() and value.isdecimal():
+        digits = value.lstrip('0') or '0'
+        # A huge valid integer still requests a long wait; do not let Python's
+        # integer conversion limit turn it into an ignored Retry-After value.
+        if len(digits) > 9: return float('inf')
+        return max(5, int(digits))
     try:
-        result = subprocess.run(['curl', '--disable', '--proto', '=https', '--tlsv1.2',
-            '--fail', '--silent', '--show-error', '--connect-timeout', '5', '--max-time', '20',
-            '--max-filesize', '2097152', '--header', 'Accept-Language: en-US',
-            '--user-agent', 'SecCheck/2.0 (AUR maintenance check)', url],
-            capture_output=True, timeout=23, env=dict(os.environ, LC_ALL='C'))
-        output, errors, code = result.stdout, result.stderr, result.returncode
-    except subprocess.TimeoutExpired as error:
-        output, errors, code = error.stdout or b'', error.stderr or b'', 28
-        errors += b'\nSecCheck: curl exceeded the 23-second process deadline\n'
-    (run / (stem + '.raw')).write_bytes(output[:2097152])
-    (run / (stem + '.stderr')).write_bytes(errors[:65536])
-    if code or len(output) > 2097152:
+        stamp = parsedate_to_datetime(value)
+        if stamp.tzinfo is not None: return max(5, stamp.timestamp() - time.time())
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return 5
+
+def fetch(url, stem):
+    global next_request, requests_stopped
+    if requests_stopped: raise RequestError('AUR requests stopped for this scan')
+    delay = 0
+    for attempt in range(2):
+        wait = max(0, delay, next_request - time.monotonic())
+        if time.monotonic() + wait + 23 > started + 260:
+            requests_stopped = True
+            diagnostics.append(('health_budget', 'request-budget=260s; URL=' + url))
+            raise RequestError('request budget exhausted')
+        if wait: time.sleep(wait)
+        next_request = time.monotonic() + 1.1
+        attempt_stem = stem if attempt == 0 else stem + '.retry1'
+        (run / (attempt_stem + '.request.txt')).write_text(url + '\n')
+        headers_path = run / (attempt_stem + '.headers')
+        try:
+            result = subprocess.run(['curl', '--disable', '--proto', '=https', '--tlsv1.2',
+                '--fail', '--silent', '--show-error', '--connect-timeout', '5', '--max-time', '20',
+                '--max-filesize', '2097152', '--dump-header', str(headers_path),
+                '--header', 'Accept-Language: en-US',
+                '--user-agent', 'SecCheck/2.0 (AUR maintenance check)', url],
+                capture_output=True, timeout=23, env=dict(os.environ, LC_ALL='C'))
+            output, errors, code = result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired as error:
+            output, errors, code = error.stdout or b'', error.stderr or b'', 28
+            errors += b'\nSecCheck: curl exceeded the 23-second process deadline\n'
+        (run / (attempt_stem + '.raw')).write_bytes(output[:2097152])
+        (run / (attempt_stem + '.stderr')).write_bytes(errors[:65536])
+        status, headers = http_response(headers_path)
+        detail = 'curl=' + str(code) + '; HTTP=' + str(status) + '; URL=' + url + \
+                 '; log=' + attempt_stem + '.stderr; ' + \
+                 text(errors.decode('utf-8', errors='replace').strip())[:500]
+        if status == 429:
+            value = headers.get('retry-after', '')
+            delay = retry_delay(value)
+            detail += '; Retry-After=' + text(value or 'absent')[:256]
+            # One retry at most. A long cooldown or another 429 stops all further
+            # AUR requests in this run, including requests for other packages.
+            if attempt == 0 and delay <= 30 and time.monotonic() + delay + 23 <= started + 260:
+                notes.append('AUR HTTP 429: wait=' + str(delay) + 's; URL=' + url)
+                continue
+            requests_stopped = True
+            diagnostics.append(('health_rate_limited', detail))
+            raise RequestError(detail)
+        if not code and len(output) <= 2097152:
+            if attempt:
+                diagnostics.append(('health_retry', 'URL=' + url + '; wait=' + str(delay) +
+                                    's; logs=' + stem + '.stderr / ' + attempt_stem + '.raw'))
+            return output.decode('utf-8')
         key = {5: 'health_dns', 6: 'health_dns', 7: 'health_connection', 22: 'health_http',
                28: 'health_timeout', 35: 'health_tls', 60: 'health_tls'}.get(code, 'health_fetch')
-        detail = 'curl=' + str(code) + '; URL=' + url + '; log=' + stem + '.stderr; ' + \
-                 text(errors.decode('utf-8', errors='replace').strip())[:500]
         if len(output) > 2097152: detail += '; response exceeds 2 MiB'
         diagnostics.append((key, detail))
         raise RequestError(detail)
-    return output.decode('utf-8')
 
 class MaintainerRow(HTMLParser):
     def __init__(self):
@@ -707,7 +770,7 @@ def execute():
             stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
         os.replace(temporary, baseline_path)
     notes.append('foreign=' + str(len(names)) + '; AUR observed=' + str(len(observed)) +
-                 '; age-threshold=365 days; max-packages=2000; request-budget=260s; baseline=' +
+                 '; age-threshold=365 days; max-packages=2000; request-budget=260s; request-spacing=1.1s; max-429-retries=1; baseline=' +
                  (('not-created' if first else 'preserved') if partial else 'updated'))
     return baseline_note if partial else ('health_baseline' if first else 'health_compared')
 
@@ -807,6 +870,9 @@ sc_t() {
         health_connection) en='The connection to AUR failed. Check connectivity and any proxy settings, then repeat this module.'; it="Connessione ad AUR non riuscita. Controlla la rete e le eventuali impostazioni proxy, poi ripeti questo modulo.";;
         health_timeout) en='An AUR request timed out. Repeat this module when the service is reachable; its error log is listed below.'; it="Una richiesta AUR ha superato il tempo disponibile. Ripeti questo modulo quando il servizio è raggiungibile; sotto è indicato il log dell'errore.";;
         health_http) en='AUR returned an HTTP error. Read the code below: 429 means too many requests; 5xx indicates a server error. Repeat the module later.'; it="AUR ha risposto con un errore HTTP. Leggi il codice qui sotto: 429 indica troppe richieste; 5xx un errore del server. Ripeti il modulo più tardi.";;
+        health_rate_limited) en='Requests stopped: AUR is limiting access (HTTP 429). The requested wait is too long for this scan, or one retry was insufficient. Repeat this module later; no package or maintainer removal is inferred from this error.'; it="Richieste interrotte: AUR sta limitando gli accessi (HTTP 429). L'attesa richiesta supera il limite di questa scansione oppure un nuovo tentativo non è bastato. Ripeti questo modulo più tardi; questo errore non indica la rimozione di pacchetti o maintainer.";;
+        health_retry) en='AUR temporarily limited requests. SecCheck waited and the next attempt succeeded:'; it="AUR ha limitato temporaneamente le richieste. SecCheck ha atteso e il tentativo successivo è riuscito:";;
+        health_budget) en='The online time limit was reached. Remaining AUR requests were stopped and coverage is partial.'; it="È stato raggiunto il limite di tempo per i controlli online. Le richieste AUR rimanenti sono state interrotte e la copertura è parziale.";;
         health_tls) en='The secure AUR connection could not be verified. Check the clock, certificates and proxy; do not disable certificate checks.'; it="Impossibile verificare la connessione sicura ad AUR. Controlla orologio, certificati e proxy; mantieni attiva la verifica dei certificati.";;
         health_fetch) en='An AUR request failed. The URL, command exit code and original error below identify the failed operation.'; it="Una richiesta AUR è fallita. URL, codice di uscita ed errore originale qui sotto identificano l'operazione non riuscita.";;
         health_data_error) en='Some AUR data could not be read or validated. Unknown maintainer information is not treated as a removal.'; it="Alcuni dati AUR non sono leggibili o verificabili. Un maintainer non verificato non viene considerato rimosso.";;

@@ -2,6 +2,8 @@
 
 ## 2.0.0 — development branch
 
+- Space AUR requests and handle HTTP 429 with one bounded retry respecting
+  Retry-After. Persistent rate limits stop further requests and preserve history.
 - Native-test follow-up: explain skipped rkhunter checks and execution diagnostics
   in the summary; an exact egrep deprecation notice alone no longer invalidates a
   completed scan. Regex/read errors and skipped tests still limit coverage.

@@ -2,6 +2,7 @@
 import json
 import os
 import time
+from email.utils import formatdate
 
 from test_seccheck import SecCheckCase
 
@@ -40,6 +41,89 @@ class AurHealthTests(SecCheckCase):
             maintainer=maintainer, co_maintainers=['bob'] if co is None else co, base='demo', seen_at=1)})
         (self.state / 'aur-maintainers.json').write_text(json.dumps(data))
         return (self.state / 'aur-maintainers.json').read_bytes()
+
+    def http_responses(self, responses):
+        """Replace only curl; real adapter parses headers and controls request timing."""
+        self.fixture('responses.json', json.dumps(responses))
+        self.fixture('http_stub.py', '''import json, os, pathlib, sys, time
+root = pathlib.Path(os.environ['SC_TEST_DIR'])
+args = sys.argv[1:]
+url = args[-1]
+log = root / 'requests.jsonl'
+calls = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+index = sum(call['url'] == url for call in calls)
+choices = json.loads((root / 'responses.json').read_text()).get(url.rsplit('/', 1)[-1], [{}])
+response = choices[min(index, len(choices) - 1)]
+status = response.get('status', 200)
+with log.open('a') as stream:
+    stream.write(json.dumps(dict(url=url, at=time.monotonic(), status=status)) + '\\n')
+if '--dump-header' in args:
+    headers = 'HTTP/2 ' + str(status) + '\\r\\n'
+    if 'retry_after' in response: headers += 'Retry-After: ' + response['retry_after'] + '\\r\\n'
+    pathlib.Path(args[args.index('--dump-header') + 1]).write_text(headers + '\\r\\n')
+if status >= 400:
+    print('curl: (22) The requested URL returned error: ' + str(status), file=sys.stderr)
+    sys.exit(22)
+print((root / ('page.html' if '/packages/' in url else 'rpc.json')).read_text(), end='')
+''')
+        self.command('curl', 'exec python3 "$SC_TEST_DIR/http_stub.py" "$@"\n')
+
+    def two_maintainer_pages(self):
+        self.command('pacman', 'printf "demo 1.0-1\\nzeta 1.0-1\\n"\n')
+        self.package.pop('CoMaintainers', None)
+        packages = [self.package, dict(self.package, Name='zeta', PackageBase='zeta')]
+        self.fixture('rpc.json', json.dumps(dict(version=5, type='multiinfo', resultcount=2, results=packages)))
+
+    def requests(self):
+        return [json.loads(line) for line in (self.folder / 'requests.jsonl').read_text().splitlines()]
+
+    def test_requests_are_spaced_even_when_responses_are_fast(self):
+        del self.package['CoMaintainers']
+        self.write_response()
+        self.http_responses({})
+        self.assertIn('completed|', self.scan())
+        calls = self.requests()
+        self.assertEqual(len(calls), 2)
+        self.assertGreaterEqual(calls[1]['at'] - calls[0]['at'], 1.0)
+
+    def test_rate_limit_retry_recovers_and_keeps_both_attempt_logs(self):
+        del self.package['CoMaintainers']
+        self.write_response()
+        self.http_responses({'demo': [dict(status=429, retry_after='2'), dict(status=200)]})
+        self.assertIn('completed||health_baseline', self.scan())
+        calls = self.requests()
+        self.assertEqual([x['status'] for x in calls], [200, 429, 200])
+        self.assertGreaterEqual(calls[2]['at'] - calls[1]['at'], 2.0)
+        self.assertTrue((self.state / 'aur-maintainers.json').exists())
+        logs = list(self.run.glob('aur-page.*.stderr'))
+        self.assertEqual(len(logs), 2)
+        self.assertTrue(any('429' in path.read_text() for path in logs))
+
+    def test_persistent_rate_limit_stops_further_requests_and_preserves_baseline(self):
+        before = self.seed_baseline()
+        self.two_maintainer_pages()
+        self.http_responses({'demo': [dict(status=429, retry_after='0')]})
+        out = self.scan(summary=True)
+        self.assertIn('partial|', out)
+        calls = self.requests()
+        self.assertEqual([x['status'] for x in calls], [200, 429, 429])
+        self.assertTrue(all('/packages/zeta' not in x['url'] for x in calls))
+        self.assertEqual(before, (self.state / 'aur-maintainers.json').read_bytes())
+        self.assertIn('Requests stopped', out)
+        self.assertNotIn('health_co_removed', out)
+
+    def test_long_retry_after_stops_instead_of_retrying_early(self):
+        before = self.seed_baseline()
+        self.two_maintainer_pages()
+        for retry_after in ('3600', formatdate(time.time() + 3600, usegmt=True), '9' * 5000):
+            with self.subTest(retry_after=retry_after):
+                (self.folder / 'requests.jsonl').unlink(missing_ok=True)
+                self.http_responses({'demo': [dict(status=429, retry_after=retry_after)]})
+                out = self.scan(summary=True)
+                self.assertIn('partial|', out)
+                self.assertEqual([x['status'] for x in self.requests()], [200, 429])
+                self.assertEqual(before, (self.state / 'aur-maintainers.json').read_bytes())
+                self.assertIn('Retry-After', out)
 
     def test_first_observation_is_baseline_not_maintainer_change(self):
         out = self.scan()
@@ -88,16 +172,16 @@ class AurHealthTests(SecCheckCase):
         packages = [self.package, dict(self.package, Name='zeta', PackageBase='zeta')]
         self.fixture('rpc.json', json.dumps(dict(version=5, type='multiinfo', resultcount=2, results=packages)))
         self.command('curl', 'case "${!#}" in\n'
-                     '  */packages/demo) echo "curl: (22) The requested URL returned error: 429" >&2; exit 22;;\n'
+                     '  */packages/demo) echo "curl: (22) The requested URL returned error: 404" >&2; exit 22;;\n'
                      '  */packages/zeta) echo "curl: (28) Operation timed out" >&2; exit 28;;\n'
                      '  *) cat "$SC_TEST_DIR/rpc.json";;\nesac\n')
         out = self.scan(summary=True)
         logs = sorted(self.run.glob('aur-page.*.stderr'))
         self.assertEqual(len(logs), 2, 'Each failed request must keep its own diagnostic log')
-        self.assertIn('429', logs[0].read_text())
+        self.assertIn('404', logs[0].read_text())
         self.assertIn('timed out', logs[1].read_text())
         self.assertIn('demo', out)
-        self.assertIn('429', out)
+        self.assertIn('404', out)
         self.assertIn('zeta', out)
         self.assertIn('timed out', out)
         self.assertNotIn('health_removed', out)

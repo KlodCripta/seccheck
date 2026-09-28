@@ -2,7 +2,7 @@
 
 ## Completed
 
-Latest local suite: **77 tests passing**, Bash syntax checks and ShellCheck 0.11.0
+Latest local suite: **81 tests passing**, Bash syntax checks and ShellCheck 0.11.0
 clean after the first native-feedback corrections (28 September 2026).
 
 - Regression tests exercise evidence/coverage independently, scanner boundary fixtures,
@@ -76,10 +76,12 @@ correctly distinguishes a missing first baseline from a preserved previous one.
 Regression fixtures reproduce successive HTTP/timeout failures, DNS failures,
 baseline preservation and the native rkhunter diagnostic patterns.
 
-The underlying cause of the user's three HTTP requests is still unconfirmed:
-the supplied excerpt does not contain the individual curl stderr. A native retry
-or the retained `aur-page.*.stderr` is needed to distinguish HTTP errors, timeouts,
-DNS and TLS problems. No retry policy or network diagnosis is inferred from counts.
+The later retained curl stderr confirmed HTTP 429 (rate limiting). The request
+loop had no pacing and no Retry-After handling. Requests are now spaced, with one
+retry after a permitted wait; a persistent limit or an excessive wait stops all
+further network requests in that run. Fixtures cover recovery, persistent 429,
+numeric and HTTP-date Retry-After, and baseline preservation. A successful native
+rerun is still needed to verify this behavior against the live AUR service.
 The missing-pacutils run also cannot validate the SHA-256 path on that machine.
 
 The user requested restoring the earlier version's clearer section separation,
@@ -87,3 +89,8 @@ use of several semantic colors and educational explanations. That interface work
 is explicitly scheduled after functional corrections; this patch does not replace
 that work. The older screenshot's zero-file integrity success and unsupported
 compromise-probability score must not be restored.
+
+The user confirmed that Atomic Arch should remain included in full scans (menu
+option 1). The module is implemented in SecCheck using documented indicators;
+it does not bundle a third-party scanner script. Indicator provenance is recorded
+in `docs/INDICATORS.md`.

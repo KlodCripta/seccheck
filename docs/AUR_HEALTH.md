@@ -34,11 +34,25 @@ new comparison history. A local root attacker could tamper with that history.
 
 Each HTTP request keeps its own `aur-rpc.N` or `aur-page.N` files: `.request.txt`
 identifies the URL, `.raw` stores the bounded response and `.stderr` stores curl's
-diagnostic output. Page numbering counts attempts, including failures, so a later
-request cannot overwrite an earlier failed request's evidence. The summary gives
+diagnostic output. `.headers` stores the HTTP response headers. Page numbering
+counts attempts, including failures, so a later request cannot overwrite an earlier
+failed request's evidence. The summary gives
 the curl exit code, original error and log filename with an EN/IT explanation.
 `aur-health-diagnostics.tsv` contains these diagnostics separately from findings.
 
 A partial first scan does not create a baseline. A partial later scan preserves
 the previous complete snapshot. The interface now states which situation applies.
 An HTTP/connection failure is never interpreted as a removed package or maintainer.
+
+Requests start at least 1.1 seconds apart within a scan. This is SecCheck's pacing
+policy, not a claim about AUR's current server-side limit. After HTTP 429, SecCheck
+honors `Retry-After` seconds or an HTTP date, with a five-second minimum/fallback.
+It retries the same URL once, preserving that attempt as `.retry1.*`. A second 429,
+a delay longer than 30 seconds, or insufficient remaining scan time stops all
+further AUR requests in that run. A long server delay is never shortened to force a
+retry. Local processing of metadata already obtained can still finish, but the
+module remains partial and the previous baseline is preserved.
+
+The 260-second online budget includes pauses and retries. Large inventories can
+reach this limit; the report states that remaining requests were stopped. Split
+packages reuse a successfully retrieved page for their package base within the run.

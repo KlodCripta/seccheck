@@ -3,6 +3,11 @@
 Bundled set **2026.09.27**, assembled 27 September 2026. Sources describe the
 11–12 June 2026 campaign. SecCheck does not download an indicator feed.
 
+The detection implementation is written for SecCheck. No third-party scanner
+script or malware payload is bundled. The references below credit the published
+technical observations used to define the checks; their source code, article text
+and artwork are not incorporated into the module.
+
 | Check | Interpretation | Source |
 | --- | --- | --- |
 | Exact tokens `atomic-lockfile`, `js-digest`, `lockfile-js` in installation scripts, npm/Bun manifests, npm cache indexes and startup definitions | Possible exposure. A reference, old cache or package name does not prove a malicious version was installed or executed. | [Sonatype original research](https://www.sonatype.com/blog/atomic-arch-npm-campaign-adds-malicious-dependency) |
