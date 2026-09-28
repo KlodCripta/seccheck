@@ -1079,7 +1079,7 @@ sc_elevate() {
 }
 
 sc_require_scan_host() {
-    if ! sc_is_arch || ! command -v pacman >/dev/null; then sc_line "$(sc_t unsupported)"; return 78; fi
+    if ! sc_is_arch /etc/os-release || ! command -v pacman >/dev/null; then sc_line "$(sc_t unsupported)"; return 78; fi
 }
 
 sc_demo() {
@@ -1159,7 +1159,7 @@ sc_scan_once() {
     local modules=$SC_SCAN module step=0
     [[ $modules != full ]] || modules=$SC_ALL_MODULES
     sc_reset "$modules"
-    sc_prepare_run || { sc_line "$(sc_t storage_error)"; return 73; }
+    sc_prepare_run /var/log/seccheck || { sc_line "$(sc_t storage_error)"; return 73; }
     SC_RUN_ACTIVE=1
     trap sc_abort INT TERM
     sc_header; sc_line "$(sc_t wait)" "$SC_C_MUTED"
@@ -1236,7 +1236,7 @@ sc_menu() {
 sc_update_action() {
     sc_require_scan_host || return $?
     if ((EUID != 0)); then sc_line "$(sc_t root)"; sc_elevate update; return $?; fi
-    sc_prepare_run || { sc_line "$(sc_t storage_error)"; return 73; }
+    sc_prepare_run /var/log/seccheck || { sc_line "$(sc_t storage_error)"; return 73; }
     sc_update_signatures
     local rc=$?
     sc_line "$(sc_t report): $SC_RUN_DIR"
