@@ -124,6 +124,29 @@ class InterfaceTests(SecCheckCase):
         self.assertIn('Selected modules only', out)
         self.assertIn('Not selected', out)
 
+    def test_details_can_reach_findings_after_the_first_page(self):
+        out = self.shell('sc_reset rkhunter; SC_LANG=en; SC_ASCII=1; SC_NO_COLOR=1; sc_ui_init\n'
+                         'for n in {1..21}; do sc_add_finding rkhunter suspicious review unconfirmed '
+                         '"/example/file$n" rkh_warning "warning $n"; done\n'
+                         'sc_render_details 20 20')
+        self.assertIn('/example/file21', out)
+        self.assertNotIn('warning 1\n', out)
+
+    def test_explained_findings_and_their_verification_remain_in_reports(self):
+        out = self.shell('sc_reset rkhunter; SC_LANG=it; SC_NO_COLOR=1; sc_ui_init\n'
+                         'sc_prepare_run "$SC_TEST_DIR/reports" || exit\n'
+                         'sc_module_set rkhunter completed ""\n'
+                         'sc_add_finding rkhunter suspicious info observation /example/script rkh_script "original warning"\n'
+                         'SC_F_CHECK_KEY[0]=rkh_file_match; SC_F_CHECK_DETAIL[0]="Package: example"\n'
+                         'sc_assess; sc_save_report || exit; printf "%s" "$SC_RUN_DIR"')
+        folder = pathlib.Path(out)
+        report = (folder / 'report.txt').read_text()
+        self.assertIn('/example/script', report)
+        self.assertIn('Package: example', report)
+        self.assertIn('original warning', report)
+        self.assertIn('rkh_file_match', (folder / 'checks.tsv').read_text())
+        self.assertEqual((folder / 'checks.tsv').stat().st_mode & 0o777, 0o600)
+
     def test_aur_maintenance_advice_has_matching_summary_guidance(self):
         out = self.shell('sc_reset aur-health; SC_LANG=en; SC_ASCII=1; SC_NO_COLOR=1; sc_ui_init\n'
                          'sc_module_set aur-health completed ""\n'

@@ -2,8 +2,8 @@
 
 ## Completed
 
-Latest local suite: **81 tests passing**, Bash syntax checks and ShellCheck 0.11.0
-clean after the first native-feedback corrections (28 September 2026).
+Latest local suite: **114 tests passing**, Bash syntax checks and ShellCheck 0.11.0
+clean after the startup and rkhunter-interpretation corrections (29 September 2026 UTC).
 
 - Regression tests exercise evidence/coverage independently, scanner boundary fixtures,
   missing tools and unknown output, static Atomic Arch reads, private reports,
@@ -35,10 +35,10 @@ private user homes, change packages or remove existing production reports.
 4. **Maintainer history consists of observations.** Changes before the first scan
    or between scans cannot be reconstructed reliably. Intermediate transfers may
    go unreported.
-5. **Online integration needs a native check.** Public AUR RPC/page samples were
-   fetched, but the full module's live trial hit this environment's proxy CONNECT
-   timeout and correctly preserved partial coverage and the baseline. Successful
-   live querying on the target machine remains to be verified.
+5. **Native AUR completion was reported.** The user's later run completed the AUR
+   maintenance module and recorded its first snapshot. The supplied output does
+   not establish whether a 429 retry was exercised in that run. Proxy failures in
+   this environment and controlled fixtures still cover incomplete/error behavior.
 6. **AUR advice wording was treated as functional.** The initial text incorrectly
    narrowed all suggestions to configuration. The replacement covers package
    maintenance and settings; the tradeoff is slightly broader wording.
@@ -80,17 +80,47 @@ The later retained curl stderr confirmed HTTP 429 (rate limiting). The request
 loop had no pacing and no Retry-After handling. Requests are now spaced, with one
 retry after a permitted wait; a persistent limit or an excessive wait stops all
 further network requests in that run. Fixtures cover recovery, persistent 429,
-numeric and HTTP-date Retry-After, and baseline preservation. A successful native
-rerun is still needed to verify this behavior against the live AUR service.
+numeric and HTTP-date Retry-After, and baseline preservation. The user's subsequent
+run at `20260928T140113Z` reported AUR maintenance completed and a first snapshot.
 The missing-pacutils run also cannot validate the SHA-256 path on that machine.
 
-The user requested restoring the earlier version's clearer section separation,
-use of several semantic colors and educational explanations. That interface work
-is explicitly scheduled after functional corrections; this patch does not replace
-that work. The older screenshot's zero-file integrity success and unsupported
-compromise-probability score must not be restored.
+The large two-color title, original subtitle and author credit have been restored.
+The menu states which five choices form a full scan and separates the other tools.
+Interactive startup checks dependencies and offers installation. The older
+screenshot's zero-file integrity success and unsupported compromise-probability
+score have not been restored.
 
 The user confirmed that Atomic Arch should remain included in full scans (menu
 option 1). The module is implemented in SecCheck using documented indicators;
 it does not bundle a third-party scanner script. Indicator provenance is recorded
 in `docs/INDICATORS.md`.
+
+## rkhunter interpretation and startup follow-up
+
+The later details exposed duplicate summary/log warnings, trailing punctuation in
+parsed paths, prerequisite notices counted as suspects, and a generic explanation
+repeated for unrelated warnings. New fixtures reproduce those forms. Automatic
+follow-ups now check exact package records and file hashes, and query SSH server
+configuration/version. The tests cover changed content, changed permissions,
+missing/malformed records, unowned files, read errors despite exit zero, unknown
+SSH versions, failed configuration queries and strong signatures that must remain
+urgent. An adversarial control-character path reproduced a possible retargeting
+after display sanitization; that path is now rejected before any file lookup.
+Five further regressions cover colon-containing paths, ambiguous hidden-file
+separators, directory warnings and script-warning delimiters embedded in a path.
+These reproduced checks against an unrelated path prefix. Unambiguous colons are
+now preserved; ambiguous forms stay unresolved, and directory warnings never
+trigger a regular-file verification.
+An independent review also reproduced filename text being mistaken for an SSH
+warning or a diagnostic notice. Message-prefix matching now prevents that
+misclassification. Two regressions cover five such filenames. The review found no
+other concrete important defect in these changes; native integration remains open.
+
+PTY tests cover missing pacfile despite an available paccheck, declined and
+accepted installation, failed installation, rechecking installed tools and a demo
+that never triggers installation. Only the pacman/sudo command boundary and host
+identity are simulated; dependency discovery and UI input are exercised directly.
+Report tests preserve explained findings and check results with private permissions.
+
+The new follow-ups still require a native run with pacutils installed. Fixture
+success does not certify the user's files, packages or SSH configuration.

@@ -20,6 +20,7 @@ sc_reset() {
     declare -ga SC_SELECTED=()
     declare -ga SC_F_MODULE=() SC_F_KIND=() SC_F_PRIORITY=() SC_F_CONFIDENCE=()
     declare -ga SC_F_OBJECT=() SC_F_KEY=() SC_F_EVIDENCE=()
+    declare -ga SC_F_CHECK_KEY=() SC_F_CHECK_DETAIL=()
     declare -ga SC_D_MODULE=() SC_D_KEY=() SC_D_EVIDENCE=()
     declare -gA SC_MODULE_STATUS=() SC_MODULE_REASON=() SC_MODULE_RC=() SC_MODULE_VERSION=()
     declare -ga SC_SCOPE=()
@@ -33,7 +34,7 @@ sc_reset() {
     for module in ${1:-$SC_ALL_MODULES}; do
         case $module in rkhunter|lynis|integrity|aur|aur-health) SC_SELECTED+=("$module");; *) return 2;; esac
     done
-    SC_INCOMPLETE=1 SC_COMPLETED=0 SC_URGENT=0 SC_REVIEW=0 SC_SUGGESTIONS=0
+    SC_INCOMPLETE=1 SC_COMPLETED=0 SC_URGENT=0 SC_REVIEW=0 SC_SUGGESTIONS=0 SC_INFO=0
     SC_ASSESSMENT=unknown
     SC_HEALTH_NOTE=''
 }
@@ -59,7 +60,7 @@ sc_add_diagnostic() {
 sc_add_finding() {
     local module=$1 kind=$2 priority=$3 confidence=$4 object=$5 key=$6 evidence=$7 i
     case $module in rkhunter|lynis|integrity|aur|aur-health) ;; *) return 2;; esac
-    case $priority in urgent|review|suggestion) ;; *) return 2;; esac
+    case $priority in urgent|review|suggestion|info) ;; *) return 2;; esac
     object=$(sc_text "$object")
     evidence=$(sc_text "$evidence")
     # Compare array elements: do not evaluate untrusted associative subscripts.
@@ -72,11 +73,12 @@ sc_add_finding() {
     SC_F_MODULE+=("$module") SC_F_KIND+=("$kind") SC_F_PRIORITY+=("$priority")
     SC_F_CONFIDENCE+=("$confidence") SC_F_OBJECT+=("$object")
     SC_F_KEY+=("$key") SC_F_EVIDENCE+=("$evidence")
+    SC_F_CHECK_KEY+=('') SC_F_CHECK_DETAIL+=('')
 }
 
 sc_assess() {
     local module priority
-    SC_COMPLETED=0 SC_INCOMPLETE=0 SC_URGENT=0 SC_REVIEW=0 SC_SUGGESTIONS=0
+    SC_COMPLETED=0 SC_INCOMPLETE=0 SC_URGENT=0 SC_REVIEW=0 SC_SUGGESTIONS=0 SC_INFO=0
     for module in "${SC_SELECTED[@]}"; do
         if [[ ${SC_MODULE_STATUS[$module]} == completed ]]; then
             ((SC_COMPLETED+=1))
@@ -87,7 +89,7 @@ sc_assess() {
     ((${#SC_SELECTED[@]})) || SC_INCOMPLETE=1
     for priority in "${SC_F_PRIORITY[@]}"; do
         case $priority in urgent) ((SC_URGENT+=1));; review) ((SC_REVIEW+=1));;
-            suggestion) ((SC_SUGGESTIONS+=1));; esac
+            suggestion) ((SC_SUGGESTIONS+=1));; info) ((SC_INFO+=1));; esac
     done
     if ((SC_URGENT)); then SC_ASSESSMENT=urgent
     elif ((SC_REVIEW)); then SC_ASSESSMENT=review
@@ -110,25 +112,90 @@ sc_version() {
     sc_text "${value%%$'\n'*}"
 }
 
+sc_rkh_finding() {
+    local key=$1 priority=$2 object=$3 evidence=$4 i same
+    # Display sanitization must never turn an unreadable source path into a
+    # different, existing filesystem path that could receive a clean verdict.
+    if [[ $object != "$(sc_text "$object")" ]]; then
+        key=rkh_path_unreadable; object=''; SC_PARSE_UNKNOWN=1
+    fi
+    evidence=$(sc_text "$evidence")
+    for ((i=0;i<${#SC_F_MODULE[@]};i++)); do
+        [[ ${SC_F_MODULE[i]} == rkhunter && ${SC_F_OBJECT[i]} == "$object" ]] || continue
+        same=0
+        [[ ${SC_F_KEY[i]} == "$key" ]] && same=1
+        if [[ -n $object && ( $key == rkh_script || $key == rkh_file_warning ) &&
+              ( ${SC_F_KEY[i]} == rkh_script || ${SC_F_KEY[i]} == rkh_file_warning ) ]]; then same=1; fi
+        ((same)) || continue
+        # Generic warnings without an identity only merge identical evidence.
+        [[ -n $object || ${SC_F_EVIDENCE[i]} == "$evidence" ]] || continue
+        [[ $key != rkh_script ]] || SC_F_KEY[i]=$key
+        if [[ ${SC_F_EVIDENCE[i]} != *"$evidence"* ]]; then SC_F_EVIDENCE[i]+=" | $evidence"; fi
+        return 0
+    done
+    sc_add_finding rkhunter suspicious "$priority" unconfirmed "$object" "$key" "$evidence"
+}
+
 sc_parse_rkhunter() {
-    local line lower key priority object
+    local line lower key priority object normalized description hidden_kind
     local -a words
+    local script_re="^The command '(/[^']+)' has been replaced by a script:"
+    local script_marker="' has been replaced by a script:" hidden_separator=': '
+    local hidden_re='^Hidden (file|directory) found: (/.+)$'
+    local file_re='^(/[^[:space:]]+) \[ *Warning *\]$'
     SC_PARSE_UNKNOWN=0
     while IFS= read -r line || [[ -n $line ]]; do
         line=${line#\[??:??:??\] }
+        line=${line#"${line%%[![:space:]]*}"}
+        line=${line%"${line##*[![:space:]]}"}
         lower=${line,,}
         # Examine findings before descriptive prefixes; [ Warning ] is significant.
         if [[ $lower == *warning:* || $lower == *'[ warning ]'* || $lower == *'[warning]'* ||
               $lower == *'[ infected ]'* || $lower == *'infected file'* ]]; then
+            SC_RKH_WARNINGS=$((${SC_RKH_WARNINGS:-0}+1))
             key=rkh_warning priority=review object=''
-            case $lower in
+            normalized=${line#Warning: }
+            # Only recognized message prefixes select explanatory follow-ups or
+            # diagnostics; wording embedded in a filename must not select SSH.
+            case ${normalized,,} in
                 *'possible rootkit'*|*'rootkit found'*|*'infected file'*|*'[ infected ]'*)
                     key=rkh_signature; priority=urgent;;
                 *'properties have changed'*|*'hash value'*|*'hash changed'*) key=rkh_properties;;
+                'checking for prerequisites '* )
+                    SC_PARSE_UNKNOWN=1; sc_add_diagnostic rkhunter rkh_prerequisite "$normalized"; continue;;
+                "warning! it is the users responsibility to ensure that when the '--propupd' option"*)
+                    sc_add_diagnostic rkhunter rkh_baseline_notice "$normalized"; continue;;
+                'checking if ssh root access is allowed '*|"the ssh configuration option 'permitrootlogin' "*)
+                    key=rkh_ssh_root; object=PermitRootLogin;;
+                'checking if ssh protocol v1 is allowed '*|"the ssh configuration option 'protocol' "*)
+                    key=rkh_ssh_protocol; object=Protocol;;
+                'checking for hidden files and directories '*) key=rkh_hidden_summary; object='hidden-files';;
+                'checking /dev for suspicious file types '*|'suspicious file types found in /dev:')
+                    key=rkh_dev; object=/dev;;
             esac
-            # A display hint, never an executable argument or proof of file identity.
-            if [[ $line =~ (/[^[:space:]]+) ]]; then object=${BASH_REMATCH[1]}; fi
-            sc_add_finding rkhunter suspicious "$priority" unconfirmed "$object" "$key" "$line"
+            if [[ $key == rkh_warning ]]; then
+                if [[ $normalized =~ $script_re ]]; then
+                    key=rkh_script; object=${BASH_REMATCH[1]}
+                    description=${normalized#*"$script_marker"}
+                    if [[ $description == *"$script_marker"* ]]; then
+                        key=rkh_path_unreadable; object=''; SC_PARSE_UNKNOWN=1
+                    fi
+                elif [[ $normalized =~ $hidden_re ]]; then
+                    hidden_kind=${BASH_REMATCH[1]}; object=${BASH_REMATCH[2]}
+                    if [[ $hidden_kind == directory ]]; then
+                        key=rkh_hidden_directory
+                    else
+                        key=rkh_hidden_file; description=${object#*"$hidden_separator"}
+                        # Plain text cannot disambiguate a filename containing
+                        # the same separator as the file-type description.
+                        if [[ $object != *"$hidden_separator"* || $description == *"$hidden_separator"* ]]; then
+                            key=rkh_path_unreadable; object=''; SC_PARSE_UNKNOWN=1
+                        else object=${object%%"$hidden_separator"*}; fi
+                    fi
+                elif [[ $normalized =~ $file_re ]]; then key=rkh_file_warning; object=${BASH_REMATCH[1]}; fi
+            fi
+            # Only the specific file-warning forms above authorize file lookups.
+            sc_rkh_finding "$key" "$priority" "$object" "$normalized"
         fi
         if [[ $lower == *'test skipped'* || $lower == *'skipped due to'* || $lower == *'[ skipped ]'* ]]; then
             SC_PARSE_UNKNOWN=1
@@ -138,12 +205,141 @@ sc_parse_rkhunter() {
     done < "$1"
 }
 
+sc_rkh_check_file() {
+    local i=$1 object=${SC_F_OBJECT[$1]} prefix="$SC_RUN_DIR/rkh-context.$1"
+    local line field value package='' recorded='' digest='' actual='' size rc
+    local files=0 owners=0 modes=0 types=0 uids=0 groups=0 hashes=0 metadata=0
+    SC_F_CHECK_KEY[i]=rkh_file_unknown
+    SC_F_CHECK_DETAIL[i]=''
+    if ! command -v pacfile >/dev/null; then SC_F_CHECK_KEY[i]=rkh_file_tool_missing; return; fi
+    if [[ $object != /* || ! -f $object || -L $object ]]; then
+        SC_F_CHECK_KEY[i]=rkh_file_nonregular; return
+    fi
+    size=$(timeout 5 stat -c '%s' -- "$object" 2>/dev/null) || return
+    if [[ ! $size =~ ^[0-9]{1,12}$ ]] || ((size > 67108864)); then
+        SC_F_CHECK_KEY[i]=rkh_context_limit; return
+    fi
+    sc_capture "$prefix.pacfile" "$prefix.stderr" 20 pacfile --check -- "$object"
+    rc=$?
+    SC_F_CHECK_DETAIL[i]="log=rkh-context.$i.pacfile / rkh-context.$i.stderr"
+    ((rc == 0)) && [[ ! -s $prefix.stderr ]] || return
+    while IFS= read -r line || [[ -n $line ]]; do
+        if [[ $line == "no package owns '$object'" ]]; then SC_F_CHECK_KEY[i]=rkh_file_unowned; return; fi
+        field=${line%%:*}; value=${line#*:}; value=${value#"${value%%[![:space:]]*}"}
+        case $field in
+            file) ((files+=1)); recorded=$value;;
+            owner)
+                if [[ $value =~ ^[A-Za-z0-9@_+.-]+$ ]]; then ((owners+=1)); package=$value
+                elif [[ $value =~ ^[0-9]+/ ]]; then ((uids+=1)); [[ $value != *' on filesystem)' ]] || metadata=1; fi;;
+            mode) ((modes+=1)); [[ $value =~ ^[0-7]{3,4}$ ]] || metadata=1;;
+            type) ((types+=1)); [[ $value == file ]] || metadata=1;;
+            group) [[ $value =~ ^[0-9]+/ ]] && ((groups+=1)); [[ $value != *' on filesystem)' ]] || metadata=1;;
+            sha256)
+                ((hashes+=1)); [[ $value =~ ^([0-9a-f]{64})($|[[:space:]]) ]] && digest=${BASH_REMATCH[1]};;
+        esac
+    done < "$prefix.pacfile"
+    # Exit zero alone is insufficient: require one exact file, its owner, MTREE
+    # properties and a SHA-256, then hash the actual regular file ourselves.
+    ((files == 1 && owners == 1 && modes == 1 && types == 1 && uids == 1 && groups == 1 && hashes == 1)) || return
+    [[ $recorded == "${object#/}" && -n $digest ]] || return
+    sc_capture "$prefix.sha256" "$prefix.sha256.stderr" 5 sha256sum -- "$object"
+    rc=$?
+    ((rc == 0)) && [[ ! -s $prefix.sha256.stderr ]] || return
+    read -r actual _ < "$prefix.sha256"
+    [[ $actual =~ ^[0-9a-f]{64}$ ]] || return
+    SC_F_CHECK_DETAIL[i]="$(sc_t package): $package; log=rkh-context.$i.pacfile / rkh-context.$i.sha256"
+    if [[ $actual != "$digest" ]]; then SC_F_CHECK_KEY[i]=rkh_file_changed
+    elif ((metadata)); then SC_F_CHECK_KEY[i]=rkh_file_metadata
+    else SC_F_CHECK_KEY[i]=rkh_file_match; SC_F_PRIORITY[i]=info; SC_F_CONFIDENCE[i]=observation; fi
+}
+
+sc_rkh_check_ssh() {
+    local i=$1 prefix="$SC_RUN_DIR/rkh-context.$1" value='' line rc major minor count=0
+    SC_F_CHECK_KEY[i]=rkh_ssh_unknown
+    SC_F_CHECK_DETAIL[i]=''
+    command -v sshd >/dev/null || return
+    SC_F_CHECK_DETAIL[i]="log=rkh-context.$i.ssh / rkh-context.$i.stderr"
+    if [[ ${SC_F_KEY[i]} == rkh_ssh_root ]]; then
+        sc_capture "$prefix.ssh" "$prefix.stderr" 10 sshd -T
+        rc=$?
+        ((rc == 0)) && [[ ! -s $prefix.stderr ]] || return
+        while IFS= read -r line; do
+            if [[ $line == 'permitrootlogin '* ]]; then value=${line#* }; ((count+=1)); fi
+        done < "$prefix.ssh"
+        ((count == 1)) || return
+        case $value in
+            yes) SC_F_CHECK_KEY[i]=rkh_ssh_allowed;;
+            no) SC_F_CHECK_KEY[i]=rkh_ssh_disabled; SC_F_PRIORITY[i]=suggestion;;
+            prohibit-password|without-password) SC_F_CHECK_KEY[i]=rkh_ssh_keys; SC_F_PRIORITY[i]=suggestion;;
+            forced-commands-only) SC_F_CHECK_KEY[i]=rkh_ssh_commands; SC_F_PRIORITY[i]=suggestion;;
+            *) return;;
+        esac
+        SC_F_KIND[i]=hardening
+        SC_F_CONFIDENCE[i]=observation
+        SC_F_CHECK_DETAIL[i]="sshd -T: PermitRootLogin=$value; log=rkh-context.$i.ssh"
+    else
+        sc_capture "$prefix.ssh" "$prefix.stderr" 10 sshd -V
+        rc=$?
+        ((rc == 0)) || return
+        while IFS= read -r line || [[ -n $line ]]; do
+            if [[ $line =~ ^OpenSSH_([0-9]{1,3})\.([0-9]{1,3})(p[0-9]+)?([,[:space:]]|$) ]]; then
+                major=${BASH_REMATCH[1]}; minor=${BASH_REMATCH[2]}
+                if ((10#$major > 7 || (10#$major == 7 && 10#$minor >= 6))); then
+                    SC_F_CHECK_KEY[i]=rkh_ssh_modern; SC_F_PRIORITY[i]=info
+                    SC_F_CONFIDENCE[i]=observation; SC_F_CHECK_DETAIL[i]="$(sc_text "$line"); sshd -V"; return
+                fi
+            fi
+        done < <(cat -- "$prefix.ssh" "$prefix.stderr")
+    fi
+}
+
+sc_interpret_rkhunter() {
+    local i hidden=0 name checked=0 started=$SECONDS
+    SC_RKH_CONTEXT_PARTIAL=0
+    for name in "${SC_F_KEY[@]}"; do
+        [[ $name == rkh_hidden_file || $name == rkh_hidden_directory ]] && hidden=1
+    done
+    if ((hidden)); then
+        for i in "${!SC_F_KEY[@]}"; do
+            [[ ${SC_F_KEY[i]} == rkh_hidden_summary ]] || continue
+            for name in SC_F_MODULE SC_F_KIND SC_F_PRIORITY SC_F_CONFIDENCE SC_F_OBJECT SC_F_KEY SC_F_EVIDENCE SC_F_CHECK_KEY SC_F_CHECK_DETAIL; do
+                local -n values=$name
+                unset 'values[i]'
+            done
+        done
+        for name in SC_F_MODULE SC_F_KIND SC_F_PRIORITY SC_F_CONFIDENCE SC_F_OBJECT SC_F_KEY SC_F_EVIDENCE SC_F_CHECK_KEY SC_F_CHECK_DETAIL; do
+            local -n values=$name
+            values=("${values[@]}")
+        done
+    fi
+    for ((i=0;i<${#SC_F_MODULE[@]};i++)); do
+        [[ ${SC_F_MODULE[i]} == rkhunter ]] || continue
+        case ${SC_F_KEY[i]} in
+            rkh_hidden_directory)
+                SC_F_CHECK_KEY[i]=rkh_file_nonregular; SC_RKH_CONTEXT_PARTIAL=1; continue;;
+            rkh_script|rkh_hidden_file|rkh_file_warning|rkh_ssh_root|rkh_ssh_protocol) ;;
+            *) continue;;
+        esac
+        if ((checked >= 40 || SECONDS-started >= 180)); then
+            SC_F_CHECK_KEY[i]=rkh_context_limit; SC_RKH_CONTEXT_PARTIAL=1; continue
+        fi
+        ((checked+=1))
+        case ${SC_F_KEY[i]} in rkh_ssh_*) sc_rkh_check_ssh "$i";; *) sc_rkh_check_file "$i";; esac
+        case ${SC_F_CHECK_KEY[i]} in
+            rkh_file_unknown|rkh_file_tool_missing|rkh_file_nonregular|rkh_context_limit|rkh_ssh_unknown)
+                SC_RKH_CONTEXT_PARTIAL=1;;
+        esac
+    done
+    SC_SCOPE+=('rkhunter context: up to 40 checks / 180s plus one in-flight check; regular files <=64MiB; exact pacfile MTREE record + SHA-256; local package records do not prove trusted origin. SSH uses default configuration, not every Match context or running daemon.')
+}
+
 sc_run_rkhunter() {
     if ! command -v rkhunter >/dev/null; then sc_module_set rkhunter skipped missing_rkhunter; return 0; fi
     sc_module_set rkhunter running ''
     SC_MODULE_VERSION[rkhunter]=$(sc_version rkhunter --version)
     local out="$SC_RUN_DIR/rkhunter.stdout" err="$SC_RUN_DIR/rkhunter.stderr"
-    local raw="$SC_RUN_DIR/rkhunter.log" parsed rc line errors=0 unknown=0 before=${#SC_F_MODULE[@]}
+    local raw="$SC_RUN_DIR/rkhunter.log" parsed rc line errors=0 unknown=0
+    SC_RKH_WARNINGS=0
     sc_capture "$out" "$err" 1200 rkhunter --check --nocolors --sk --lang en --logfile "$raw"
     rc=$?; SC_MODULE_RC[rkhunter]=$rc
     # Display execution diagnostics before the potentially long skipped-test list.
@@ -168,12 +364,15 @@ sc_run_rkhunter() {
         sc_parse_rkhunter "$out"
         SC_PARSE_UNKNOWN=$((SC_PARSE_UNKNOWN || unknown))
     fi
+    sc_interpret_rkhunter
     if ((rc <= 1)) && grep -Eq 'System checks summary|Info: End date is' "$parsed" "$out"; then
-        if ((rc == 1 && ${#SC_F_MODULE[@]} == before)); then
+        if ((rc == 1 && SC_RKH_WARNINGS == 0)); then
             errors=1; sc_add_diagnostic rkhunter rkh_unparsed 'exit=1; rkhunter.log / rkhunter.stdout'
         fi
         if ((errors || SC_PARSE_UNKNOWN)); then
             sc_module_set rkhunter partial rkh_limited
+        elif ((SC_RKH_CONTEXT_PARTIAL)); then
+            sc_module_set rkhunter partial rkh_context_limited
         else sc_module_set rkhunter completed ''; fi
     elif [[ -s $out || -s $raw ]]; then sc_module_set rkhunter partial unfinished
     else sc_module_set rkhunter failed command_failed
@@ -817,9 +1016,11 @@ PY
 sc_t() {
     local en it
     case $1 in
-        tagline) en='Understand the signals. Choose your next step.'; it="Comprendi i segnali. Scegli il prossimo passo.";;
-        scope) en='READ-ONLY SECURITY CHECKS  /  ARCH LINUX'; it="CONTROLLI DI SICUREZZA  /  ARCH LINUX";;
         welcome) en='Choose what to check'; it="Scegli cosa controllare";;
+        menu_scans) en='SCANS'; it="SCANSIONI";;
+        menu_tools) en='TOOLS'; it="STRUMENTI";;
+        full_includes) en='Runs all five checks: options 2, 3, 4, 5 and 9.'; it="Esegue tutti e cinque i controlli: voci 2, 3, 4, 5 e 9.";;
+        tools_separate) en='Dependency installation, signature updates and the demo are separate actions.'; it="Installazione dipendenze, aggiornamento firme ed esempio sono azioni separate.";;
         menu_full) en='Full scan'; it="Scansione completa";;
         menu_rkhunter) en='Rootkit indicators'; it="Indicatori di rootkit";;
         menu_lynis) en='System configuration'; it="Configurazione del sistema";;
@@ -838,12 +1039,12 @@ sc_t() {
         review) en='REVIEW NEEDED'; it="DA VERIFICARE";;
         advice) en='IMPROVEMENTS AVAILABLE'; it="MIGLIORAMENTI POSSIBILI";;
         unknown) en='RESULT UNDETERMINED'; it="ESITO NON DETERMINABILE";;
-        clear) en='NO FINDINGS IN THESE CHECKS'; it="NESSUNA SEGNALAZIONE NEI CONTROLLI";;
+        clear) en='NO UNRESOLVED FINDINGS'; it="NESSUNA SEGNALAZIONE APERTA";;
         why_urgent) en='A strong indicator needs investigation. A finding alone does not establish that malware ran.'; it="Un indicatore forte richiede attenzione. Una segnalazione, da sola, non dimostra che il malware sia stato eseguito.";;
         why_review) en='There are changes or traces to explain. They may have a legitimate cause.'; it="Ci sono modifiche o tracce da chiarire. Potrebbero avere una causa legittima.";;
         why_advice) en='There are software maintenance or configuration suggestions. These are not evidence of an infection.'; it="Ci sono consigli sulla manutenzione del software o sulla configurazione. Non sono prove di infezione.";;
         why_unknown) en='Some checks could not finish. Missing results cannot establish a clean outcome.'; it="Alcuni controlli non sono terminati. I risultati mancanti non permettono di escludere problemi.";;
-        why_clear) en='No signals were found within the stated scope. This is not a guarantee that the system is safe.'; it="Nessun segnale trovato nei limiti indicati. Questo non garantisce che il sistema sia sicuro.";;
+        why_clear) en='No unresolved signals remain within the stated scope. This is not a guarantee that the system is safe.'; it="Nei limiti dei controlli svolti non restano segnali da chiarire. Questo non garantisce che il sistema sia sicuro.";;
         coverage) en='COVERAGE'; it="COPERTURA";;
         complete) en='COMPLETE FOR SELECTED CHECKS'; it="COMPLETA PER I CONTROLLI SCELTI";;
         incomplete) en='INCOMPLETE'; it="INCOMPLETA";;
@@ -876,8 +1077,8 @@ sc_t() {
         health_tls) en='The secure AUR connection could not be verified. Check the clock, certificates and proxy; do not disable certificate checks.'; it="Impossibile verificare la connessione sicura ad AUR. Controlla orologio, certificati e proxy; mantieni attiva la verifica dei certificati.";;
         health_fetch) en='An AUR request failed. The URL, command exit code and original error below identify the failed operation.'; it="Una richiesta AUR è fallita. URL, codice di uscita ed errore originale qui sotto identificano l'operazione non riuscita.";;
         health_data_error) en='Some AUR data could not be read or validated. Unknown maintainer information is not treated as a removal.'; it="Alcuni dati AUR non sono leggibili o verificabili. Un maintainer non verificato non viene considerato rimosso.";;
-        health_baseline) en='First AUR snapshot recorded. Maintainer changes before this observation are unknown; comparison starts with the next complete scan.'; it="Registrata la prima fotografia AUR. I cambi di maintainer precedenti sono sconosciuti; il confronto inizia dalla prossima scansione completa.";;
-        health_compared) en='AUR maintainers compared with the previous complete scan. Changes are observations, not evidence of malicious intent.'; it="Maintainer AUR confrontati con la precedente scansione completa. I cambi sono osservazioni, non prove di intenzioni malevole.";;
+        health_baseline) en='First AUR snapshot recorded. Earlier maintainer changes are unknown; comparison starts with the next successful AUR check (option 9 or a full scan).'; it="Registrata la prima fotografia AUR. I cambi di maintainer precedenti sono sconosciuti; il confronto inizia dal prossimo controllo AUR riuscito (voce 9 o scansione completa).";;
+        health_compared) en='AUR maintainers compared with the preceding successful AUR check. Changes are observations, not evidence of malicious intent.'; it="Maintainer confrontati con il precedente controllo AUR riuscito. I cambi sono osservazioni, non prove di intenzioni malevole.";;
         health_orphan) en='AUR lists no primary maintainer: this package is orphaned. This differs from an unused local dependency. Check support and consider a maintained alternative if needed.'; it="AUR non indica un maintainer principale: il pacchetto è orfano. Non significa che sia una dipendenza locale inutilizzata. Verifica il supporto e valuta, se serve, un'alternativa mantenuta.";;
         health_flagged) en='Someone flagged the AUR recipe as out of date. This is a report by a user, not a verified vulnerability or proof that every installed version is obsolete.'; it="La ricetta AUR è segnalata come non aggiornata. È una segnalazione di un utente, non una vulnerabilità verificata o la prova che ogni versione installata sia obsoleta.";;
         health_upgrade) en='AUR advertises a newer package version than the installed one. Review the build changes before updating. VCS packages may use dynamic versions.'; it="AUR indica una versione del pacchetto più nuova di quella installata. Esamina le modifiche allo script prima di aggiornare. I pacchetti VCS possono usare versioni dinamiche.";;
@@ -929,6 +1130,48 @@ sc_t() {
         confidence_match) en='Known byte sequence matched'; it="Corrispondenza con byte noti";;
         confidence_unconfirmed) en='Indicator requiring verification'; it="Indicatore da confermare";;
         confidence_observation) en='Observation; cause not established'; it="Osservazione; causa da chiarire";;
+        package) en='Package'; it="Pacchetto";;
+        meaning) en='What it means'; it="Cosa significa";;
+        checked) en='SecCheck verification'; it="Verifica di SecCheck";;
+        action) en='What to do'; it="Cosa fare";;
+        explained) en='Warnings explained by additional checks'; it="Avvisi spiegati dalle verifiche aggiuntive";;
+        explained_note) en='These stay in the details and report. A matching local package record does not certify the package source or the whole system.'; it="Restano consultabili nei dettagli e nel rapporto. La corrispondenza con i dati locali non certifica la provenienza del pacchetto o l'intero sistema.";;
+        priority_info) en='Explained'; it="Spiegato";;
+        page) en='Page'; it="Pagina";;
+        pages_menu) en='1  Next page   2  Previous page   0  Back to result'; it="1  Pagina successiva   2  Pagina precedente   0  Torna al risultato";;
+        rkh_prerequisite) en='rkhunter reported a prerequisite problem. This limits its checks; it is not a malware detection. Read the prerequisite section in rkhunter.log.'; it="rkhunter segnala un problema nei prerequisiti. Limita i suoi controlli e non è un rilevamento di malware. La sezione dei prerequisiti in rkhunter.log contiene i dettagli.";;
+        rkh_baseline_notice) en='This is a reminder about rkhunter baseline updates, not a detected threat. Do not use --propupd to silence warnings before checking their cause.'; it="Questo è un promemoria sull'aggiornamento della base di confronto di rkhunter, non una minaccia rilevata. Non usare --propupd per azzerare gli avvisi prima di averne verificato la causa.";;
+        rkh_context_limited) en='rkhunter finished, but some automatic follow-up checks were unavailable or inconclusive. The details explain which ones and why.'; it="rkhunter è terminato, ma alcune verifiche aggiuntive non erano disponibili o non hanno dato una risposta completa. I dettagli indicano quali e perché.";;
+        rkh_script) en='rkhunter expected a compiled program and found a script. A distribution can intentionally ship scripts; SecCheck checks the installed file against its package record.'; it="rkhunter si aspettava un programma compilato e ha trovato uno script. La distribuzione può fornire intenzionalmente uno script: SecCheck lo confronta con i dati del pacchetto installato.";;
+        rkh_file_warning) en='rkhunter flagged this file. SecCheck checks whether it belongs to an installed package and whether its contents match the recorded SHA-256.'; it="rkhunter ha segnalato questo file. SecCheck verifica a quale pacchetto appartiene e se il contenuto coincide con lo SHA-256 registrato.";;
+        rkh_path_unreadable) en='Control characters or ambiguous text separators prevent reliable identification of the reported path. No automatic file verification was attempted. Inspect the original rkhunter log before acting on the path.'; it="Caratteri di controllo o separatori ambigui nel testo impediscono di identificare con certezza il percorso segnalato. La verifica automatica del file non è stata tentata. Consulta il log originale di rkhunter prima di intervenire sul percorso.";;
+        rkh_hidden_file) en='The name starts with a dot, which hides it in ordinary file listings. That is common on Linux and does not by itself indicate malware. SecCheck checks its package record when available.'; it="Il nome inizia con un punto e quindi il file è nascosto negli elenchi ordinari. È comune su Linux e non indica da solo malware. SecCheck verifica i dati del pacchetto, quando disponibili.";;
+        rkh_hidden_directory) en='rkhunter reported a hidden directory. Applications commonly create these. A directory cannot be verified with a single file hash: check which application created it and examine its contents without running them.'; it="rkhunter segnala una cartella nascosta. Molte applicazioni ne creano: una cartella non si verifica con lo SHA-256 di un singolo file. Controlla quale applicazione l'ha creata e il suo contenuto, senza eseguirlo.";;
+        rkh_hidden_summary) en='rkhunter reported hidden files without individually readable details. Their names are needed before a file verification can be made.'; it="rkhunter segnala file nascosti, ma non sono disponibili dettagli leggibili sui singoli file. Servono i percorsi per verificarli.";;
+        rkh_dev) en='rkhunter found unexpected file types under /dev, where devices and runtime data live. Some applications create legitimate files there; this warning needs the listed paths and their origin.'; it="rkhunter segnala tipi di file inattesi in /dev, dove si trovano dispositivi e dati creati durante il funzionamento. Alcune applicazioni vi creano file legittimi: occorre verificarne percorsi e origine.";;
+        rkh_ssh_root) en='This concerns administrator login through SSH, the service for remote access. A missing explicit setting does not tell us its effective value.'; it="Riguarda l'accesso come amministratore tramite SSH, il servizio per collegarsi da remoto. Una voce non scritta nel file di configurazione non basta a conoscerne il valore effettivo.";;
+        rkh_ssh_protocol) en='rkhunter is checking for the obsolete SSH protocol 1. SecCheck checks the installed server version to interpret this older test.'; it="rkhunter cerca il vecchio protocollo SSH 1. SecCheck controlla la versione del server installato per interpretare questo test datato.";;
+        rkh_file_match) en='The exact file has a package owner, its SHA-256 matches the local record, and type, permissions and ownership show no difference. This explains this file warning.'; it="Il file appartiene a un pacchetto, lo SHA-256 coincide con i dati locali e tipo, permessi e proprietario non mostrano differenze. Questo spiega l'avviso sul file.";;
+        rkh_file_changed) en='The file content differs from the SHA-256 recorded by its package. SecCheck has kept the warning open.'; it="Il contenuto del file è diverso dallo SHA-256 registrato dal pacchetto. SecCheck mantiene aperta la segnalazione.";;
+        rkh_file_metadata) en='The SHA-256 matches, but type, permissions or ownership differ from the package record. Matching contents do not explain these property changes.'; it="Lo SHA-256 coincide, ma tipo, permessi o proprietario differiscono dai dati del pacchetto. Il contenuto uguale non spiega queste modifiche alle proprietà.";;
+        rkh_file_unknown) en='The package check did not provide a complete, readable record for this exact file. It has not been marked as verified.'; it="Il controllo del pacchetto non ha fornito dati completi e leggibili per questo file preciso. Non è stato considerato verificato.";;
+        rkh_file_unowned) en='No installed package claims this file. Files generated by the system or applications can be unowned; this result alone does not establish an infection.'; it="Nessun pacchetto installato dichiara questo file. È possibile per file generati dal sistema o dalle applicazioni; questo risultato da solo non dimostra un'infezione.";;
+        rkh_file_tool_missing) en='pacfile is unavailable. It is supplied by pacutils, which is needed for this automatic file verification.'; it="pacfile non è disponibile. Fa parte di pacutils, necessario per questa verifica automatica del file.";;
+        rkh_file_nonregular) en='This path is missing, is a symbolic link, or is not a regular file. SecCheck has not treated it as a file with a verified content hash.'; it="Il percorso è assente, è un collegamento simbolico oppure non è un file ordinario. SecCheck non lo ha considerato un file con contenuto verificato.";;
+        rkh_context_limit) en='The additional check exceeded its file-size, count or time limit. The warning remains open.'; it="La verifica aggiuntiva supera il limite di dimensione, numero di file o tempo. La segnalazione resta aperta.";;
+        rkh_ssh_allowed) en='The general SSH configuration permits root login. Whether the server is running, reachable or restricted by Match rules is not established by this check.'; it="La configurazione generale di SSH consente il login di root. Questo controllo non stabilisce se il server sia avviato, raggiungibile o limitato da regole Match.";;
+        rkh_ssh_disabled) en='The general SSH configuration disables root login. Connection-specific Match rules and custom server startup options need separate review.'; it="La configurazione generale di SSH disabilita il login di root. Le regole Match per connessioni specifiche e le opzioni di avvio personalizzate richiedono un controllo separato.";;
+        rkh_ssh_keys) en='The general SSH configuration allows root login with keys, but disables password and keyboard-interactive login. This is a configuration choice, not a rootkit finding.'; it="La configurazione generale di SSH consente l'accesso di root con chiavi e disabilita password e autenticazione interattiva da tastiera. È una scelta di configurazione, non un rilevamento di rootkit.";;
+        rkh_ssh_commands) en='Root login is limited to keys with a forced command in the general SSH configuration. Review whether this is needed for your remote tasks.'; it="La configurazione generale di SSH limita root alle chiavi associate a un comando prestabilito. Verifica se serve per le tue attività remote.";;
+        rkh_ssh_modern) en='The detected OpenSSH server version no longer supports SSH protocol 1. The old Protocol-setting warning is explained for this server binary.'; it="La versione rilevata del server OpenSSH non supporta più il protocollo SSH 1. L'avviso sulla vecchia voce Protocol è spiegato per questo eseguibile del server.";;
+        rkh_ssh_unknown) en='SecCheck could not read a supported server version or its effective configuration. It has not assumed that SSH access is disabled or secure.'; it="SecCheck non è riuscito a leggere una versione riconosciuta del server o la sua configurazione effettiva. Non presume che l'accesso SSH sia disabilitato o sicuro.";;
+        rkh_action_explained) en='No change is needed solely for this warning. Keep the separate findings and incomplete checks under review.'; it="Non serve intervenire solo per questo avviso. Restano da valutare le altre segnalazioni e i controlli incompleti.";;
+        rkh_action_file) en='Check whether you intentionally changed this file. If not, inspect the saved comparison and package origin before replacing anything. Do not execute a file to test whether it is safe.'; it="Verifica se hai modificato volontariamente questo file. Altrimenti controlla il confronto salvato e l'origine del pacchetto prima di sostituirlo. Non eseguire un file per provare se è sicuro.";;
+        rkh_action_unowned) en='Check which application created it and whether its location is expected. Do not remove it just because it is hidden or has no package owner.'; it="Verifica quale applicazione lo ha creato e se la posizione è prevista. Non rimuoverlo solo perché è nascosto o non appartiene a un pacchetto.";;
+        rkh_action_tools) en='Install pacutils using option 6, then repeat the rootkit scan with option 2.'; it="Installa pacutils dalla voce 6, poi ripeti il controllo rootkit con la voce 2.";;
+        rkh_action_ssh) en='If direct root access is unnecessary, consider PermitRootLogin no. Check Include and Match rules before changing the configuration; validate it with sshd -t and keep an existing remote session open.'; it="Se l'accesso diretto come root non ti serve, valuta PermitRootLogin no. Controlla le regole Include e Match prima di modificare la configurazione; validala con sshd -t e mantieni aperta un'eventuale sessione remota.";;
+        rkh_action_ssh_disabled) en='No change is needed for the general root-login setting. If you use SSH, also review any connection-specific Match rules.'; it="Non serve cambiare l'impostazione generale del login di root. Se usi SSH, controlla anche le eventuali regole Match per connessioni specifiche.";;
+        rkh_action_unknown) en='The original warning and the saved check logs identify what could not be verified. Use those details for further investigation or technical assistance.'; it="L'avviso originale e i log della verifica indicano cosa non è stato possibile controllare. Usa questi dettagli per approfondire o chiedere assistenza tecnica.";;
         rkh_signature) en='rkhunter reported a possible rootkit signature. It remains unresolved even if package checks pass. Check the exact signature and its context with expert help.'; it="rkhunter segnala una possibile firma di rootkit. Resta da chiarire anche se i pacchetti superano il controllo. Verifica la firma precisa e il contesto con aiuto esperto.";;
         rkh_properties) en='rkhunter found changed file properties. Updates can cause this, but the change needs checking. Do not reset its baseline before investigating.'; it="rkhunter ha trovato proprietà di file cambiate. Gli aggiornamenti possono causarlo, ma occorre verificare. Non azzerare la base di confronto prima di approfondire.";;
         rkh_warning) en='rkhunter raised an alert. Read the specific evidence: hidden files and configuration warnings can have legitimate explanations.'; it="rkhunter ha prodotto un avviso. Leggi la prova specifica: file nascosti e avvisi di configurazione possono avere spiegazioni legittime.";;
@@ -949,16 +1192,24 @@ sc_t() {
         scope_report) en='TECHNICAL SCOPE / ORIGINAL LOGS'; it="AMBITO TECNICO / LOG ORIGINALI";;
         limits) en='Live checks cannot exclude hidden rootkits, past execution or data theft. AUR checks cover only bundled indicators and listed paths.'; it="I controlli dal sistema avviato non escludono rootkit nascosti, esecuzioni passate o furti di dati. Il modulo AUR copre solo gli indicatori inclusi e i percorsi indicati.";;
         result_menu) en='1  Findings   2  Full report   3  Repeat scan   0  Main menu'; it="1  Dettagli   2  Rapporto   3  Ripeti scansione   0  Menu";;
-        more) en='More findings are available in the full report.'; it="Le altre segnalazioni sono disponibili nel rapporto completo.";;
+        more) en='More findings are available on the following pages and in the full report.'; it="Le altre segnalazioni sono nelle pagine successive e nel rapporto completo.";;
         unsupported) en='Scanning requires Arch Linux or an Arch derivative with pacman.'; it="La scansione richiede Arch Linux o una derivata con pacman.";;
         root) en='This action requires root. SecCheck will request permission through sudo.'; it="Questa azione richiede root. SecCheck chiederà i permessi tramite sudo.";;
         need_root) en='Run this command with sudo to scan noninteractively.'; it="Esegui questo comando con sudo per una scansione non interattiva.";;
         storage_error) en='Cannot create a private report directory. Scan not started.'; it="Impossibile creare una cartella privata per i rapporti. Scansione non avviata.";;
         save_error) en='Report could not be saved completely. Check free space and permissions.'; it="Rapporto non salvato completamente. Controlla spazio libero e permessi.";;
         deps) en='TOOLS AND PURPOSE'; it="STRUMENTI E FUNZIONE";;
+        deps_startup) en='STARTUP CHECK'; it="CONTROLLO INIZIALE";;
+        deps_explain) en='SecCheck checks which tools are available before you choose a scan.'; it="SecCheck verifica gli strumenti disponibili prima di scegliere una scansione.";;
+        deps_ready) en='Tools ready: all scan dependencies are available.'; it="Strumenti pronti: sono disponibili tutte le dipendenze delle scansioni.";;
+        deps_missing) en='Missing packages'; it="Pacchetti mancanti";;
+        deps_continue) en='You can continue. Checks needing missing tools will remain incomplete. Use option 6 to install them later.'; it="Puoi proseguire. I controlli che richiedono gli strumenti mancanti resteranno incompleti. Puoi installarli in seguito dalla voce 6.";;
+        deps_pacutils) en='File contents and automatic verification of rkhunter file warnings (paccheck + pacfile)'; it="Contenuto dei file e verifica automatica degli avvisi di rkhunter (paccheck + pacfile)";;
+        deps_python) en='Read AUR metadata and compare maintainer history'; it="Lettura dei dati AUR e confronto dello storico dei maintainer";;
+        deps_curl) en='HTTPS connection to AUR for maintenance information'; it="Collegamento HTTPS ad AUR per i dati sulla manutenzione";;
         available) en='available'; it="disponibile";;
         absent) en='missing'; it="mancante";;
-        install_question) en='Install missing scanner packages with pacman? [y/N]'; it="Installare con pacman gli strumenti mancanti? [s/N]";;
+        install_question) en='Install the missing packages with pacman? [y/N]'; it="Installare con pacman i pacchetti mancanti? [s/N]";;
         install_note) en='pacman will show its own transaction confirmation. No AUR helper is used.'; it="pacman mostrerà la propria conferma della transazione. Non viene usato un helper AUR.";;
         install_failed) en='Installation did not complete.'; it="Installazione non completata.";;
         signatures_updated) en='rkhunter signatures updated.'; it="Firme di rkhunter aggiornate.";;
@@ -988,11 +1239,12 @@ sc_ui_init() {
     [[ $SC_WIDTH =~ ^[0-9]{1,4}$ ]] || SC_WIDTH=80
     ((SC_WIDTH < 24)) && SC_WIDTH=24
     ((SC_WIDTH > 120)) && SC_WIDTH=120
-    SC_C_PRIMARY='' SC_C_MUTED='' SC_C_RED='' SC_C_AMBER='' SC_C_GREEN='' SC_C_RESET='' SC_C_BOLD=''
+    SC_C_PRIMARY='' SC_C_MUTED='' SC_C_RED='' SC_C_AMBER='' SC_C_GREEN='' SC_C_WHITE='' SC_C_RESET='' SC_C_BOLD=''
     if [[ -t 1 && ${TERM:-dumb} != dumb && ${SC_NO_COLOR:-0} == 0 && ! ${NO_COLOR+x} ]]; then
         SC_C_RESET=$'\e[0m' SC_C_BOLD=$'\e[1m'
         SC_C_PRIMARY=$'\e[38;5;80m' SC_C_MUTED=$'\e[38;5;109m'
         SC_C_RED=$'\e[38;5;203m' SC_C_AMBER=$'\e[38;5;222m' SC_C_GREEN=$'\e[38;5;114m'
+        SC_C_WHITE=$'\e[38;5;255m'
         if [[ ${COLORTERM:-} == truecolor || ${COLORTERM:-} == 24bit ]]; then
             SC_C_PRIMARY=$'\e[38;2;122;205;216m' SC_C_MUTED=$'\e[38;2;140;168;185m'
         fi
@@ -1025,18 +1277,44 @@ sc_line() {
 
 sc_rule() { printf '  %s' "$SC_C_MUTED"; sc_repeat "$SC_RULE_CHAR" "$((SC_WIDTH-4))"; printf '%s\n' "$SC_C_RESET"; }
 sc_cell() { printf '%s%*s' "$1" "$(( $2 - ${#1} ))" ''; }
-sc_heading() { printf '\n'; sc_line "$(sc_t "$1")" "$SC_C_PRIMARY$SC_C_BOLD"; sc_rule; }
+sc_heading() { printf '\n'; sc_line "$(sc_t "$1")" "${2:-$SC_C_PRIMARY}$SC_C_BOLD"; sc_rule; }
+sc_brand() {
+    printf '\n'
+    if ((SC_WIDTH >= 68)) && [[ ${SC_ASCII:-0} == 0 ]]; then
+        local i
+        local -a sec=(
+            '███████╗███████╗ ██████╗'
+            '██╔════╝██╔════╝██╔════╝'
+            '███████╗█████╗  ██║     '
+            '╚════██║██╔══╝  ██║     '
+            '███████║███████╗╚██████╗'
+            '╚══════╝╚══════╝ ╚═════╝'
+        ) check=(
+            ' ██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗'
+            '██╔════╝██║  ██║██╔════╝██╔════╝██║ ██╔╝'
+            '██║     ███████║█████╗  ██║     █████╔╝ '
+            '██║     ██╔══██║██╔══╝  ██║     ██╔═██╗ '
+            '╚██████╗██║  ██║███████╗╚██████╗██║  ██╗'
+            ' ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝'
+        )
+        for ((i=0;i<6;i++)); do
+            printf '  %s%s%s %s%s%s\n' "$SC_C_PRIMARY$SC_C_BOLD" "${sec[i]}" "$SC_C_RESET" "$SC_C_WHITE$SC_C_BOLD" "${check[i]}" "$SC_C_RESET"
+        done
+        printf '\n'
+    else
+        sc_rule; sc_line 'S E C C H E C K' "$SC_C_PRIMARY$SC_C_BOLD"; sc_rule
+    fi
+    sc_line 'Security & Integrity Checker for Arch Linux' "$SC_C_PRIMARY$SC_C_BOLD"
+    sc_line "v$SC_VERSION | KlodCripta" "$SC_C_WHITE"
+}
 sc_header() {
-    printf '\n'; sc_rule
-    sc_line "S E C C H E C K   /   $SC_VERSION" "$SC_C_PRIMARY$SC_C_BOLD"
-    sc_line "$(sc_t scope)" "$SC_C_MUTED"
-    sc_rule; sc_line "$(sc_t tagline)"; printf '\n'
+    sc_brand; sc_rule; printf '\n'
     [[ ${SC_DEMO:-0} == 0 ]] || sc_line "$(sc_t demo)" "$SC_C_AMBER"
 }
 
 sc_status_color() {
     case $1 in urgent|failed) printf '%s' "$SC_C_RED";; review|advice|partial) printf '%s' "$SC_C_AMBER";;
-        clear|completed) printf '%s' "$SC_C_GREEN";; *) printf '%s' "$SC_C_MUTED";; esac
+        clear|completed) printf '%s' "$SC_C_GREEN";; info|suggestion) printf '%s' "$SC_C_PRIMARY";; *) printf '%s' "$SC_C_MUTED";; esac
 }
 
 sc_render_diagnostics() {
@@ -1056,7 +1334,7 @@ sc_render_diagnostics() {
 
 sc_render_summary() {
     local module count i color label bar total=${#SC_SELECTED[@]}
-    sc_heading result
+    sc_heading result "$(sc_status_color "$SC_ASSESSMENT")"
     color=$(sc_status_color "$SC_ASSESSMENT")
     sc_line "$SC_DOT  $(sc_t "$SC_ASSESSMENT")" "$color$SC_C_BOLD"
     sc_line "$(sc_t "why_$SC_ASSESSMENT")"
@@ -1098,6 +1376,10 @@ sc_render_summary() {
         sc_line "$(sc_t "priority_$priority"): $count  $(sc_repeat "$SC_BAR_CHAR" "$n")" "$(sc_status_color "$priority")"
     done
     sc_line "$(sc_t count_note)" "$SC_C_MUTED"
+    if ((SC_INFO)); then
+        printf '\n'; sc_line "$(sc_t explained): $SC_INFO" "$SC_C_GREEN$SC_C_BOLD"
+        sc_line "$(sc_t explained_note)"
+    fi
     sc_heading next
     sc_line "$(sc_t "next_$SC_ASSESSMENT")"
     ((SC_INCOMPLETE == 0)) || sc_line "$(sc_t incomplete_next)" "$SC_C_AMBER"
@@ -1105,24 +1387,61 @@ sc_render_summary() {
 }
 
 sc_render_details() {
-    local limit=${1:-0} i shown=0 priority object
+    local limit=${1:-0} offset=${2:-0} i shown=0 visited=0 priority object check action
     sc_heading details
     ((${#SC_F_MODULE[@]})) || { sc_line "$(sc_t none)"; return 0; }
-    for priority in urgent review suggestion; do
+    for priority in urgent review suggestion info; do
         for ((i=0;i<${#SC_F_MODULE[@]};i++)); do
             [[ ${SC_F_PRIORITY[i]} == "$priority" ]] || continue
+            ((visited+=1)); ((visited > offset)) || continue
             if ((limit && shown >= limit)); then sc_line "$(sc_t more)"; return 0; fi
             ((shown+=1)); object=${SC_F_OBJECT[i]}
             printf '\n'
             sc_line "#$((i+1)) / $(sc_t "priority_$priority") / $(sc_t "${SC_F_MODULE[i]}")" "$(sc_status_color "$priority")"
             sc_line "$(sc_t "confidence_${SC_F_CONFIDENCE[i]}")" "$SC_C_MUTED"
             [[ -z $object ]] || sc_line "$(sc_t object): $object"
+            sc_line "$(sc_t meaning):" "$SC_C_WHITE$SC_C_BOLD"
             sc_line "$(sc_t "${SC_F_KEY[i]}")"
+            check=${SC_F_CHECK_KEY[i]}
+            if [[ -n $check ]]; then
+                sc_line "$(sc_t checked):" "$SC_C_PRIMARY$SC_C_BOLD"
+                sc_line "$(sc_t "$check")"
+                [[ -z ${SC_F_CHECK_DETAIL[i]} ]] || sc_line "${SC_F_CHECK_DETAIL[i]}" "$SC_C_MUTED"
+                case $check in
+                    rkh_file_match|rkh_ssh_modern) action=rkh_action_explained;;
+                    rkh_file_changed|rkh_file_metadata) action=rkh_action_file;;
+                    rkh_file_unowned) action=rkh_action_unowned;;
+                    rkh_file_tool_missing) action=rkh_action_tools;;
+                    rkh_ssh_allowed|rkh_ssh_keys|rkh_ssh_commands) action=rkh_action_ssh;;
+                    rkh_ssh_disabled) action=rkh_action_ssh_disabled;;
+                    *) action=rkh_action_unknown;;
+                esac
+                sc_line "$(sc_t action):" "$SC_C_AMBER$SC_C_BOLD"
+                sc_line "$(sc_t "$action")"
+            fi
             if [[ ${SC_F_MODULE[i]} == integrity && ( $object == /etc/* || ${SC_F_EVIDENCE[i]} == *'backup file:'* ) ]]; then
                 sc_line "$(sc_t file_config)"
             fi
             sc_line "$(sc_t evidence): ${SC_F_EVIDENCE[i]}" "$SC_C_MUTED"
         done
+    done
+}
+
+sc_browse_details() {
+    local page=0 pages=$(((${#SC_F_MODULE[@]}+9)/10)) answer
+    ((pages)) || { sc_render_details; return; }
+    while :; do
+        sc_line "$(sc_t page) $((page+1)) / $pages" "$SC_C_PRIMARY"
+        sc_render_details 10 "$((page*10))"
+        [[ -t 0 ]] || return 0
+        printf '\n'; sc_line "$(sc_t pages_menu)"
+        printf '  > '; IFS= read -r answer || return 0
+        case $answer in
+            1) ((page+1 < pages)) && ((page+=1));;
+            2) ((page > 0)) && ((page-=1));;
+            0) return 0;;
+            *) sc_line "$(sc_t invalid)";;
+        esac
     done
 }
 
@@ -1168,6 +1487,13 @@ sc_save_report() (
                 "${SC_F_PRIORITY[i]}" "${SC_F_CONFIDENCE[i]}" "${SC_F_OBJECT[i]}" "${SC_F_KEY[i]}" "${SC_F_EVIDENCE[i]}"
         done
     } > "$SC_RUN_DIR/findings.tsv" || return 1
+    {
+        printf 'finding\tresult\tdetail\n'
+        for ((i=0;i<${#SC_F_MODULE[@]};i++)); do
+            [[ -n ${SC_F_CHECK_KEY[i]} ]] || continue
+            printf '%d\t%s\t%s\n' "$((i+1))" "${SC_F_CHECK_KEY[i]}" "$(sc_text "${SC_F_CHECK_DETAIL[i]}")"
+        done
+    } > "$SC_RUN_DIR/checks.tsv" || return 1
     {
         printf 'module\tstatus\treason\texit\tversion\n'
         for module in $SC_ALL_MODULES; do
@@ -1228,7 +1554,8 @@ sc_parse_args() {
 
 sc_choose_language() {
     local answer
-    printf '\n  S E C C H E C K   /   %s\n\n  1  English\n  2  Italiano\n\n' "$SC_VERSION"
+    sc_brand
+    printf '\n  1  English\n  2  Italiano\n\n'
     while :; do
         printf '  > '
         IFS= read -r answer || return 1
@@ -1268,7 +1595,10 @@ sc_demo() {
             sc_add_finding aur exposure review observation /home/example/.cache/yay/sample/PKGBUILD aur_reference 'DEMO: atomic-lockfile reference'
             sc_add_finding lynis hardening suggestion observation SSH-DEMO lynis_suggestion 'DEMO: review SSH configuration'
             sc_add_finding aur-health maintenance review observation example-app health_maintainer 'DEMO: old-owner -> new-owner'
-            sc_add_finding aur-health maintenance suggestion observation example-tool health_inactive 'DEMO: days=420';;
+            sc_add_finding aur-health maintenance suggestion observation example-tool health_inactive 'DEMO: days=420'
+            sc_add_finding rkhunter suspicious info observation /usr/bin/example-tool rkh_script 'DEMO: The command is a script'
+            SC_F_CHECK_KEY[${#SC_F_MODULE[@]}-1]=rkh_file_match
+            SC_F_CHECK_DETAIL[${#SC_F_MODULE[@]}-1]='DEMO: example-package / SHA-256';;
     esac
     sc_assess; sc_header; sc_render_summary; sc_render_details 6
 }
@@ -1286,29 +1616,42 @@ sc_update_signatures() {
 }
 
 sc_dependencies() {
-    local tool label answer
-    local -a missing=()
-    sc_heading deps
-    for tool in rkhunter lynis paccheck python3 curl; do
-        label=$(sc_t available)
-        if ! command -v "$tool" >/dev/null; then
-            label=$(sc_t absent)
-            case $tool in paccheck) missing+=(pacutils);; python3) missing+=(python);; *) missing+=("$tool");; esac
-        fi
-        case $tool in rkhunter) sc_line "$tool / $(sc_t menu_rkhunter): $label";;
-            lynis) sc_line "$tool / $(sc_t menu_lynis): $label";;
-            paccheck) sc_line "pacutils (paccheck) / SHA-256: $label";;
-            *) sc_line "$tool / $(sc_t aur-health): $label";; esac
+    local mode=${1:-menu} tool label answer package purpose color missing_tool
+    local -a missing=() install=()
+    if [[ $mode == startup ]]; then sc_heading deps_startup; sc_line "$(sc_t deps_explain)"
+    else sc_heading deps; fi
+    for package in rkhunter lynis pacutils python curl; do
+        missing_tool=0
+        case $package in
+            rkhunter) tool=rkhunter; purpose=menu_rkhunter;;
+            lynis) tool=lynis; purpose=menu_lynis;;
+            pacutils) tool=paccheck; purpose=deps_pacutils; command -v pacfile >/dev/null || missing_tool=1;;
+            python) tool=python3; purpose=deps_python;;
+            curl) tool=curl; purpose=deps_curl;;
+        esac
+        command -v "$tool" >/dev/null || missing_tool=1
+        label=$(sc_t available); color=$SC_C_GREEN
+        if ((missing_tool)); then missing+=("$package"); label=$(sc_t absent); color=$SC_C_AMBER; fi
+        printf '\n'; sc_line "$package: $label" "$color$SC_C_BOLD"
+        sc_line "$(sc_t "$purpose")"
     done
-    ((${#missing[@]})) || return 0
+    if ((${#missing[@]} == 0)); then printf '\n'; sc_line "$(sc_t deps_ready)" "$SC_C_GREEN"; return 0; fi
+    printf '\n'; sc_line "$(sc_t deps_missing): ${missing[*]}" "$SC_C_AMBER"
+    if [[ $mode == report ]]; then sc_line "$(sc_t deps_continue)"; return 1; fi
     [[ -t 0 ]] || return 1
-    sc_line "$(sc_t install_question)"
-    IFS= read -r answer || return 0
-    case $answer in y|Y|s|S) ;; *) return 0;; esac
+    # --install-tools is an explicit installation request (also used by sudo).
+    # The interactive menu asks once; pacman still confirms the transaction.
+    if [[ $mode != install ]]; then
+        sc_line "$(sc_t install_question)"
+        IFS= read -r answer || return 0
+        case $answer in y|Y|s|S) ;; *) sc_line "$(sc_t deps_continue)"; return 0;; esac
+    fi
     sc_require_scan_host || return $?
-    if ((EUID != 0)); then sc_line "$(sc_t root)"; sc_elevate install; return $?; fi
+    install=(pacman -S --needed -- "${missing[@]}")
+    if ((EUID != 0)); then sc_line "$(sc_t root)"; install=(sudo -- "${install[@]}"); fi
     sc_line "$(sc_t install_note)"
-    pacman -S --needed -- "${missing[@]}" || { sc_line "$(sc_t install_failed)"; return 1; }
+    "${install[@]}" || { sc_line "$(sc_t install_failed)"; return 1; }
+    sc_dependencies report
 }
 
 sc_abort() {
@@ -1367,7 +1710,7 @@ sc_run_requested() {
             printf '\n'; sc_line "$(sc_t result_menu)"
             printf '  > '; IFS= read -r answer || return "$rc"
             case $answer in
-                1) sc_render_details 20;;
+                1) sc_browse_details;;
                 2) sc_render_report;;
                 3) break;;
                 0) return "$rc";;
@@ -1382,11 +1725,17 @@ sc_menu() {
     while :; do
         SC_DEMO=0; sc_header; sc_heading welcome
         sc_line "$(sc_t health_network)" "$SC_C_MUTED"; printf '\n'
-        sc_line "1  $(sc_t menu_full)" "$SC_C_PRIMARY"
+        sc_heading menu_scans
+        sc_line "1  $(sc_t menu_full)" "$SC_C_PRIMARY$SC_C_BOLD"
+        sc_line "$(sc_t full_includes)" "$SC_C_WHITE"; printf '\n'
         sc_line "2  $(sc_t menu_rkhunter)"; sc_line "3  $(sc_t menu_lynis)"
         sc_line "4  $(sc_t menu_integrity)"; sc_line "5  $(sc_t menu_aur)"
-        printf '\n'; sc_line "6  $(sc_t menu_deps)"; sc_line "7  $(sc_t menu_update)"
-        sc_line "8  $(sc_t menu_demo)"; sc_line "9  $(sc_t aur-health)"; sc_line "0  $(sc_t exit)"
+        sc_line "9  $(sc_t aur-health)"
+        sc_heading menu_tools "$SC_C_AMBER"
+        sc_line "6  $(sc_t menu_deps)"; sc_line "7  $(sc_t menu_update)"
+        sc_line "8  $(sc_t menu_demo)"
+        sc_line "$(sc_t tools_separate)" "$SC_C_MUTED"
+        printf '\n'; sc_line "0  $(sc_t exit)" "$SC_C_WHITE"
         printf '\n  %s > ' "$(sc_t choose)"; IFS= read -r answer || return 0
         case $answer in
             1) SC_SCAN=full; sc_run_requested;;
@@ -1422,15 +1771,17 @@ sc_main() {
     umask 077
     sc_parse_args "$@" || { printf 'SecCheck: invalid arguments / argomenti non validi. --help\n' >&2; return 64; }
     case $SC_ACTION in help) sc_help; return 0;; version) printf 'SecCheck %s\n' "$SC_VERSION"; return 0;; esac
+    sc_ui_init
     if [[ -z $SC_LANG ]]; then
         if [[ -t 0 ]]; then sc_choose_language || return 0
         else printf '%s\n' "$(sc_t language_needed)" >&2; return 64; fi
     fi
     sc_ui_init
     if ((SC_DEMO)); then sc_demo "$SC_SCENARIO"; return 0; fi
-    case $SC_ACTION in install) sc_dependencies; return $?;; update) sc_update_action; return $?;; esac
+    case $SC_ACTION in install) sc_dependencies install; return $?;; update) sc_update_action; return $?;; esac
     if [[ -n $SC_SCAN ]]; then sc_run_requested; return $?; fi
     [[ -t 0 ]] || { sc_help; return 64; }
+    if sc_is_arch /etc/os-release && command -v pacman >/dev/null; then sc_dependencies startup; fi
     sc_menu
 }
 

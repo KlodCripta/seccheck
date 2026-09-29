@@ -21,10 +21,19 @@ bash seccheck.sh
 ```
 
 Choose **1 English** or **2 Italiano** at startup. Root is requested only when
-needed; your chosen language and paths are retained through sudo.
+needed; your chosen language and paths are retained through sudo. On Arch and its
+derivatives, the interactive startup checks the scanner dependencies, explains
+their purpose and offers to install missing packages. You can decline and continue.
 
 Scegli **1 English** o **2 Italiano** all'avvio. I permessi di root vengono richiesti
-quando servono; lingua e percorsi scelti vengono mantenuti dopo sudo.
+quando servono; lingua e percorsi scelti vengono mantenuti dopo sudo. Il controllo
+iniziale mostra gli strumenti disponibili e quelli mancanti, spiegando a cosa
+servono. Puoi accettare l'installazione con pacman oppure proseguire con i controlli
+disponibili. Vengono richiesti solo i pacchetti mancanti, senza conferme automatiche.
+
+**1 — Full scan / Scansione completa** includes **2, 3, 4, 5 and 9**. Options 6–8
+are separate tools: dependencies, signature updates and the example result.
+See the [current terminal menu](screenshots/seccheck-v2-menu.png).
 
 Try the interface anywhere, without root or scanners:
 
@@ -47,7 +56,7 @@ bash seccheck.sh --lang en --demo clean
 
 Tools: Bash 4.4+, pacman, GNU coreutils/find/grep; `rkhunter`, `lynis`, `pacutils`
 for their respective modules. Online AUR maintenance checks also require `python`
-(Python 3 standard library) and `curl`. `paccheck` is supplied by `pacutils`. Missing scanner
+(Python 3 standard library) and `curl`. `paccheck` and `pacfile` are supplied by `pacutils`. Missing scanner
 packages can be installed through the menu, with pacman's confirmation. No AUR
 helper is invoked. A missing scanner leaves its module unavailable and coverage incomplete.
 
@@ -57,7 +66,7 @@ helper is invoked. A missing scanner leaves its module unavailable and coverage 
 - **Review needed / Da verificare:** explain a change, a trace or a configuration warning before taking action.
 - **Improvements / Miglioramenti:** software maintenance or configuration suggestions, not independent evidence of malware.
 - **Undetermined / Non determinabile:** checks failed, were unavailable or could not finish.
-- **No findings / Nessuna segnalazione:** no signals in the completed checks and stated scope; no guarantee of safety.
+- **No unresolved findings / Nessuna segnalazione aperta:** no open findings in the completed checks and stated scope. Explained warnings remain in the report; this is no guarantee of safety.
 
 **Coverage and priority are separate.** A partial scan can still find an urgent
 indicator. Counts and bars show findings and completed modules, never a supposed
@@ -70,6 +79,18 @@ probabilità di infezione. Un singolo modulo non equivale a una scansione comple
 Findings explain their meaning, uncertainty and next step. Original scanner evidence
 keeps its original language. Configuration edits are labelled without automatically
 dismissing changed executables. Lynis advice never confirms an unrelated rootkit alert.
+
+SecCheck also follows up supported rkhunter warnings automatically. It checks the
+exact file's package record and SHA-256, or queries the SSH server's configuration
+and version. Duplicate summary/log messages are grouped. A warning explained by
+these checks remains visible as **Explained**, with its evidence, instead of being
+counted as an unresolved warning. Strong rootkit signatures are never cleared by a
+matching package file. See [how these checks work and their limits](docs/RKHUNTER_CONTEXT.md).
+
+Nei dettagli trovi **Cosa significa**, **Verifica di SecCheck** e **Cosa fare**.
+Gli avvisi spiegati restano consultabili; quelli che SecCheck non riesce a verificare
+mantengono una spiegazione del limite. Le pagine dei dettagli permettono di leggere
+anche le segnalazioni successive alle prime dieci.
 
 ## CLI
 
@@ -94,7 +115,9 @@ Setup errors: 64 arguments, 73 report storage, 77 privilege, 78 unsupported syst
 ## Reports / Rapporti
 
 Each actual run writes a new private directory under `/var/log/seccheck`, mode 700,
-with mode-600 files: `report.txt`, `findings.tsv`, `modules.tsv` and raw scanner logs.
+with mode-600 files: `report.txt`, `findings.tsv`, `checks.tsv`, `modules.tsv` and raw scanner logs.
+`checks.tsv` associates each additional verification with its finding number;
+`rkh-context.*` files retain the command output and hashes used in those checks.
 Reports include versions, return statuses and scope. Existing runs are preserved.
 
 Ogni scansione crea una cartella privata nuova in `/var/log/seccheck`. Il rapporto
