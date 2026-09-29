@@ -1,0 +1,291 @@
+"""Official metadata fixtures; curl and pacman are inert command-boundary doubles."""
+import json
+import os
+import time
+from email.utils import formatdate
+
+from test_seccheck import SecCheckCase
+
+
+class AurHealthTests(SecCheckCase):
+    def setUp(self):
+        super().setUp()
+        self.state = self.folder / 'state'
+        self.state.mkdir(mode=0o700)
+        self.run = self.folder / 'run'
+        self.run.mkdir(mode=0o700)
+        self.path = self.command('pacman', 'printf "demo 1.0-1\\nlocal-only 1.0-1\\n"\n')
+        self.command('vercmp', '[[ "$1" == "$2" ]] && echo 0 || echo -1\n')
+        self.command('curl', '[[ "$*" == *"/packages/"* ]] && cat "$SC_TEST_DIR/page.html" || cat "$SC_TEST_DIR/rpc.json"\n')
+        self.package = dict(Name='demo', PackageBase='demo', Version='1.0-1',
+                            Maintainer='alice', CoMaintainers=['bob'],
+                            LastModified=int(time.time()), OutOfDate=None)
+        self.write_response()
+        self.fixture('page.html', '<tr class="pkgmaint"><th>Maintainer:</th><td>alice (bob)</td></tr>')
+
+    def write_response(self):
+        self.fixture('rpc.json', json.dumps(dict(version=5, type='multiinfo', resultcount=1, results=[self.package])))
+
+    def scan(self, extra='', summary=False):
+        output = self.shell('sc_reset aur-health; SC_LANG=en; SC_OFFLINE=0\n'
+                          'SC_RUN_DIR="$SC_TEST_DIR/run"; SC_STATE_DIR="$SC_TEST_DIR/state"\n'
+                          + extra + '\nsc_run_aur_health\n'
+                          'printf "%s|%s|%s\\n" "${SC_MODULE_STATUS[aur-health]}" "${SC_MODULE_REASON[aur-health]}" "${SC_HEALTH_NOTE-}"\n'
+                          'printf "%s\\n" "${SC_F_KEY[@]}"' +
+                          ('\nSC_ASCII=1; SC_NO_COLOR=1; sc_ui_init; sc_assess; sc_render_summary' if summary else ''),
+                          PATH=self.path)
+        return ' '.join(output.split()) if summary else output
+
+    def seed_baseline(self, maintainer='alice', co=None):
+        data = dict(schema=1, observed_at=1, packages={'demo': dict(
+            maintainer=maintainer, co_maintainers=['bob'] if co is None else co, base='demo', seen_at=1)})
+        (self.state / 'aur-maintainers.json').write_text(json.dumps(data))
+        return (self.state / 'aur-maintainers.json').read_bytes()
+
+    def http_responses(self, responses):
+        """Replace only curl; real adapter parses headers and controls request timing."""
+        self.fixture('responses.json', json.dumps(responses))
+        self.fixture('http_stub.py', '''import json, os, pathlib, sys, time
+root = pathlib.Path(os.environ['SC_TEST_DIR'])
+args = sys.argv[1:]
+url = args[-1]
+log = root / 'requests.jsonl'
+calls = [json.loads(x) for x in log.read_text().splitlines()] if log.exists() else []
+index = sum(call['url'] == url for call in calls)
+choices = json.loads((root / 'responses.json').read_text()).get(url.rsplit('/', 1)[-1], [{}])
+response = choices[min(index, len(choices) - 1)]
+status = response.get('status', 200)
+with log.open('a') as stream:
+    stream.write(json.dumps(dict(url=url, at=time.monotonic(), status=status)) + '\\n')
+if '--dump-header' in args:
+    headers = 'HTTP/2 ' + str(status) + '\\r\\n'
+    if 'retry_after' in response: headers += 'Retry-After: ' + response['retry_after'] + '\\r\\n'
+    pathlib.Path(args[args.index('--dump-header') + 1]).write_text(headers + '\\r\\n')
+if status >= 400:
+    print('curl: (22) The requested URL returned error: ' + str(status), file=sys.stderr)
+    sys.exit(22)
+print((root / ('page.html' if '/packages/' in url else 'rpc.json')).read_text(), end='')
+''')
+        self.command('curl', 'exec python3 "$SC_TEST_DIR/http_stub.py" "$@"\n')
+
+    def two_maintainer_pages(self):
+        self.command('pacman', 'printf "demo 1.0-1\\nzeta 1.0-1\\n"\n')
+        self.package.pop('CoMaintainers', None)
+        packages = [self.package, dict(self.package, Name='zeta', PackageBase='zeta')]
+        self.fixture('rpc.json', json.dumps(dict(version=5, type='multiinfo', resultcount=2, results=packages)))
+
+    def requests(self):
+        return [json.loads(line) for line in (self.folder / 'requests.jsonl').read_text().splitlines()]
+
+    def test_requests_are_spaced_even_when_responses_are_fast(self):
+        del self.package['CoMaintainers']
+        self.write_response()
+        self.http_responses({})
+        self.assertIn('completed|', self.scan())
+        calls = self.requests()
+        self.assertEqual(len(calls), 2)
+        self.assertGreaterEqual(calls[1]['at'] - calls[0]['at'], 1.0)
+
+    def test_rate_limit_retry_recovers_and_keeps_both_attempt_logs(self):
+        del self.package['CoMaintainers']
+        self.write_response()
+        self.http_responses({'demo': [dict(status=429, retry_after='2'), dict(status=200)]})
+        self.assertIn('completed||health_baseline', self.scan())
+        calls = self.requests()
+        self.assertEqual([x['status'] for x in calls], [200, 429, 200])
+        self.assertGreaterEqual(calls[2]['at'] - calls[1]['at'], 2.0)
+        self.assertTrue((self.state / 'aur-maintainers.json').exists())
+        logs = list(self.run.glob('aur-page.*.stderr'))
+        self.assertEqual(len(logs), 2)
+        self.assertTrue(any('429' in path.read_text() for path in logs))
+
+    def test_persistent_rate_limit_stops_further_requests_and_preserves_baseline(self):
+        before = self.seed_baseline()
+        self.two_maintainer_pages()
+        self.http_responses({'demo': [dict(status=429, retry_after='0')]})
+        out = self.scan(summary=True)
+        self.assertIn('partial|', out)
+        calls = self.requests()
+        self.assertEqual([x['status'] for x in calls], [200, 429, 429])
+        self.assertTrue(all('/packages/zeta' not in x['url'] for x in calls))
+        self.assertEqual(before, (self.state / 'aur-maintainers.json').read_bytes())
+        self.assertIn('Requests stopped', out)
+        self.assertNotIn('health_co_removed', out)
+
+    def test_long_retry_after_stops_instead_of_retrying_early(self):
+        before = self.seed_baseline()
+        self.two_maintainer_pages()
+        for retry_after in ('3600', formatdate(time.time() + 3600, usegmt=True), '9' * 5000):
+            with self.subTest(retry_after=retry_after):
+                (self.folder / 'requests.jsonl').unlink(missing_ok=True)
+                self.http_responses({'demo': [dict(status=429, retry_after=retry_after)]})
+                out = self.scan(summary=True)
+                self.assertIn('partial|', out)
+                self.assertEqual([x['status'] for x in self.requests()], [200, 429])
+                self.assertEqual(before, (self.state / 'aur-maintainers.json').read_bytes())
+                self.assertIn('Retry-After', out)
+
+    def test_first_observation_is_baseline_not_maintainer_change(self):
+        out = self.scan()
+        self.assertIn('completed||health_baseline', out)
+        self.assertNotIn('health_maintainer', out)
+        baseline = json.loads((self.state / 'aur-maintainers.json').read_text())
+        self.assertEqual(baseline['packages']['demo']['co_maintainers'], ['bob'])
+        self.assertEqual((self.state / 'aur-maintainers.json').stat().st_mode & 0o777, 0o600)
+
+    def test_orphan_flag_age_and_available_update_remain_distinct(self):
+        self.package.update(Maintainer=None, CoMaintainers=[], Version='2.0-1',
+                            OutOfDate=1700000000, LastModified=int(time.time())-400*86400)
+        self.write_response()
+        out = self.scan()
+        for key in ('health_orphan', 'health_flagged', 'health_inactive', 'health_upgrade'):
+            self.assertIn(key, out)
+        self.assertNotIn('abandoned', out)
+
+    def test_primary_and_added_removed_co_maintainers_are_reported(self):
+        self.seed_baseline(maintainer='old-owner', co=['carol'])
+        out = self.scan()
+        for key in ('health_maintainer', 'health_co_added', 'health_co_removed'):
+            self.assertIn(key, out)
+
+    def test_first_foreign_package_absent_from_aur_is_not_called_removed(self):
+        out = self.scan()
+        self.assertIn('health_unlisted', out)
+        self.assertNotIn('health_removed', out)
+
+    def test_previously_seen_package_absent_from_aur_is_reported(self):
+        self.seed_baseline()
+        self.fixture('rpc.json', '{"version":5,"type":"multiinfo","resultcount":0,"results":[]}')
+        self.assertIn('health_removed', self.scan())
+
+    def test_network_failure_preserves_baseline_and_does_not_report_removal(self):
+        before = self.seed_baseline()
+        self.command('curl', 'echo "network unavailable" >&2; exit 7\n')
+        out = self.scan()
+        self.assertIn('partial|', out)
+        self.assertNotIn('health_removed', out)
+        self.assertEqual(before, (self.state / 'aur-maintainers.json').read_bytes())
+
+    def test_successive_failed_pages_keep_each_packages_error_log(self):
+        self.command('pacman', 'printf "demo 1.0-1\\nzeta 1.0-1\\n"\n')
+        del self.package['CoMaintainers']
+        packages = [self.package, dict(self.package, Name='zeta', PackageBase='zeta')]
+        self.fixture('rpc.json', json.dumps(dict(version=5, type='multiinfo', resultcount=2, results=packages)))
+        self.command('curl', 'case "${!#}" in\n'
+                     '  */packages/demo) echo "curl: (22) The requested URL returned error: 404" >&2; exit 22;;\n'
+                     '  */packages/zeta) echo "curl: (28) Operation timed out" >&2; exit 28;;\n'
+                     '  *) cat "$SC_TEST_DIR/rpc.json";;\nesac\n')
+        out = self.scan(summary=True)
+        logs = sorted(self.run.glob('aur-page.*.stderr'))
+        self.assertEqual(len(logs), 2, 'Each failed request must keep its own diagnostic log')
+        self.assertIn('404', logs[0].read_text())
+        self.assertIn('timed out', logs[1].read_text())
+        self.assertIn('demo', out)
+        self.assertIn('404', out)
+        self.assertIn('zeta', out)
+        self.assertIn('timed out', out)
+        self.assertNotIn('health_removed', out)
+
+    def test_rpc_error_is_explained_in_summary_without_claiming_a_previous_baseline(self):
+        self.command('curl', 'echo "curl: (6) Could not resolve host: aur.archlinux.org" >&2; exit 6\n')
+        out = self.scan(summary=True)
+        self.assertIn('Could not resolve host', out)
+        self.assertIn('aur-rpc.0.stderr', out)
+        self.assertIn('No AUR baseline', out)
+        self.assertNotIn('baseline was preserved', out)
+        self.assertFalse((self.state / 'aur-maintainers.json').exists())
+
+    def test_incomplete_first_page_check_does_not_claim_to_have_recorded_a_baseline(self):
+        del self.package['CoMaintainers']
+        self.write_response()
+        self.fixture('page.html', '<html>Access denied</html>')
+        out = self.scan(summary=True)
+        self.assertIn('No AUR baseline', out)
+        self.assertNotIn('First AUR snapshot recorded', out)
+        self.assertNotIn('baseline was preserved', out)
+
+    def test_existing_baseline_is_explicitly_preserved_on_an_incomplete_scan(self):
+        before = self.seed_baseline()
+        self.command('curl', 'echo "connection failed" >&2; exit 7\n')
+        out = self.scan(summary=True)
+        self.assertIn('baseline was preserved', out)
+        self.assertEqual(before, (self.state / 'aur-maintainers.json').read_bytes())
+
+    def test_invalid_json_preserves_baseline(self):
+        before = self.seed_baseline()
+        self.fixture('rpc.json', '<html>upstream challenge</html>')
+        self.assertIn('partial|', self.scan())
+        self.assertEqual(before, (self.state / 'aur-maintainers.json').read_bytes())
+
+    def test_missing_required_metadata_is_not_inferred_to_be_orphaned(self):
+        del self.package['Maintainer']
+        self.write_response()
+        out = self.scan()
+        self.assertIn('partial|', out)
+        self.assertNotIn('health_orphan', out)
+
+    def test_missing_comaintainer_field_uses_public_maintainer_row(self):
+        self.seed_baseline(co=['carol'])
+        del self.package['CoMaintainers']
+        self.write_response()
+        out = self.scan()
+        self.assertIn('completed|', out)
+        self.assertIn('health_co_added', out)
+
+    def test_failed_maintainer_page_is_unknown_not_empty(self):
+        before = self.seed_baseline()
+        del self.package['CoMaintainers']
+        self.write_response()
+        self.fixture('page.html', '<html>Access denied</html>')
+        out = self.scan()
+        self.assertIn('partial|', out)
+        self.assertNotIn('health_co_removed', out)
+        self.assertEqual(before, (self.state / 'aur-maintainers.json').read_bytes())
+
+    def test_truncated_maintainer_row_does_not_remove_co_maintainers(self):
+        before = self.seed_baseline()
+        del self.package['CoMaintainers']
+        self.write_response()
+        self.fixture('page.html', '<tr class="pkgmaint"><th>Maintainer:</th><td>alice')
+        out = self.scan()
+        self.assertIn('partial|', out)
+        self.assertNotIn('health_co_removed', out)
+        self.assertEqual(before, (self.state / 'aur-maintainers.json').read_bytes())
+
+    def test_python_ignores_modules_from_cwd_and_pythonpath(self):
+        self.fixture('json.py', 'from pathlib import Path\nPath("EXECUTED").touch()\nraise RuntimeError("untrusted module executed")\n')
+        out = self.scan('cd "$SC_TEST_DIR"\nexport PYTHONPATH="$SC_TEST_DIR"')
+        self.assertFalse((self.folder / 'EXECUTED').exists())
+        self.assertIn('completed|', out)
+
+    def test_known_primary_change_is_retained_when_co_maintainers_are_unavailable(self):
+        self.seed_baseline(maintainer='old-owner')
+        del self.package['CoMaintainers']
+        self.write_response()
+        self.fixture('page.html', '<html>Access denied</html>')
+        out = self.scan()
+        self.assertIn('partial|', out)
+        self.assertIn('health_maintainer', out)
+
+    def test_abandoned_temporary_snapshot_does_not_block_future_runs(self):
+        self.seed_baseline()
+        (self.state / 'aur-maintainers.next').write_text('interrupted write')
+        self.assertIn('completed|', self.scan())
+
+    def test_offline_never_queries_remote_or_updates_baseline(self):
+        before = self.seed_baseline()
+        self.command('curl', 'touch "$SC_TEST_DIR/QUERIED"; exit 99\n')
+        out = self.scan('SC_OFFLINE=1')
+        self.assertIn('skipped|offline', out)
+        self.assertFalse((self.folder / 'QUERIED').exists())
+        self.assertEqual(before, (self.state / 'aur-maintainers.json').read_bytes())
+
+    def test_terminal_controls_in_metadata_are_rejected(self):
+        self.package['Maintainer'] = 'bad\x1b[31m'
+        self.write_response()
+        self.assertIn('partial|', self.scan())
+
+    def test_api_result_for_an_unrequested_package_is_rejected(self):
+        self.package['Name'] = 'injected'
+        self.write_response()
+        self.assertIn('partial|', self.scan())
