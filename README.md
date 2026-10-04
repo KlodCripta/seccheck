@@ -92,6 +92,16 @@ Gli avvisi spiegati restano consultabili; quelli che SecCheck non riesce a verif
 mantengono una spiegazione del limite. Le pagine dei dettagli permettono di leggere
 anche le segnalazioni successive alle prime dieci.
 
+The integrity module distinguishes changed content, permissions, owner/group and
+modification time. A difference is a result, not automatically an incomplete check.
+Read failures, missing package reference data and unsupported output instead limit
+coverage; the summary identifies the tool and preserves the exact message.
+
+Il controllo di integrità distingue contenuto, permessi, proprietario/gruppo e data
+di modifica. Le differenze restano da verificare anche per file modificati spesso dai
+servizi. Se il controllo è parziale, il riepilogo indica lo strumento e il motivo;
+il rapporto completo conserva tutti i messaggi originali.
+
 ## CLI
 
 ```bash

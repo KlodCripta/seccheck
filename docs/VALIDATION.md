@@ -2,8 +2,8 @@
 
 ## Completed
 
-Latest local suite: **114 tests passing**, Bash syntax checks and ShellCheck 0.11.0
-clean after the startup and rkhunter-interpretation corrections (29 September 2026 UTC).
+Latest local suite: **126 tests passing**, Bash syntax checks and ShellCheck 0.11.0
+clean after the integrity-interpretation corrections (4 October 2026 UTC).
 
 - Regression tests exercise evidence/coverage independently, scanner boundary fixtures,
   missing tools and unknown output, static Atomic Arch reads, private reports,
@@ -11,6 +11,9 @@ clean after the startup and rkhunter-interpretation corrections (29 September 20
 - AUR metadata tests cover current owner/co-owners, outdated/orphan/age/version
   signals, first baseline, observed changes, absent foreign packages, bad responses,
   interrupted writes and snapshot preservation.
+- Integrity regressions cover the native pacman message forms, distinct property
+  explanations, valid difference exits, missing MTREE data, read failures even with
+  successful output, unsupported formats, no results, timeouts and execution errors.
 - The Petrolio screenshot is captured from the actual program demo in a PTY.
 - An independent whole-branch review of commit `5cdf30b` found one critical and
   three important defects. Each was reproduced with an inert regression before
@@ -35,9 +38,10 @@ private user homes, change packages or remove existing production reports.
 4. **Maintainer history consists of observations.** Changes before the first scan
    or between scans cannot be reconstructed reliably. Intermediate transfers may
    go unreported.
-5. **Native AUR completion was reported.** The user's later run completed the AUR
-   maintenance module and recorded its first snapshot. The supplied output does
-   not establish whether a 429 retry was exercised in that run. Proxy failures in
+5. **Native AUR completion was reported.** The user's later runs completed the AUR
+   maintenance module, recorded its first snapshot and subsequently compared it.
+   The supplied output does not establish whether a 429 retry was exercised.
+   Proxy failures in
    this environment and controlled fixtures still cover incomplete/error behavior.
 6. **AUR advice wording was treated as functional.** The initial text incorrectly
    narrowed all suggestions to configuration. The replacement covers package
@@ -122,5 +126,41 @@ that never triggers installation. Only the pacman/sudo command boundary and host
 identity are simulated; dependency discovery and UI input are exercised directly.
 Report tests preserve explained findings and check results with private permissions.
 
-The new follow-ups still require a native run with pacutils installed. Fixture
-success does not certify the user's files, packages or SSH configuration.
+The user's run at `20260929T100329Z` followed the proposed installation of
+pacutils 0.15.0-2 and reported six explained warnings. The user also confirmed the
+corrected title and menu. This establishes that those paths were reached on that
+machine; without their complete evidence, it does not independently certify each
+file, package or SSH configuration check.
+
+## Integrity follow-up
+
+That run still reported partial integrity coverage. The supplied excerpt contained
+pacman permission, owner/group, timestamp, size and SHA-256 differences; paccheck
+stderr was empty, and its last 80 stdout lines were successful SHA-256 summaries.
+The earlier stdout and exit codes were not supplied, so this excerpt cannot
+establish the reason for partial coverage or prove that every file matched.
+
+It did expose a definite interpretation bug: pacman's `SHA256 checksum mismatch`
+was described as a metadata difference. It now receives the content explanation.
+Permission, owner/group and timestamp changes also have distinct explanations.
+No paths are automatically allowed and no reported differences are silently cleared.
+
+Previously, unknown output and execution failures could leave only a generic
+instruction to consult logs. Each now records a diagnostic with its tool, exact
+message or exit code. Read failures and missing MTREE data limit coverage instead
+of being presented as confirmed file changes. Actual differences with the normal
+difference exit code preserve completed coverage. The pacutils source was checked
+for its message forms; a read warning can coexist with success output and exit zero,
+so the new tests explicitly preserve partial coverage in that case.
+
+The independent review found that an unrecognized reason attached to a file path
+still counted as a review finding. Four inert cases reproduced that behavior,
+including an I/O error. Unknown reasons now remain coverage diagnostics with their
+original evidence, without claiming a detected file change. The complete 126-test
+suite passed after the fix. The review identified no other concrete defect in
+this patch; pacman's aggregate exit behavior was not independently established
+from current source and should be recorded during the native rerun.
+
+The updated integrity adapter still needs a native rerun (menu option 4). Its
+fixtures demonstrate the parsing and reporting corrections, not the outcome of
+that future scan or a completed stable-release validation pass.

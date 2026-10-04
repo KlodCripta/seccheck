@@ -416,35 +416,70 @@ sc_run_lynis() {
 }
 
 sc_parse_integrity() {
-    local line lower object detail key mode=${2:-pacman}
-    local re_pacman='^(warning: |backup file: )?[^:]+: (/.+) \((.*)\)$'
+    local line normalized object detail key message mode=${2:-pacman}
+    local re_pacman='^[^:]+: (/.+) \((.*)\)$'
     local re_paccheck="^[^:]+: '(.+)' (.*)$"
     SC_PARSE_SEEN=0 SC_PARSE_UNKNOWN=0 SC_PARSE_ERRORS=0
     while IFS= read -r line || [[ -n $line ]]; do
         [[ -z $line ]] && continue
-        lower=${line,,}; object='' detail=''
-        if [[ $lower == *'error:'* || $lower == *'read error'* || $lower == *'mtree data not available'* ||
-              $lower == *'error reading mtree'* || $lower == *'permission denied'* ]]; then
-            SC_PARSE_ERRORS=1
+        object='' detail=''
+        normalized=${line#warning: }; normalized=${normalized#backup file: }
+        if [[ $normalized == 'error: '* ]]; then
+            SC_PARSE_ERRORS=1; sc_add_diagnostic integrity integrity_tool_error "$mode: $line"; continue
         fi
-        if [[ $line =~ $re_pacman ]]; then
-            object=${BASH_REMATCH[2]}; detail=${BASH_REMATCH[3]}
-        elif [[ $line =~ $re_paccheck ]]; then
+        if [[ $mode == pacman && $normalized =~ $re_pacman ]]; then
+            object=${BASH_REMATCH[1]}; detail=${BASH_REMATCH[2]}
+        elif [[ $mode == paccheck && $normalized =~ $re_paccheck ]]; then
             object=${BASH_REMATCH[1]}; detail=${BASH_REMATCH[2]}
         elif [[ $line =~ ^[^:]+:\ [0-9]+\ total\ files?,\ [0-9]+\ altered\ files?$ ||
                 $line == *': all files match mtree sha256sums' || $line == *': all files present and unmodified' ]]; then
             ((SC_PARSE_SEEN+=1)); continue
         else
-            SC_PARSE_UNKNOWN=1; continue
+            message=${normalized#*: }
+            case ${message,,} in
+                'mtree data not available ('*|'error reading mtree data ('*)
+                    SC_PARSE_ERRORS=1; sc_add_diagnostic integrity integrity_mtree "$mode: $line"; continue;;
+                'read error ('*)
+                    SC_PARSE_ERRORS=1; sc_add_diagnostic integrity integrity_read_error "$mode: $line"; continue;;
+            esac
+            SC_PARSE_UNKNOWN=1; sc_add_diagnostic integrity integrity_unparsed "$mode: $line"
+            continue
         fi
         ((SC_PARSE_SEEN+=1))
-        key=integrity_metadata
+        # Classify the tool's reason, never words embedded in the pathname.
         case ${detail,,} in
-            *'missing file'*|*'no such file'*) key=integrity_missing;;
-            *'sha256sum mismatch'*) key=integrity_content;;
+            'permission denied'|'read error ('*)
+                SC_PARSE_ERRORS=1; sc_add_diagnostic integrity integrity_read_error "$mode: $line"; continue;;
+            'missing file'|'no such file or directory') key=integrity_missing;;
+            'sha256sum mismatch ('*|'sha256 checksum mismatch') key=integrity_content;;
+            'permissions mismatch'|'permission mismatch ('*) key=integrity_permissions;;
+            'uid mismatch'|'gid mismatch'|'uid mismatch ('*|'gid mismatch ('*) key=integrity_owner;;
+            'modification time mismatch'|'modification time mismatch ('*) key=integrity_time;;
+            'size mismatch'|'size mismatch ('*|'file type mismatch'|'symbolic link path mismatch') key=integrity_metadata;;
+            *) SC_PARSE_UNKNOWN=1
+                sc_add_diagnostic integrity integrity_unparsed "$mode: $line"; continue;;
         esac
         sc_add_finding integrity integrity review observation "$object" "$key" "$mode: $line"
     done < "$1"
+}
+
+sc_integrity_complete() {
+    local tool=$1 rc=$2 before=$3 partial=0
+    if ((rc > 1)); then
+        partial=1
+        case $rc in
+            124|137) sc_add_diagnostic integrity integrity_timeout "$tool: exit=$rc";;
+            *) sc_add_diagnostic integrity integrity_exit_error "$tool: exit=$rc";;
+        esac
+    fi
+    if ((SC_PARSE_SEEN == 0)); then
+        partial=1; sc_add_diagnostic integrity integrity_no_results "$tool: exit=$rc"
+    fi
+    if ((SC_PARSE_UNKNOWN || SC_PARSE_ERRORS)); then partial=1
+    elif ((rc == 1 && ${#SC_F_MODULE[@]} == before)); then
+        partial=1; sc_add_diagnostic integrity integrity_exit_unexplained "$tool: exit=$rc"
+    fi
+    ((partial == 0))
 }
 
 sc_run_integrity() {
@@ -452,13 +487,12 @@ sc_run_integrity() {
     sc_module_set integrity running ''
     SC_MODULE_VERSION[integrity]=$(sc_version pacman --version)
     local rc partial=0 out="$SC_RUN_DIR/pacman.stdout" err="$SC_RUN_DIR/pacman.stderr"
-    local before=${#SC_F_MODULE[@]} seen unknown errors
+    local before=${#SC_F_MODULE[@]}
     sc_capture "$out" "$err" 1200 pacman -Qkk
     rc=$?; SC_MODULE_RC[integrity]="pacman=$rc"
     cat -- "$out" "$err" > "$SC_RUN_DIR/pacman-combined.txt"
     sc_parse_integrity "$SC_RUN_DIR/pacman-combined.txt" pacman
-    seen=$SC_PARSE_SEEN unknown=$SC_PARSE_UNKNOWN errors=$SC_PARSE_ERRORS
-    if ((rc > 1 || seen == 0 || unknown || errors || (rc == 1 && ${#SC_F_MODULE[@]} == before))); then partial=1; fi
+    sc_integrity_complete pacman "$rc" "$before" || partial=1
     if ! command -v paccheck >/dev/null; then
         sc_module_set integrity partial missing_paccheck
         return 0
@@ -469,9 +503,8 @@ sc_run_integrity() {
     rc=$?; SC_MODULE_RC[integrity]+=" paccheck=$rc"
     cat -- "$out" "$err" > "$SC_RUN_DIR/paccheck-combined.txt"
     sc_parse_integrity "$SC_RUN_DIR/paccheck-combined.txt" paccheck
-    if ((rc > 1 || SC_PARSE_SEEN == 0 || SC_PARSE_UNKNOWN || SC_PARSE_ERRORS ||
-         (rc == 1 && ${#SC_F_MODULE[@]} == before))); then partial=1; fi
-    if ((partial)); then sc_module_set integrity partial check_details
+    sc_integrity_complete paccheck "$rc" "$before" || partial=1
+    if ((partial)); then sc_module_set integrity partial integrity_incomplete
     else sc_module_set integrity completed ''; fi
     SC_SCOPE+=("integrity: pacman metadata + paccheck SHA-256 against local package MTREE; includes backup files; excludes NoExtract/NoUpgrade")
 }
@@ -1179,6 +1212,18 @@ sc_t() {
         lynis_suggestion) en='Lynis suggests stronger settings. Assess compatibility and the purpose of this machine before applying the suggestion.'; it="Lynis suggerisce impostazioni più robuste. Valuta compatibilità e uso di questo computer prima di applicare il consiglio.";;
         integrity_metadata) en='Size, permissions or another file property differs from the local package record. This is not a content hash result. Explain the change, especially for executables.'; it="Dimensione, permessi o altre proprietà differiscono dai dati locali del pacchetto. Questo non è un confronto crittografico del contenuto. Chiarisci la modifica, soprattutto per gli eseguibili.";;
         integrity_content) en='File contents differ from the local package SHA-256 record. Configuration edits can be intentional; an unexplained executable change needs investigation. The package record itself is not proof of trusted provenance.'; it="Il contenuto differisce dallo SHA-256 registrato localmente dal pacchetto. Una configurazione può essere modificata volontariamente; un eseguibile cambiato senza spiegazione richiede attenzione. I dati del pacchetto non ne garantiscono la provenienza.";;
+        integrity_permissions) en='File access permissions differ from the package record. This describes who can read, write or execute it, not whether its content changed. Check the purpose of the file and any service configuration before changing permissions.'; it="I permessi differiscono dai dati del pacchetto: indicano chi può leggere, scrivere o eseguire il file, non se il contenuto è cambiato. Controlla la funzione del file e la configurazione del servizio prima di modificare i permessi.";;
+        integrity_owner) en='The owner or group differs from the package record. A service may deliberately use a dedicated account. Check which account should manage this path before changing its owner or group.'; it="Il proprietario o il gruppo differisce dai dati del pacchetto. Un servizio può usare appositamente un account dedicato. Verifica quale account deve gestire questo percorso prima di cambiarne proprietario o gruppo.";;
+        integrity_time) en='The modification timestamp differs from the package record. This alone does not establish that the content changed. Read any separate size or SHA-256 finding for this file and compare with recent updates or application activity.'; it="La data di modifica differisce dai dati del pacchetto. Da sola non dimostra un cambiamento del contenuto. Leggi le eventuali segnalazioni separate su dimensione o SHA-256 dello stesso file e confrontale con aggiornamenti o attività delle applicazioni.";;
+        integrity_incomplete) en='One or both package tools left part of the check unresolved. The messages below identify the tool and the reason; detected file differences are listed separately.'; it="Uno o entrambi gli strumenti hanno lasciato una parte del controllo irrisolta. I messaggi qui sotto indicano lo strumento e il motivo; le differenze rilevate sui file sono elencate separatamente.";;
+        integrity_unparsed) en='SecCheck could not interpret this output line. It remains visible so an unsupported format cannot silently count as a completed check. Include this line when reporting the problem.'; it="SecCheck non riesce a interpretare questa riga. La mostra per evitare che un formato non supportato venga considerato un controllo completato. Includi questa riga quando segnali il problema.";;
+        integrity_mtree) en='Local package reference data (MTREE) is missing or unreadable. The affected comparison cannot finish. Check the named package and local database; this does not by itself establish that its installed files changed.'; it="I dati locali di confronto del pacchetto (MTREE) sono assenti o illeggibili. La verifica interessata non può terminare. Controlla il pacchetto indicato e il database locale: questo non dimostra da solo una modifica ai file installati.";;
+        integrity_read_error) en='The tool could not read a file or its reference data. This is a coverage limit, not a confirmed file change. Check the reported path, permissions and storage error before repeating the check.'; it="Lo strumento non ha potuto leggere un file o i suoi dati di confronto. È un limite della verifica, non una modifica confermata. Controlla il percorso, i permessi e l'errore di lettura indicati prima di ripetere il controllo.";;
+        integrity_tool_error) en='The package tool reported an execution error. Read its exact message below; this part of the check did not complete normally.'; it="Lo strumento dei pacchetti ha segnalato un errore di esecuzione. Leggi il messaggio preciso qui sotto: questa parte del controllo non si è conclusa normalmente.";;
+        integrity_timeout) en='The package check timed out or was forcibly stopped. Its earlier results remain available, but later files may not have been checked.'; it="Il controllo dei pacchetti ha superato il tempo massimo oppure è stato terminato forzatamente. I risultati già ottenuti restano disponibili, ma altri file potrebbero non essere stati controllati.";;
+        integrity_exit_error) en='The package tool ended with an unexpected exit code. Even if it printed successful checks, its overall execution remains incomplete. See the tool name, code and original logs.'; it="Lo strumento dei pacchetti è terminato con un codice inatteso. Anche se ha mostrato verifiche riuscite, l'esecuzione complessiva resta incompleta. Consulta nome dello strumento, codice e log originali.";;
+        integrity_no_results) en='The tool produced no interpretable file result or package summary. SecCheck cannot count this as a completed comparison.'; it="Lo strumento non ha prodotto risultati interpretabili sui file o riepiloghi dei pacchetti. SecCheck non può considerarlo un confronto completato.";;
+        integrity_exit_unexplained) en='The tool reported a problem through its exit code, but no corresponding file difference was found in the interpreted output. Its original logs need review.'; it="Il codice di uscita dello strumento segnala un problema, ma nei messaggi interpretati non compare una differenza sui file che lo spieghi. Occorre controllare i log originali.";;
         integrity_missing) en='A packaged file is missing. Check exclusions, package state and recent changes. Missing does not by itself mean malicious.'; it="Manca un file previsto dal pacchetto. Verifica esclusioni, stato del pacchetto e modifiche recenti. Un file mancante non dimostra da solo un attacco.";;
         aur_reference) en='A documented campaign package name appears in this file. It may be a cached reference. Check the version, installation history and lifecycle scripts without executing them.'; it="In questo file compare il nome di un pacchetto associato alla campagna. Potrebbe essere un riferimento in cache. Verifica versione, storico e script di installazione senza eseguirli.";;
         aur_hash) en='This file matches the documented Atomic Arch payload SHA-256. Preserve it as evidence and seek incident-response help. Presence is established; execution is not established by this check.'; it="Questo file corrisponde allo SHA-256 del payload Atomic Arch documentato. Conservalo come prova e chiedi assistenza per analizzare l'incidente. Il controllo ne rileva la presenza, non dimostra l'esecuzione.";;

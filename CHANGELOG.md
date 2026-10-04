@@ -2,6 +2,11 @@
 
 ## 2.0.0 — development branch
 
+- Interpret pacman's SHA-256 mismatch as a content difference. Explain permission,
+  owner/group and timestamp differences separately, without dismissing any by path.
+- Show the exact tool and reason when integrity coverage is incomplete: unreadable
+  files, missing MTREE data, unsupported output, timeouts or unexpected exits.
+  A detected file difference alone does not make a completed check partial.
 - Restore the large two-color SecCheck title, original subtitle and author credit;
   remove the slogan. Separate scans and tools, with the full-scan scope stated.
 - Check dependencies at interactive startup, including pacfile from pacutils.
