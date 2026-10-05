@@ -2,11 +2,13 @@
 
 ## Completed
 
-Latest local suite: **126 tests passing**, Bash syntax checks and ShellCheck 0.11.0
-clean after the integrity-interpretation corrections (4 October 2026 UTC).
+Latest local suite: **134 tests passing**, Bash syntax checks and ShellCheck 0.11.0
+clean after the four-module and post-scan follow-up changes (5 October 2026 UTC).
+The existing-root PTY integration test runs here; it is explicitly skipped when
+the test account is not root. Tests use inert scanner commands in both cases.
 
 - Regression tests exercise evidence/coverage independently, scanner boundary fixtures,
-  missing tools and unknown output, static Atomic Arch reads, private reports,
+  missing tools and unknown output, removal of Atomic Arch routing, private reports,
   EN/IT CLI, real PTY language selection and narrow/ASCII output.
 - AUR metadata tests cover current owner/co-owners, outdated/orphan/age/version
   signals, first baseline, observed changes, absent foreign packages, bad responses,
@@ -30,8 +32,8 @@ private user homes, change packages or remove existing production reports.
 1. **Native Arch remains a release gate.** Ubuntu fixture tests cannot certify
    the installed rkhunter/Lynis/pacman/pacutils versions on Arch or a derivative.
    A format or platform difference may require another adapter adjustment.
-2. **Malware fixtures stay inert.** Tests verify static matching and parsing without
-   obtaining/executing a live payload. Undocumented variants may evade detection.
+2. **Malware fixtures stay inert.** Tests verify parsing and decision boundaries without
+   obtaining/executing a live payload. No campaign-specific scanner remains.
 3. **Live-system limits remain explicit.** Hidden kernel artifacts, a hostile local
    root user and filesystem races are outside the guarantee of a Bash assistant;
    a compromised system may conceal evidence.
@@ -59,7 +61,7 @@ On an Arch test machine and at least one derivative, record tool versions and te
 - full and individual scans, missing optional tools and interrupted runs;
 - genuine changed/missing package files and configuration backups in a disposable VM;
 - a successful AUR query, then an offline/error run preserving the snapshot;
-- custom user homes/cache paths, traversal bounds and report permissions.
+- acceptance, decline and interruption of follow-ups, command bounds and report permissions.
 
 Keep the resulting sanitized raw output as new fixtures when the upstream format
 differs. Do not merge/tag/publish this development branch as stable before that pass.
@@ -89,15 +91,14 @@ run at `20260928T140113Z` reported AUR maintenance completed and a first snapsho
 The missing-pacutils run also cannot validate the SHA-256 path on that machine.
 
 The large two-color title, original subtitle and author credit have been restored.
-The menu states which five choices form a full scan and separates the other tools.
+The menu then stated which five choices formed a full scan and separates the other tools.
 Interactive startup checks dependencies and offers installation. The older
 screenshot's zero-file integrity success and unsupported compromise-probability
 score have not been restored.
 
-The user confirmed that Atomic Arch should remain included in full scans (menu
-option 1). The module is implemented in SecCheck using documented indicators;
-it does not bundle a third-party scanner script. Indicator provenance is recorded
-in `docs/INDICATORS.md`.
+At that point the user wanted Atomic Arch included. **This was superseded on
+4 October:** the entire campaign-specific scanner and indicator document are now
+removed; full scans contain four modules and menu 5 is AUR maintenance.
 
 ## rkhunter interpretation and startup follow-up
 
@@ -161,6 +162,38 @@ suite passed after the fix. The review identified no other concrete defect in
 this patch; pacman's aggregate exit behavior was not independently established
 from current source and should be recorded during the native rerun.
 
-The updated integrity adapter still needs a native rerun (menu option 4). Its
-fixtures demonstrate the parsing and reporting corrections, not the outcome of
-that future scan or a completed stable-release validation pass.
+The subsequent native run `20261004T164830Z.be65VV` reported integrity completed
+with 146 findings and pacman=1/paccheck=1, AUR maintenance completed, and six
+explained warnings. This confirms that normal difference exits no longer made
+that integrity run incomplete. rkhunter remained incomplete with prerequisite,
+regex and skipped-test diagnostics. This feedback is for `72c1fc6`, not for the
+new follow-up interface or a stable release.
+
+
+## Four modules and post-scan verification, 5 October 2026
+
+The user removed Atomic Arch from scope and requested concise, beginner-facing
+results plus an explicit **s/y** prompt for SecCheck to verify scanner findings.
+Full scan routing, CLI rejection of the removed flags and report module counts
+are covered. The AUR reminder counts only confirmed matches and triggers above
+50; offline advice remains available.
+
+Follow-up tests cover affirmative/negative/EOF input, initial deferral, real PTY
+acceptance with updated private report and exit code, changed contents/permissions,
+a timestamp that cannot be cleared by a matching hash, repeated-file comparison
+reuse, ambiguous paths and persistent urgent/manual findings. An inert symlink
+fixture confirms a flagged SSH executable is not launched for `sshd -V/-T`.
+
+Native rkhunter source/message forms distinguish a documented optional exclusion
+from an unexplained skip. Prerequisite causes, including disabled commands, missing
+baseline data and commands returning no output, remain report diagnostics. Unknown
+skip causes and grep regex warnings still limit coverage. No scanner is patched,
+no stderr is suppressed and no `--propupd` baseline is created.
+
+The review reproduced a misleading remaining-assessment count, missing native
+prerequisite messages and execution of an SSH binary with its own unresolved
+finding. Regression fixtures now cover the corrected behavior. The follow-up review found
+no remaining critical or important blocker for this development-branch update.
+The additional interruption fixture preserves the report and labels unfinished
+checks. Native Arch and
+derivative validation of this revision remains the stable-release gate.

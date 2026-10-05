@@ -16,7 +16,7 @@ class IntegrityFeedbackTests(SecCheckCase):
                      f'exit {paccheck_rc}\n')
         return self.shell('sc_reset integrity; SC_RUN_DIR="$SC_TEST_DIR"; SC_LANG=en\n'
                           'sc_run_integrity; sc_assess; SC_NO_COLOR=1; sc_ui_init\n'
-                          'sc_render_summary; sc_render_details\n'
+                          'sc_render_report\n'
                           'printf "\\nRESULT|%s|%s|%s\\n" "${SC_MODULE_STATUS[integrity]}" '
                           '"$SC_ASSESSMENT" "${#SC_F_MODULE[@]}"\n'
                           'for key in "${SC_D_KEY[@]}"; do printf "DIAG|%s\\n" "$key"; done', PATH=path)
@@ -26,15 +26,15 @@ class IntegrityFeedbackTests(SecCheckCase):
             with self.subTest(prefix=prefix):
                 out = self.scan(pacman_err=prefix + 'demo: /usr/share/demo/cache.dat (SHA256 checksum mismatch)\n',
                                 pacman_rc=1)
-                self.assertIn('File contents differ from the local package SHA-256 record.', out)
+                self.assertIn('File content differs from the local package record.', out)
                 self.assertNotIn('This is not a content hash result.', out)
                 self.assertIn('RESULT|completed|review|1', out)
 
     def test_native_property_differences_have_specific_meanings(self):
-        for detail, meaning in [('Permissions mismatch', 'access permissions'),
+        for detail, meaning in [('Permissions mismatch', 'Access permissions'),
                                 ('UID mismatch', 'owner or group'),
                                 ('GID mismatch', 'owner or group'),
-                                ('Modification time mismatch', 'modification timestamp')]:
+                                ('Modification time mismatch', 'modification time')]:
             with self.subTest(detail=detail):
                 out = self.scan(pacman_err=f'warning: demo: /usr/share/demo/data ({detail})\n', pacman_rc=1)
                 self.assertIn(meaning, out)
@@ -46,7 +46,7 @@ class IntegrityFeedbackTests(SecCheckCase):
                         paccheck_out="demo: '/usr/bin/demo' sha256sum mismatch (expected abcd)\n")
         self.assertIn('RESULT|completed|review|2', out)
 
-    def test_unrecognized_output_is_identified_in_the_summary(self):
+    def test_unrecognized_output_is_identified_in_the_report(self):
         out = self.scan(paccheck_out='demo: new upstream format\nzlib: all files match mtree sha256sums\n')
         self.assertIn('DIAG|integrity_unparsed', out)
         self.assertIn('paccheck: demo: new upstream format', out)

@@ -21,7 +21,8 @@ class InterfaceTests(SecCheckCase):
         self.assertEqual(version.stdout.strip(), 'SecCheck 2.0.0')
         help_result = self.cli('--lang', 'it', '--help')
         self.assertEqual(help_result.returncode, 0)
-        self.assertIn('--aur-path', help_result.stdout)
+        self.assertIn('integrity|aur-health', help_result.stdout)
+        self.assertNotIn('--aur-path', help_result.stdout)
         self.assertIn('Uso:', help_result.stdout)
 
     def test_invalid_and_incomplete_cli_options_fail(self):
@@ -50,7 +51,7 @@ class InterfaceTests(SecCheckCase):
         result = self.cli('--lang', 'it', '--demo', 'urgent')
         self.assertIn('URGENTE', result.stdout)
         self.assertIn('INCOMPLETA', result.stdout)
-        self.assertIn('4/5', result.stdout)
+        self.assertIn('3/4', result.stdout)
         self.assertNotIn('SISTEMA SICURO', result.stdout)
 
     def test_ascii_output_fits_narrow_and_wide_terminals(self):
@@ -96,10 +97,10 @@ class InterfaceTests(SecCheckCase):
         self.assertEqual(out, '1')
 
     def test_private_plain_report_and_machine_readable_findings(self):
-        out = self.shell('sc_reset aur; SC_LANG=it; SC_ASCII=1; SC_NO_COLOR=1; sc_ui_init\n'
+        out = self.shell('sc_reset rkhunter; SC_LANG=it; SC_ASCII=1; SC_NO_COLOR=1; sc_ui_init\n'
                          'sc_prepare_run "$SC_TEST_DIR/reports" || exit\n'
-                         'sc_module_set aur partial bounded_scope\n'
-                         'sc_add_finding aur suspicious urgent match $\'/tmp/bad\\e[31m\\tname\' aur_hash fixture\n'
+                         'sc_module_set rkhunter partial unfinished\n'
+                         'sc_add_finding rkhunter suspicious urgent unconfirmed $\'/tmp/bad\\e[31m\\tname\' rkh_signature fixture\n'
                          'sc_assess; sc_save_report || exit\nprintf "%s" "$SC_RUN_DIR"')
         folder = pathlib.Path(out)
         self.assertEqual(folder.stat().st_mode & 0o777, 0o700)
@@ -122,7 +123,7 @@ class InterfaceTests(SecCheckCase):
                          'sc_module_set lynis completed ""; sc_assess; sc_render_summary')
         self.assertIn('1/1', out)
         self.assertIn('Selected modules only', out)
-        self.assertIn('Not selected', out)
+        self.assertNotIn('Not selected', out)
 
     def test_details_can_reach_findings_after_the_first_page(self):
         out = self.shell('sc_reset rkhunter; SC_LANG=en; SC_ASCII=1; SC_NO_COLOR=1; sc_ui_init\n'
@@ -144,6 +145,7 @@ class InterfaceTests(SecCheckCase):
         self.assertIn('/example/script', report)
         self.assertIn('Package: example', report)
         self.assertIn('original warning', report)
+        self.assertNotIn('causa da chiarire', report)
         self.assertIn('rkh_file_match', (folder / 'checks.tsv').read_text())
         self.assertEqual((folder / 'checks.tsv').stat().st_mode & 0o777, 0o600)
 
@@ -169,13 +171,14 @@ class InterfaceTests(SecCheckCase):
         self.assertIn('failed', out)
         self.assertTrue(out.endswith('|1'))
 
-    def test_sudo_retains_language_and_paths_as_separate_arguments(self):
+    def test_sudo_retains_language_scan_and_display_network_flags(self):
         path = self.command('sudo', 'printf "%s\\n" "$@"\n')
-        out = self.shell('SC_LANG=it; SC_SCAN=aur; SC_ASCII=1; SC_NO_COLOR=1\n'
-                         "SC_EXTRA_AUR_PATHS=('/a path/$(literal)')\n"
+        out = self.shell('SC_LANG=it; SC_SCAN=aur-health; SC_ASCII=1; SC_NO_COLOR=1; SC_OFFLINE=1\n'
                          'sc_elevate scan', PATH=path)
-        self.assertIn('--lang\nit\n--scan\naur', out)
-        self.assertIn('--aur-path\n/a path/$(literal)', out)
+        self.assertIn('--lang\nit\n--scan\naur-health', out)
+        self.assertIn('--offline', out)
+        self.assertIn('--ascii', out)
+        self.assertIn('--no-color', out)
 
 
 if __name__ == '__main__':

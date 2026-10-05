@@ -92,7 +92,7 @@ class AdapterTests(SecCheckCase):
                             'echo "egrep: warning: egrep is obsolescent; using grep -E" >&2\n'
                             'echo "grep: warning: stray \\ before +" >&2\n')
         out = self.shell('sc_reset rkhunter; SC_RUN_DIR="$SC_TEST_DIR"; SC_LANG=en\n'
-                         'sc_run_rkhunter; sc_assess; SC_NO_COLOR=1; sc_ui_init; sc_render_summary\n'
+                         'sc_run_rkhunter; sc_assess; SC_NO_COLOR=1; sc_ui_init; sc_render_report\n'
                          'printf "\\n%s|%s" "${SC_MODULE_STATUS[rkhunter]}" "${#SC_F_MODULE[@]}"', PATH=path)
         self.assertIn('skdet', out)
         self.assertIn('xinetd', out)
@@ -113,7 +113,7 @@ class AdapterTests(SecCheckCase):
                             'echo "System checks summary"\n'
                             'echo "grep: /private/example: Permission denied" >&2\n')
         out = self.shell('sc_reset rkhunter; SC_RUN_DIR="$SC_TEST_DIR"; SC_LANG=en\n'
-                         'sc_run_rkhunter; sc_assess; SC_NO_COLOR=1; sc_ui_init; sc_render_summary\n'
+                         'sc_run_rkhunter; sc_assess; SC_NO_COLOR=1; sc_ui_init; sc_render_report\n'
                          'printf "\\n%s" "${SC_MODULE_STATUS[rkhunter]}"', PATH=path)
         self.assertIn('Permission denied', out)
         self.assertTrue(out.endswith('partial'), out)
@@ -173,109 +173,9 @@ class AdapterTests(SecCheckCase):
         self.assertEqual(out, "partial")
 
 
-class AurTests(SecCheckCase):
-    def test_depth_limit_does_not_silently_claim_complete_coverage(self):
-        root = self.folder / 'cache'
-        deep = root.joinpath(*(['nested']*12))
-        deep.mkdir(parents=True)
-        (deep / 'PKGBUILD').write_text('npm install atomic-lockfile\n')
-        out = self.shell('sc_reset aur; sc_aur_init; SC_RUN_DIR="$SC_TEST_DIR"\n'
-                         'sc_scan_aur_root "$SC_TEST_DIR/cache" cache\n'
-                         'printf "%s" "$SC_AUR_PARTIAL"')
-        self.assertEqual(out, '1')
-
-    def test_real_traversal_finds_pacman_install_script_with_spaces(self):
-        package = self.folder / 'package with spaces'
-        package.mkdir()
-        (package / 'install').write_text('npm install atomic-lockfile\n')
-        out = self.shell('sc_reset aur; sc_aur_init\nSC_RUN_DIR="$SC_TEST_DIR"\n'
-                         'sc_scan_aur_root "$SC_TEST_DIR/package with spaces" cache\n'
-                         'printf "%s|%s|%s" "$SC_AUR_COUNT" "$SC_AUR_PARTIAL" "${SC_F_KEY[0]-}"')
-        self.assertEqual(out, '1|0|aur_reference')
-
-    def test_custom_home_service_is_inspected(self):
-        self.fixture('sample.service', '[Service]\nExecStart=/srv/alice/.cache/helper\nRestart=always\nRestartSec=30\n')
-        out = self.shell('sc_reset aur; sc_aur_init\nSC_AUR_HOMES=(/srv/alice)\n'
-                         'sc_inspect_aur_file "$SC_TEST_DIR/sample.service" startup\n'
-                         'printf "%s" "${SC_F_KEY[0]-}"')
-        self.assertEqual(out, 'aur_service')
-
-    def test_untrusted_history_fifo_is_not_opened(self):
-        os.mkfifo(self.folder / 'history')
-        out = self.shell('sc_reset aur; sc_aur_init\nsc_parse_aur_history "$SC_TEST_DIR/history"\n'
-                         'printf "%s" "$SC_AUR_PARTIAL"')
-        self.assertEqual(out, '1')
-
-    def test_pkgbuild_is_read_never_executed(self):
-        self.fixture("PKGBUILD", 'touch "$SC_TEST_DIR/EXECUTED"\nnpm install atomic-lockfile minimist\n')
-        out = self.shell('sc_reset aur\nsc_aur_init\nsc_inspect_aur_file "$SC_TEST_DIR/PKGBUILD" cache\n'
-                         'printf "%s|%s" "${SC_F_KEY[0]}" "${SC_F_PRIORITY[0]}"')
-        self.assertEqual(out, "aur_reference|review")
-        self.assertFalse((self.folder / "EXECUTED").exists())
-
-    def test_similar_benign_name_does_not_match(self):
-        self.fixture("package.json", '{"name":"my-atomic-lockfile-wrapper"}\n')
-        out = self.shell('sc_reset aur\nsc_aur_init\nsc_inspect_aur_file "$SC_TEST_DIR/package.json" cache\n'
-                         'printf "%s" "${#SC_F_MODULE[@]}"')
-        self.assertEqual(out, "0")
-
-    def test_manifest_reference_is_not_claimed_as_execution(self):
-        self.fixture("package.json", '{"name":"atomic-lockfile","version":"1.4.2","scripts":{"preinstall":"./src/hooks/deps"}}\n')
-        out = self.shell('sc_reset aur\nsc_aur_init\nsc_inspect_aur_file "$SC_TEST_DIR/package.json" cache\n'
-                         'printf "%s|%s" "${SC_F_KEY[0]}" "${SC_F_CONFIDENCE[0]}"')
-        self.assertEqual(out, "aur_reference|observation")
-
-    def test_known_hash_reports_presence_without_executing_file(self):
-        self.fixture("deps", "inert fixture")
-        path = self.command("sha256sum", 'printf "%s  %s\\n" 6144d433f8a0316869877b5f834c801251bbb936e5f1577c5680878c7443c98b "$2"\n')
-        out = self.shell('sc_reset aur\nsc_aur_init\nsc_check_known_file "$SC_TEST_DIR/deps"\n'
-                         'printf "%s|%s" "${SC_F_KEY[0]}" "${SC_F_PRIORITY[0]}"', PATH=path)
-        self.assertEqual(out, "aur_hash|urgent")
-
-    def test_benign_file_real_sha256_does_not_match(self):
-        self.fixture("deps", "benign sample\n")
-        out = self.shell('sc_reset aur\nsc_aur_init\nsc_check_known_file "$SC_TEST_DIR/deps"\n'
-                         'printf "%s" "${#SC_F_MODULE[@]}"')
-        self.assertEqual(out, "0")
-
-    def test_symlinks_are_not_followed(self):
-        self.fixture("target", "npm install atomic-lockfile\n")
-        (self.folder / "PKGBUILD").symlink_to(self.folder / "target")
-        out = self.shell('sc_reset aur\nsc_aur_init\nsc_inspect_aur_file "$SC_TEST_DIR/PKGBUILD" cache\n'
-                         'printf "%s|%s" "${#SC_F_MODULE[@]}" "$SC_AUR_PARTIAL"')
-        self.assertEqual(out, "0|1")
-
-    def test_file_limit_is_reported_as_partial(self):
-        (self.folder / "a").mkdir()
-        (self.folder / "b").mkdir()
-        self.fixture("a/PKGBUILD", "pkgname=a\n")
-        self.fixture("b/PKGBUILD", "pkgname=b\n")
-        out = self.shell('sc_reset aur\nsc_aur_init\nSC_RUN_DIR="$SC_TEST_DIR"\nSC_AUR_MAX_FILES=1\n'
-                         'sc_scan_aur_root "$SC_TEST_DIR" cache\nprintf "%s" "$SC_AUR_PARTIAL"')
-        self.assertEqual(out, "1")
-
-    def test_local_user_homes_include_custom_locations(self):
-        self.fixture("passwd", "root:x:0:0:root:/root:/bin/bash\nklod:x:1000:1000::/data/klod:/bin/bash\nnobody:x:65534:65534::/nonexistent:/usr/bin/nologin\n")
-        out = self.shell('sc_reset aur\nsc_aur_init\nsc_collect_homes "$SC_TEST_DIR/passwd"\n'
-                         'printf "%s\\n" "${SC_AUR_HOMES[@]}"')
-        self.assertEqual(out.splitlines(), ["/root", "/data/klod"])
-
-    def test_persistence_pattern_is_not_based_on_restart_alone(self):
-        self.fixture("normal.service", "[Service]\nExecStart=/usr/bin/normal\nRestart=always\nRestartSec=30\n")
-        out = self.shell('sc_reset aur\nsc_aur_init\nsc_inspect_aur_file "$SC_TEST_DIR/normal.service" startup\n'
-                         'printf "%s" "${#SC_F_MODULE[@]}"')
-        self.assertEqual(out, "0")
-
-    def test_suspicious_persistence_combination_is_preserved(self):
-        self.fixture("unknown.service", "[Service]\nExecStart=/var/lib/unknown/worker\nRestart=always\nRestartSec=30\n")
-        out = self.shell('sc_reset aur\nsc_aur_init\nsc_inspect_aur_file "$SC_TEST_DIR/unknown.service" startup\n'
-                         'printf "%s" "${SC_F_KEY[0]}"')
-        self.assertEqual(out, "aur_service")
-
-
 class EvidenceTests(SecCheckCase):
     def test_failed_empty_modules_are_incomplete(self):
-        out = self.shell('sc_reset "rkhunter lynis integrity aur"\n'
+        out = self.shell('sc_reset "rkhunter lynis integrity aur-health"\n'
                          'for m in "${SC_SELECTED[@]}"; do sc_module_set "$m" failed command_failed; done\n'
                          'sc_assess\nprintf "%s|%s" "$SC_INCOMPLETE" "$SC_ASSESSMENT"')
         self.assertEqual(out, "1|unknown")
@@ -297,12 +197,12 @@ class EvidenceTests(SecCheckCase):
 
     def test_only_selected_modules_count_for_coverage(self):
         out = self.shell('sc_reset "lynis"\nsc_module_set lynis completed ""\nsc_assess\n'
-                         'printf "%s|%s|%s" "$SC_INCOMPLETE" "$SC_COMPLETED" "${SC_MODULE_STATUS[aur]}"')
+                         'printf "%s|%s|%s" "$SC_INCOMPLETE" "$SC_COMPLETED" "${SC_MODULE_STATUS[aur-health]}"')
         self.assertEqual(out, "0|1|not-run")
 
     def test_partial_scan_keeps_urgent_findings(self):
-        out = self.shell('sc_reset "aur"\nsc_module_set aur partial unreadable\n'
-                         'sc_add_finding aur suspicious urgent match "/a b/deps" aur_hash digest\n'
+        out = self.shell('sc_reset "rkhunter"\nsc_module_set rkhunter partial unfinished\n'
+                         'sc_add_finding rkhunter suspicious urgent unconfirmed "/a b/deps" rkh_signature digest\n'
                          'sc_assess\nprintf "%s|%s" "$SC_INCOMPLETE" "$SC_ASSESSMENT"')
         self.assertEqual(out, "1|urgent")
 
@@ -332,7 +232,7 @@ class EvidenceTests(SecCheckCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_reset_clears_prior_scan_findings(self):
-        out = self.shell('sc_reset aur\nsc_add_finding aur suspicious urgent match /x aur_hash x\n'
+        out = self.shell('sc_reset rkhunter\nsc_add_finding rkhunter suspicious urgent unconfirmed /x rkh_signature x\n'
                          'sc_reset lynis\nprintf "%s|%s" "${#SC_F_MODULE[@]}" "${SC_SELECTED[*]}"')
         self.assertEqual(out, "0|lynis")
 

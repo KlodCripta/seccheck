@@ -41,7 +41,7 @@ cat "$SC_TEST_DIR/pacfile.error" >&2
         self.fixture('rkh.log', lines + '\nSystem checks summary\n')
         self.fixture('rkh.stdout', (lines if stdout is None else stdout) + '\nSystem checks summary\n')
         out = self.shell('sc_reset rkhunter; SC_RUN_DIR="$SC_TEST_DIR"\n'
-                         'sc_run_rkhunter; sc_assess\n'
+                         'sc_ui_init; sc_run_rkhunter; sc_run_followups > /dev/null; sc_assess\n'
                          'for ((i=0;i<${#SC_F_MODULE[@]};i++)); do\n'
                          ' printf "%s|%s|%s|%s\\n" "${SC_F_PRIORITY[i]}" "${SC_F_KEY[i]}" '
                          '"${SC_F_OBJECT[i]}" "${SC_F_CHECK_KEY[i]-}"\ndone\n'

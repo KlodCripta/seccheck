@@ -21,17 +21,17 @@ bash seccheck.sh
 ```
 
 Choose **1 English** or **2 Italiano** at startup. Root is requested only when
-needed; your chosen language and paths are retained through sudo. On Arch and its
+needed; your chosen language and display options are retained through sudo. On Arch and its
 derivatives, the interactive startup checks the scanner dependencies, explains
 their purpose and offers to install missing packages. You can decline and continue.
 
 Scegli **1 English** o **2 Italiano** all'avvio. I permessi di root vengono richiesti
-quando servono; lingua e percorsi scelti vengono mantenuti dopo sudo. Il controllo
+quando servono; lingua e opzioni di visualizzazione vengono mantenute dopo sudo. Il controllo
 iniziale mostra gli strumenti disponibili e quelli mancanti, spiegando a cosa
 servono. Puoi accettare l'installazione con pacman oppure proseguire con i controlli
 disponibili. Vengono richiesti solo i pacchetti mancanti, senza conferme automatiche.
 
-**1 — Full scan / Scansione completa** includes **2, 3, 4, 5 and 9**. Options 6–8
+**1 — Full scan / Scansione completa** includes **2, 3, 4 and 5**. Options 6–8
 are separate tools: dependencies, signature updates and the example result.
 See the [current terminal menu](screenshots/seccheck-v2-menu.png).
 
@@ -51,10 +51,9 @@ bash seccheck.sh --lang en --demo clean
 | rkhunter | Known rootkit indicators and suspicious properties / Indicatori di rootkit e proprietà sospette |
 | Lynis | System configuration and hardening advice / Configurazione e consigli di sicurezza |
 | Integrity | pacman metadata **and** paccheck SHA-256 against local package records / Metadati e contenuto dei file rispetto ai dati locali dei pacchetti |
-| AUR / Atomic Arch | Static inspection of documented campaign traces / Ricerca statica di tracce documentate della campagna |
 | AUR / Project health | Installed versions, out-of-date flags, orphan status, age and maintainer changes / Versioni, segnalazioni di mancato aggiornamento, orfani, anzianità e cambi di maintainer |
 
-Tools: Bash 4.4+, pacman, GNU coreutils/find/grep; `rkhunter`, `lynis`, `pacutils`
+Tools: Bash 4.4+, pacman, GNU coreutils/grep; `rkhunter`, `lynis`, `pacutils`
 for their respective modules. Online AUR maintenance checks also require `python`
 (Python 3 standard library) and `curl`. `paccheck` and `pacfile` are supplied by `pacutils`. Missing scanner
 packages can be installed through the menu, with pacman's confirmation. No AUR
@@ -80,22 +79,30 @@ Findings explain their meaning, uncertainty and next step. Original scanner evid
 keeps its original language. Configuration edits are labelled without automatically
 dismissing changed executables. Lynis advice never confirms an unrelated rootkit alert.
 
-SecCheck also follows up supported rkhunter warnings automatically. It checks the
+After an interactive scan, SecCheck asks **“Vuoi che faccia io le verifiche del caso al posto tuo? [s/N]”** (English: **“Would you like me to run the follow-up checks for you? [y/N]”**).
+Answering **s** or **y** starts read-only checks with the existing root permissions.
+Enter, n or end-of-input leaves the initial results unchanged. It checks the
 exact file's package record and SHA-256, or queries the SSH server's configuration
 and version. Duplicate summary/log messages are grouped. A warning explained by
 these checks remains visible as **Explained**, with its evidence, instead of being
 counted as an unresolved warning. Strong rootkit signatures are never cleared by a
-matching package file. See [how these checks work and their limits](docs/RKHUNTER_CONTEXT.md).
+matching package file. Integrity follow-ups compare supported regular files and
+record current properties of directories/links. Unexplained changes, unavailable
+checks and advice requiring a human decision remain visible. The report is updated
+in the same private run directory; original scanner logs are retained.
+See [how these checks work and their limits](docs/RKHUNTER_CONTEXT.md).
 
 Nei dettagli trovi **Cosa significa**, **Verifica di SecCheck** e **Cosa fare**.
 Gli avvisi spiegati restano consultabili; quelli che SecCheck non riesce a verificare
-mantengono una spiegazione del limite. Le pagine dei dettagli permettono di leggere
+mantengono una spiegazione del limite. Con **s** avvii le verifiche aggiuntive;
+il programma aggiorna il risultato senza modificare file o impostazioni. Le pagine dei dettagli permettono di leggere
 anche le segnalazioni successive alle prime dieci.
 
 The integrity module distinguishes changed content, permissions, owner/group and
 modification time. A difference is a result, not automatically an incomplete check.
 Read failures, missing package reference data and unsupported output instead limit
-coverage; the summary identifies the tool and preserves the exact message.
+coverage. The short summary gives the reason; the full report retains exact
+messages and technical diagnostics.
 
 Il controllo di integrità distingue contenuto, permessi, proprietario/gruppo e data
 di modifica. Le differenze restano da verificare anche per file modificati spesso dai
@@ -107,13 +114,13 @@ il rapporto completo conserva tutti i messaggi originali.
 ```bash
 sudo bash seccheck.sh --lang it --scan full
 sudo bash seccheck.sh --lang en --scan integrity --no-color
-sudo bash seccheck.sh --lang it --scan aur --aur-path '/data/my projects' --ascii
 sudo bash seccheck.sh --lang it --scan aur-health
 sudo bash seccheck.sh --lang it --scan full --offline
 bash seccheck.sh --help
 ```
 
-Noninteractive scans require `--lang`. `NO_COLOR`, `--no-color`, `TERM=dumb` and
+Noninteractive scans require `--lang` and perform the initial scan only: follow-up
+checks require the interactive confirmation. No input is read from a batch pipeline. `NO_COLOR`, `--no-color`, `TERM=dumb` and
 redirected output disable color; `--ascii` provides basic character output. Layouts
 adapt to narrow terminals. Interactive results offer details, a full report and rescan.
 
@@ -142,7 +149,7 @@ an explicit menu action; SecCheck never resets rkhunter's file-property baseline
 This separate module is included in full scans. It queries the official AUR RPC
 over HTTPS, sending the names of installed **foreign packages** (`pacman -Qm`).
 Those packages are not necessarily from AUR. `--offline` skips these online queries
-and leaves this module unavailable; static Atomic Arch inspection still works.
+and leaves this module unavailable. The three local modules can still run.
 
 The public package page supplies co-maintainers when the RPC omits that field.
 An unavailable page, invalid metadata, failed request or mismatching maintainer
@@ -166,6 +173,19 @@ scan atomically updates that file. Failed/partial/offline runs preserve it, and 
 lock prevents concurrent updates. Each run keeps its own observations and findings.
 Changes are observed between scans, not monitored continuously.
 
+AUR maintenance is menu option **5**. SecCheck no longer includes the campaign-specific
+Atomic Arch scanner or its `--scan aur` / `--aur-path` options.
+
+Install only packages you need and review the PKGBUILD, associated install scripts
+and changes before building or updating. Maintenance metadata cannot certify a
+package or its build instructions. More than **50 installed packages confirmed in
+AUR** triggers an inventory-review suggestion. This is a reminder chosen by SecCheck,
+not a security threshold; unlisted foreign packages do not count toward it.
+
+Installa solo ciò che ti serve e controlla PKGBUILD, file .install e modifiche prima
+di compilare o aggiornare. Oltre 50 pacchetti riconosciuti su AUR compare un invito
+a rivederli: non significa che siano pericolosi né che sotto quella soglia siano sicuri.
+
 La prima scansione completa registra una **fotografia iniziale**, senza certificare
 l'affidabilità dei maintainer. Le successive segnalano cambi del responsabile e
 aggiunte/rimozioni di co-maintainer. Non viene inventato uno storico precedente.
@@ -176,12 +196,7 @@ needed, 2 MiB per response and a 300-second module timeout. Exceeding a bound ma
 coverage partial. The report states counts and the 365-day age threshold; this does
 not establish the upstream project's activity or responsiveness.
 
-## Atomic Arch limits / Limiti
-
-See [indicators, primary sources and bounds](docs/INDICATORS.md). Cache references
-indicate possible exposure; a documented SHA-256 match establishes presence of those
-bytes, not execution. Older/removed history, archives, arbitrary projects, unmounted
-homes and kernel memory are outside the default scope. Use `--aur-path` for extra roots.
+## Limits / Limiti
 
 This is a live-system assistant, not a forensic acquisition environment. A running
 rootkit may hide artifacts. It cannot rule out past execution or data theft, and
@@ -201,7 +216,7 @@ real scanners, changes installed packages or deletes production logs.
 
 Before release, test on Arch and at least one derivative: full/individual scans,
 real scanner versions, missing tools, interrupted/offline runs, sudo language retention,
-nonstandard homes, report permissions and a normal package update. Preserve fixture
+report permissions and a normal package update. Preserve fixture
 outputs for any newly observed upstream format. Demo success is not native validation.
 
 MIT — Klod Cripta.

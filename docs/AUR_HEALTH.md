@@ -56,3 +56,20 @@ module remains partial and the previous baseline is preserved.
 The 260-second online budget includes pauses and retries. Large inventories can
 reach this limit; the report states that remaining requests were stopped. Split
 packages reuse a successfully retrieved page for their package base within the run.
+
+## Scope update, 4 October 2026
+
+AUR maintenance is the fourth module in a full scan and menu option 5. The separate
+campaign-specific scanner has been removed. The source checks above, observation
+history and failure handling remain the same.
+
+The result includes an EN/IT reminder to install only needed packages, review
+PKGBUILD and .install instructions and changes, and check source locations. This
+follows the [ArchWiki AUR guidance](https://wiki.archlinux.org/title/Arch_User_Repository).
+SecCheck does not audit those scripts or infer safety from active maintenance.
+
+More than 50 confirmed installed AUR matches adds a suggestion to review the
+inventory. This is an explicitly labelled SecCheck reminder, not a proven security
+threshold. Only packages found in validated RPC responses count; absent foreign
+packages do not. A partial query may still trigger the reminder if it has already
+confirmed more than 50 matches, while coverage and baseline handling remain partial.

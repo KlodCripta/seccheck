@@ -32,7 +32,7 @@ class AurHealthTests(SecCheckCase):
                           + extra + '\nsc_run_aur_health\n'
                           'printf "%s|%s|%s\\n" "${SC_MODULE_STATUS[aur-health]}" "${SC_MODULE_REASON[aur-health]}" "${SC_HEALTH_NOTE-}"\n'
                           'printf "%s\\n" "${SC_F_KEY[@]}"' +
-                          ('\nSC_ASCII=1; SC_NO_COLOR=1; sc_ui_init; sc_assess; sc_render_summary' if summary else ''),
+                          ('\nSC_ASCII=1; SC_NO_COLOR=1; sc_ui_init; sc_assess; sc_render_report' if summary else ''),
                           PATH=self.path)
         return ' '.join(output.split()) if summary else output
 
@@ -153,6 +153,35 @@ print((root / ('page.html' if '/packages/' in url else 'rpc.json')).read_text(),
         self.assertIn('health_unlisted', out)
         self.assertNotIn('health_removed', out)
 
+    def test_large_aur_inventory_reminder_starts_above_fifty_confirmed_matches(self):
+        self.fixture('batch_rpc.py', '''import json, os, pathlib, sys, urllib.parse
+root = pathlib.Path(os.environ['SC_TEST_DIR'])
+names = urllib.parse.parse_qs(urllib.parse.urlsplit(sys.argv[-1]).query)['arg[]']
+packages = json.loads((root / 'packages.json').read_text())
+found = [pkg for pkg in packages if pkg['Name'] in names]
+print(json.dumps(dict(version=5, type='multiinfo', resultcount=len(found), results=found)))
+''')
+        self.command('curl', 'exec python3 "$SC_TEST_DIR/batch_rpc.py" "$@"\n')
+        for count in (50, 51):
+            with self.subTest(count=count):
+                packages = [dict(self.package, Name=f'demo-{n}', PackageBase=f'demo-{n}')
+                            for n in range(count)]
+                self.fixture('packages.json', json.dumps(packages))
+                self.fixture('inventory.txt', ''.join(pkg['Name'] + ' 1.0-1\n' for pkg in packages))
+                self.command('pacman', 'cat "$SC_TEST_DIR/inventory.txt"\n')
+                out = self.scan(summary=True)
+                self.assertIn('completed|', out)
+                self.assertEqual('health_many' in out, count > 50)
+                if count > 50:
+                    self.assertIn('not a security threshold', out)
+                    self.assertIn('AUR matches=51', (self.run / 'aur-health-findings.tsv').read_text())
+
+    def test_foreign_packages_without_aur_matches_do_not_trigger_inventory_reminder(self):
+        self.fixture('inventory.txt', 'demo 1.0-1\n' + ''.join(f'local-{n} 1.0-1\n' for n in range(50)))
+        self.command('pacman', 'cat "$SC_TEST_DIR/inventory.txt"\n')
+        self.fixture('rpc.json', json.dumps(dict(version=5, type='multiinfo', resultcount=0, results=[])))
+        self.assertNotIn('health_many', self.scan())
+
     def test_previously_seen_package_absent_from_aur_is_reported(self):
         self.seed_baseline()
         self.fixture('rpc.json', '{"version":5,"type":"multiinfo","resultcount":0,"results":[]}')
@@ -186,7 +215,7 @@ print((root / ('page.html' if '/packages/' in url else 'rpc.json')).read_text(),
         self.assertIn('timed out', out)
         self.assertNotIn('health_removed', out)
 
-    def test_rpc_error_is_explained_in_summary_without_claiming_a_previous_baseline(self):
+    def test_rpc_error_is_explained_in_report_without_claiming_a_previous_baseline(self):
         self.command('curl', 'echo "curl: (6) Could not resolve host: aur.archlinux.org" >&2; exit 6\n')
         out = self.scan(summary=True)
         self.assertIn('Could not resolve host', out)
