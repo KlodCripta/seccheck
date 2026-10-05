@@ -2,8 +2,8 @@
 
 ## Completed
 
-Latest local suite: **134 tests passing**, Bash syntax checks and ShellCheck 0.11.0
-clean after the four-module and post-scan follow-up changes (5 October 2026 UTC).
+Latest local suite: **142 tests passing**, Bash syntax checks and ShellCheck 0.11.0
+clean after grouping integrity findings and exposing SSH failure causes (5 October 2026 UTC).
 The existing-root PTY integration test runs here; it is explicitly skipped when
 the test account is not root. Tests use inert scanner commands in both cases.
 
@@ -197,3 +197,31 @@ no remaining critical or important blocker for this development-branch update.
 The additional interruption fixture preserves the report and labels unfinished
 checks. Native Arch and
 derivative validation of this revision remains the stable-release gate.
+
+## Grouped results after native follow-up, 5 October 2026
+
+The user's `51f01f2` run completed the post-scan prompt. Its aggregate check
+results were 113 changed-content observations, 14 metadata differences, 19
+nonregular-path observations, 50 manual findings, five matching-file checks,
+one modern-SSH check, one unknown SSH result and one unowned file. These are
+finding counts, not unique files. The aggregate does not identify which paths
+changed, why SSH failed or whether any change was intentional.
+
+Previously the pending-assessment count included suggestions, and a file with
+several properties reported by both pacman and paccheck appeared repeatedly.
+The summary, priority bars and paginated details now group integrity findings
+by exact absolute path. Other findings remain individual; ambiguous paths are
+not merged. The highest member priority controls each displayed group. The
+underlying assessment, coverage, exit statuses and all original report/TSV
+observations are preserved.
+
+Seven regression tests cover counts excluding suggestions, distinct path cards,
+all property types, group-based paging, mixed priorities/check results, unchanged
+private reports, ambiguous paths and specific missing-tool guidance. An eighth checks bounded, sanitized SSH
+failure text in regular Details while retaining the original stderr. The full
+142-test suite passed locally. This presentation change does not explain away
+the user's differing files or create the missing rkhunter baseline.
+
+A read-only review found no Critical or Important blocker. Its minor finding
+about grouped warnings losing their installation advice was reproduced and fixed:
+grouping now preserves specific guidance for missing tools.

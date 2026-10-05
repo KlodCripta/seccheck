@@ -124,6 +124,15 @@ checks require the interactive confirmation. No input is read from a batch pipel
 redirected output disable color; `--ascii` provides basic character output. Layouts
 adapt to narrow terminals. Interactive results offer details, a full report and rescan.
 
+The summary and paged details group package-integrity differences by exact path.
+Several warnings about one file become one item, with all differences listed.
+Suggestions are separate from items still requiring review. Grouping does not
+clear a finding; the full report and TSVs preserve every original observation.
+
+Riepilogo e Dettagli riuniscono le differenze dei pacchetti per percorso: un file
+compare una sola volta, con tutte le differenze rilevate. I consigli restano
+separati dalle voci da chiarire. Il rapporto completo conserva gli avvisi originali.
+
 Batch scan exit codes: **0** no urgent/review findings (suggestions may exist), **1**
 urgent/review findings, **2** incomplete coverage even when findings also exist.
 Setup errors: 64 arguments, 73 report storage, 77 privilege, 78 unsupported system;

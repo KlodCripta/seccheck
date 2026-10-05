@@ -226,6 +226,24 @@ cat "$SC_TEST_DIR/pacfile.error" >&2
         self.assertIn('|rkh_ssh_unknown', out)
         self.assertNotIn('|rkh_ssh_disabled', out)
 
+    def test_failed_ssh_check_shows_bounded_cause_in_regular_details(self):
+        self.command('sshd', '''[[ $1 == -T ]] || exit 2
+printf '\\033[31mconfiguration error: test-only message\\n' >&2
+printf '%0600d' 0 >&2
+exit 1
+''')
+        out = self.shell('''sc_reset rkhunter; SC_RUN_DIR="$SC_TEST_DIR"; SC_LANG=en; sc_ui_init
+sc_add_finding rkhunter suspicious review unconfirmed PermitRootLogin rkh_ssh_root warning
+sc_rkh_check_ssh 0; sc_render_details
+printf 'RESULT|%s|%s\\n' "${SC_F_PRIORITY[0]}" "${SC_F_CHECK_KEY[0]}"
+''', PATH=self.path)
+        self.assertIn('configuration error: test-only message', out)
+        self.assertIn('sshd -T: exit=1', out)
+        self.assertIn('RESULT|review|rkh_ssh_unknown', out)
+        self.assertNotIn('\x1b', out)
+        self.assertNotIn('0' * 400, out)
+        self.assertGreater((self.folder / 'rkh-context.0.stderr').stat().st_size, 600)
+
     def test_legacy_protocol_warning_is_checked_against_server_version(self):
         self.command('sshd', '[[ "$1" == -V ]] || exit 2; echo "OpenSSH_10.0p1, OpenSSL 3.5" >&2\n')
         out = self.scan("Checking if SSH protocol v1 is allowed [ Warning ]\n"

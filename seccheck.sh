@@ -298,10 +298,18 @@ sc_rkh_check_file() {
     else SC_F_CHECK_KEY[i]=rkh_file_match; SC_F_PRIORITY[i]=info; SC_F_CONFIDENCE[i]=observation; fi
 }
 
+sc_rkh_ssh_evidence() {
+    local i=$1 command=$2 rc=$3 prefix="$SC_RUN_DIR/rkh-context.$1" excerpt
+    # Show a short, inert excerpt; the full original streams stay in the report directory.
+    excerpt=$(timeout 2 head -c 320 -- "$prefix.stderr" 2>/dev/null)
+    [[ -n $excerpt ]] || excerpt=$(timeout 2 head -c 320 -- "$prefix.ssh" 2>/dev/null)
+    SC_F_CHECK_DETAIL[i]="$command: exit=$rc; $(sc_text "$excerpt")"
+}
+
 sc_rkh_check_ssh() {
     local i=$1 prefix="$SC_RUN_DIR/rkh-context.$1" value='' line rc major minor count=0 j executable resolved other guard_started=$SECONDS
     SC_F_CHECK_KEY[i]=rkh_ssh_unknown
-    SC_F_CHECK_DETAIL[i]=''
+    SC_F_CHECK_DETAIL[i]="$(sc_t rkh_ssh_not_started)"
     executable=$(command -v sshd) || return
     resolved=$(timeout 5 readlink -f -- "$executable") || return
     # Do not launch an SSH binary which this scan has left under suspicion,
@@ -319,6 +327,7 @@ sc_rkh_check_ssh() {
     if [[ ${SC_F_KEY[i]} == rkh_ssh_root ]]; then
         sc_capture "$prefix.ssh" "$prefix.stderr" 10 sshd -T
         rc=$?
+        sc_rkh_ssh_evidence "$i" 'sshd -T' "$rc"
         ((rc == 0)) && [[ ! -s $prefix.stderr ]] || return
         while IFS= read -r line; do
             if [[ $line == 'permitrootlogin '* ]]; then value=${line#* }; ((count+=1)); fi
@@ -337,6 +346,7 @@ sc_rkh_check_ssh() {
     else
         sc_capture "$prefix.ssh" "$prefix.stderr" 10 sshd -V
         rc=$?
+        sc_rkh_ssh_evidence "$i" 'sshd -V' "$rc"
         ((rc == 0)) || return
         while IFS= read -r line || [[ -n $line ]]; do
             if [[ $line =~ ^OpenSSH_([0-9]{1,3})\.([0-9]{1,3})(p[0-9]+)?([,[:space:]]|$) ]]; then
@@ -964,7 +974,16 @@ sc_t() {
         followup_rootkit) en="Checking reported files and SSH settings..."; it="Verifico i file segnalati e le impostazioni SSH...";;
         followup_files) en="Comparing reported files with local package records..."; it="Confronto i file segnalati con i dati dei pacchetti...";;
         followup_manual) en="This finding cannot be resolved automatically. Follow the advice above or ask for help using the report."; it="Questa segnalazione richiede una valutazione. Segui il consiglio sopra o chiedi aiuto usando il rapporto.";;
-        followup_pending) en="Still to assess"; it="Richiedono una tua valutazione";;
+        followup_pending) en="Still to assess"; it="Voci ancora da chiarire";;
+        followup_group_note) en="File differences are grouped by path in Findings. Suggestions are separate."; it="Nei Dettagli le differenze sullo stesso file sono riunite. I consigli sono separati.";;
+        grouped_findings) en="Warnings for this path"; it="Avvisi su questo percorso";;
+        integrity_fields) en="Reported differences"; it="Differenze segnalate";;
+        field_integrity_content) en="content"; it="contenuto";;
+        field_integrity_permissions) en="permissions"; it="permessi";;
+        field_integrity_owner) en="owner or group"; it="proprietario o gruppo";;
+        field_integrity_time) en="modification time"; it="data di modifica";;
+        field_integrity_metadata) en="size, type or link target"; it="dimensione, tipo o collegamento";;
+        field_integrity_missing) en="missing file"; it="file assente";;
         followup_interrupted) en="Additional checks were interrupted. Unfinished findings remain open."; it="Verifiche aggiuntive interrotte. Gli avvisi non verificati restano aperti.";;
         rkh_ssh_flagged) en="The SSH executable has an unresolved warning. It was not run."; it="L’eseguibile SSH ha una segnalazione aperta. Non è stato avviato.";;
         followup_finished) en="Checks finished. Open Findings to see what remains and why."; it="Verifiche terminate. Nei Dettagli trovi ciò che resta da chiarire e perché.";;
@@ -1008,7 +1027,7 @@ sc_t() {
         coverage_note) en="Completed checks, not a security score."; it="Controlli conclusi, non un punteggio di sicurezza.";;
         module) en='Module'; it="Modulo";;
         status) en='Status'; it="Stato";;
-        findings) en='Findings'; it="Segnali";;
+        findings) en='Items'; it="Voci";;
         rkhunter) en='Rootkit / rkhunter'; it="Rootkit / rkhunter";;
         lynis) en='Configuration / Lynis'; it="Configurazione / Lynis";;
         integrity) en='Package integrity'; it="Integrità pacchetti";;
@@ -1076,11 +1095,11 @@ sc_t() {
         next_unknown) en="Resolve the listed missing checks, then repeat the scan."; it="Risolvi le cause indicate e ripeti i controlli mancanti.";;
         next_clear) en="Keep the system updated and review software before installing it."; it="Mantieni il sistema aggiornato e controlla il software prima di installarlo.";;
         incomplete_next) en='Also resolve the incomplete modules: the current result does not cover them fully.'; it="Completa anche i moduli rimasti parziali: il risultato attuale non li copre interamente.";;
-        signals) en='SIGNALS BY PRIORITY'; it="SEGNALI PER PRIORITÀ";;
+        signals) en='ITEMS BY PRIORITY'; it="VOCI PER PRIORITÀ";;
         priority_urgent) en='Urgent'; it="Urgenti";;
         priority_review) en='To review'; it="Da verificare";;
         priority_suggestion) en='Suggestions'; it="Consigli";;
-        count_note) en="Counts are warnings, not infections."; it="Questi numeri contano gli avvisi, non le infezioni.";;
+        count_note) en="File differences are grouped by path. These counts do not indicate infections."; it="Le differenze sullo stesso file sono riunite. Questi numeri non indicano infezioni.";;
         details) en='FINDING DETAILS'; it="DETTAGLI DELLE SEGNALAZIONI";;
         none) en='No findings were recorded.'; it="Nessuna segnalazione registrata.";;
         evidence) en='Source evidence (original language)'; it="Prova dalla fonte (lingua originale)";;
@@ -1122,10 +1141,11 @@ sc_t() {
         rkh_ssh_commands) en='Root login is limited to keys with a forced command in the general SSH configuration. Review whether this is needed for your remote tasks.'; it="La configurazione generale di SSH limita root alle chiavi associate a un comando prestabilito. Verifica se serve per le tue attività remote.";;
         rkh_ssh_modern) en="The installed OpenSSH server no longer supports protocol 1. This explains the old warning."; it="Il server OpenSSH installato non supporta più il protocollo 1. Questo chiarisce il vecchio avviso.";;
         rkh_ssh_unknown) en="The SSH version or effective settings could not be checked."; it="Non è stato possibile verificare la versione o le impostazioni effettive di SSH.";;
+        rkh_ssh_not_started) en="The SSH command is missing or its preliminary checks could not finish."; it="Il comando SSH manca oppure le sue verifiche preliminari non sono terminate.";;
         rkh_action_explained) en="No action needed for this warning alone."; it="Non serve intervenire per questo singolo avviso.";;
         rkh_action_file) en="If you did not make this change, ask for help using the report before replacing the file."; it="Se non hai fatto tu questa modifica, chiedi aiuto usando il rapporto prima di sostituire il file.";;
         rkh_action_unowned) en="Identify the application that created it. Being hidden or unowned is not a reason to delete it."; it="Verifica quale applicazione lo ha creato. Essere nascosto o fuori dai pacchetti non basta per eliminarlo.";;
-        rkh_action_tools) en='Install pacutils using option 6, then repeat the rootkit scan with option 2.'; it="Installa pacutils dalla voce 6, poi ripeti il controllo rootkit con la voce 2.";;
+        rkh_action_tools) en='Install pacutils using option 6, then repeat this scan.'; it="Installa pacutils dalla voce 6, poi ripeti questo controllo.";;
         rkh_action_ssh) en='If direct root access is unnecessary, consider PermitRootLogin no. Check Include and Match rules before changing the configuration; validate it with sshd -t and keep an existing remote session open.'; it="Se l'accesso diretto come root non ti serve, valuta PermitRootLogin no. Controlla le regole Include e Match prima di modificare la configurazione; validala con sshd -t e mantieni aperta un'eventuale sessione remota.";;
         rkh_action_ssh_disabled) en='No change is needed for the general root-login setting. If you use SSH, also review any connection-specific Match rules.'; it="Non serve cambiare l'impostazione generale del login di root. Se usi SSH, controlla anche le eventuali regole Match per connessioni specifiche.";;
         rkh_action_unknown) en="The report contains the original warning and the failed check. Use it to ask for help."; it="Nel rapporto trovi avviso originale e verifica tentata. Usalo per chiedere aiuto.";;
@@ -1297,7 +1317,15 @@ sc_render_diagnostics() {
 }
 
 sc_render_summary() {
-    local module count i color label bar total=${#SC_SELECTED[@]}
+    local module count i color label bar total=${#SC_SELECTED[@]} urgent=0 review=0 suggestions=0 explained=0
+    sc_detail_groups
+    for i in "${SC_DETAIL_GROUPS[@]}"; do
+        i=${i%% *}
+        case ${SC_F_PRIORITY[i]} in
+            urgent) ((urgent+=1));; review) ((review+=1));;
+            suggestion) ((suggestions+=1));; info) ((explained+=1));;
+        esac
+    done
     sc_heading result "$(sc_status_color "$SC_ASSESSMENT")"
     color=$(sc_status_color "$SC_ASSESSMENT")
     sc_line "$SC_DOT  $(sc_t "$SC_ASSESSMENT")" "$color$SC_C_BOLD"
@@ -1317,7 +1345,9 @@ sc_render_summary() {
     fi
     for module in "${SC_SELECTED[@]}"; do
         count=0
-        for i in "${SC_F_MODULE[@]}"; do [[ $i == "$module" ]] && ((count+=1)); done
+        for i in "${SC_DETAIL_GROUPS[@]}"; do
+            i=${i%% *}; [[ ${SC_F_MODULE[i]} == "$module" ]] && ((count+=1))
+        done
         color=$(sc_status_color "${SC_MODULE_STATUS[$module]}")
         if ((SC_WIDTH >= 64)); then
             printf '  '; sc_cell "$(sc_t "$module")" 24; printf ' %s' "$color"
@@ -1333,21 +1363,22 @@ sc_render_summary() {
     done
     sc_line "$(sc_t coverage_note)" "$SC_C_MUTED"
     sc_heading signals
-    local max=$SC_URGENT slots=$((SC_WIDTH-29)) n priority
-    ((SC_REVIEW > max)) && max=$SC_REVIEW; ((SC_SUGGESTIONS > max)) && max=$SC_SUGGESTIONS
+    local max=$urgent slots=$((SC_WIDTH-29)) n priority
+    ((review > max)) && max=$review; ((suggestions > max)) && max=$suggestions
     ((slots < 4)) && slots=4; ((slots > 24)) && slots=24
     for priority in urgent review suggestion; do
-        case $priority in urgent) count=$SC_URGENT;; review) count=$SC_REVIEW;; suggestion) count=$SC_SUGGESTIONS;; esac
+        case $priority in urgent) count=$urgent;; review) count=$review;; suggestion) count=$suggestions;; esac
         n=0; ((max)) && n=$(((count*slots+max-1)/max))
         sc_line "$(sc_t "priority_$priority"): $count  $(sc_repeat "$SC_BAR_CHAR" "$n")" "$(sc_status_color "$priority")"
     done
     sc_line "$(sc_t count_note)" "$SC_C_MUTED"
-    if ((SC_INFO)); then
-        printf '\n'; sc_line "$(sc_t explained): $SC_INFO" "$SC_C_GREEN$SC_C_BOLD"
+    if ((explained)); then
+        printf '\n'; sc_line "$(sc_t explained): $explained" "$SC_C_GREEN$SC_C_BOLD"
     fi
     if ((SC_FOLLOWUPS_DONE)); then
-        count=$((SC_URGENT+SC_REVIEW+SC_SUGGESTIONS))
+        count=$((urgent+review))
         sc_line "$(sc_t followup_pending): $count" "$SC_C_MUTED"
+        sc_line "$(sc_t followup_group_note)" "$SC_C_MUTED"
     fi
     sc_heading next
     if ((SC_FOLLOWUPS_DONE)) && [[ $SC_ASSESSMENT != urgent ]]; then sc_line "$(sc_t followup_finished)"
@@ -1366,13 +1397,38 @@ sc_render_summary() {
     fi
 }
 
+# Group only the presentation, never the original evidence or its assessment.
+# The first member has the highest priority. Ambiguous paths remain separate.
+sc_detail_groups() {
+    local technical=${1:-0} priority i g first found
+    declare -ga SC_DETAIL_GROUPS=()
+    for priority in urgent review suggestion info; do
+        for i in "${!SC_F_MODULE[@]}"; do
+            [[ ${SC_F_PRIORITY[i]} == "$priority" ]] || continue
+            found=-1
+            if ((technical == 0)) && [[ ${SC_F_MODULE[i]} == integrity && ${SC_F_OBJECT[i]} == /* ]]; then
+                for g in "${!SC_DETAIL_GROUPS[@]}"; do
+                    first=${SC_DETAIL_GROUPS[g]%% *}
+                    if [[ ${SC_F_MODULE[first]} == integrity && ${SC_F_OBJECT[first]} == "${SC_F_OBJECT[i]}" ]]; then
+                        found=$g; break
+                    fi
+                done
+            fi
+            if ((found >= 0)); then SC_DETAIL_GROUPS[found]+=" $i"
+            else SC_DETAIL_GROUPS+=("$i"); fi
+        done
+    done
+}
+
 sc_render_details() {
-    local limit=${1:-0} offset=${2:-0} technical=${3:-0} i shown=0 visited=0 priority object check action
+    local limit=${1:-0} offset=${2:-0} technical=${3:-0} i j group shown=0 visited=0 priority object check action fields seen key config
+    local -a members=()
     sc_heading details
     ((${#SC_F_MODULE[@]})) || { sc_line "$(sc_t none)"; return 0; }
-    for priority in urgent review suggestion info; do
-        for ((i=0;i<${#SC_F_MODULE[@]};i++)); do
-            [[ ${SC_F_PRIORITY[i]} == "$priority" ]] || continue
+    sc_detail_groups "$technical"
+    for group in "${SC_DETAIL_GROUPS[@]}"; do
+            read -r -a members <<< "$group"
+            i=${members[0]}; priority=${SC_F_PRIORITY[i]}
             ((visited+=1)); ((visited > offset)) || continue
             if ((limit && shown >= limit)); then sc_line "$(sc_t more)"; return 0; fi
             ((shown+=1)); object=${SC_F_OBJECT[i]}
@@ -1384,13 +1440,31 @@ sc_render_details() {
                 sc_line "$(sc_t "confidence_${SC_F_CONFIDENCE[i]}")" "$SC_C_MUTED"
             fi
             [[ -z $object ]] || sc_line "$(sc_t object): $object"
-            sc_line "$(sc_t meaning):" "$SC_C_WHITE$SC_C_BOLD"
-            sc_line "$(sc_t "${SC_F_KEY[i]}")"
-            check=${SC_F_CHECK_KEY[i]}
-            if [[ -n $check ]]; then
+            if ((${#members[@]} > 1)); then
+                fields='' seen=' '
+                for j in "${members[@]}"; do
+                    key=${SC_F_KEY[j]}
+                    [[ $seen == *" $key "* ]] && continue
+                    seen+="$key "
+                    fields+="${fields:+; }$(sc_t "field_$key")"
+                done
+                sc_line "$(sc_t grouped_findings): ${#members[@]}" "$SC_C_MUTED"
+                sc_line "$(sc_t integrity_fields): $fields"
+            else
+                sc_line "$(sc_t meaning):" "$SC_C_WHITE$SC_C_BOLD"
+                sc_line "$(sc_t "${SC_F_KEY[i]}")"
+            fi
+            seen=' ' action=''
+            for j in "${members[@]}"; do
+                check=${SC_F_CHECK_KEY[j]}
+                [[ -n $check && $seen != *" $check "* ]] || continue
+                seen+="$check "
                 sc_line "$(sc_t checked):" "$SC_C_PRIMARY$SC_C_BOLD"
                 sc_line "$(sc_t "$check")"
-                if ((technical)) && [[ -n ${SC_F_CHECK_DETAIL[i]} ]]; then sc_line "${SC_F_CHECK_DETAIL[i]}" "$SC_C_MUTED"; fi
+                if ((technical)) || [[ $check == rkh_ssh_unknown ]]; then
+                    [[ -z ${SC_F_CHECK_DETAIL[j]} ]] || sc_line "${SC_F_CHECK_DETAIL[j]}" "$SC_C_MUTED"
+                fi
+                [[ -z $action ]] || continue
                 case $check in
                     rkh_file_match|rkh_ssh_modern|integrity_rechecked) action=rkh_action_explained;;
                     rkh_file_changed|rkh_file_metadata|integrity_hash_only|integrity_special) action=rkh_action_file;;
@@ -1400,21 +1474,28 @@ sc_render_details() {
                     rkh_ssh_disabled) action=rkh_action_ssh_disabled;;
                     *) action=rkh_action_unknown;;
                 esac
-                sc_line "$(sc_t action):" "$SC_C_AMBER$SC_C_BOLD"
-                sc_line "$(sc_t "$action")"
+            done
+            if [[ -n $action ]]; then
+                # A matching sibling must not dismiss a still-open difference.
+                if ((${#members[@]} > 1)) && [[ $priority != info && $action == rkh_action_explained ]]; then
+                    action=rkh_action_file
+                fi
+                sc_line "$(sc_t action):" "$SC_C_AMBER$SC_C_BOLD"; sc_line "$(sc_t "$action")"
             fi
-            if [[ ${SC_F_MODULE[i]} == integrity && ( $object == /etc/* || ${SC_F_EVIDENCE[i]} == *'backup file:'* ) ]]; then
-                sc_line "$(sc_t file_config)"
+            if [[ ${SC_F_MODULE[i]} == integrity ]]; then
+                config=0; [[ $object != /etc/* ]] || config=1
+                for j in "${members[@]}"; do [[ ${SC_F_EVIDENCE[j]} != *'backup file:'* ]] || config=1; done
+                ((config == 0)) || sc_line "$(sc_t file_config)"
             fi
             if ((technical)) || [[ ${SC_F_MODULE[i]} == lynis || ${SC_F_KEY[i]} == rkh_signature || ${SC_F_KEY[i]} == rkh_warning ]]; then
                 sc_line "$(sc_t evidence): ${SC_F_EVIDENCE[i]}" "$SC_C_MUTED"
             fi
-        done
     done
 }
 
 sc_browse_details() {
-    local page=0 pages=$(((${#SC_F_MODULE[@]}+9)/10)) answer
+    sc_detail_groups
+    local page=0 pages=$(((${#SC_DETAIL_GROUPS[@]}+9)/10)) answer
     ((pages)) || { sc_render_details; return; }
     while :; do
         sc_line "$(sc_t page) $((page+1)) / $pages" "$SC_C_PRIMARY"

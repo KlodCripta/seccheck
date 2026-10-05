@@ -58,6 +58,10 @@ It distinguishes `yes`, `no`, key-only access and forced-command access. This do
 not establish whether a daemon is listening, whether its launch options use a
 different configuration, or how all connection-specific `Match` blocks behave.
 Configuration advice remains separate from malware indicators.
+If the command fails or returns an unsupported response, regular Details show
+its exit code and a sanitized excerpt of at most 320 input bytes. The complete
+stdout and stderr remain in the private run directory; an excerpt never changes
+the assessment to a successful check.
 
 For the old `Protocol` warning, SecCheck queries **the server** with `sshd -V`.
 A recognized OpenSSH version at least 7.6 explains the obsolete protocol-1 test;

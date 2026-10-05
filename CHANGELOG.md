@@ -2,6 +2,11 @@
 
 ## 2.0.0 — development branch
 
+- Group package-integrity differences by exact path in summary counts and paged
+  details, preserving all raw observations and the highest unresolved priority.
+  Keep suggestions separate from the remaining-assessment count.
+- Show a bounded, sanitized SSH failure excerpt directly in details while keeping
+  complete original command logs in the private report directory.
 - Add the final s/y confirmation for read-only file/SSH follow-ups using existing
   root permissions; update the private result and exit assessment after checks.
 - Add bounded integrity follow-ups; matching hashes never clear timestamp/size
