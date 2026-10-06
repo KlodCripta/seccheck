@@ -2,8 +2,8 @@
 
 ## Completed
 
-Latest local suite: **152 tests passing**, Bash syntax checks and ShellCheck 0.11.0
-clean after the native rkhunter/SSH/Lynis follow-up fixes (6 October 2026 UTC).
+Latest local suite: **154 tests passing**, Bash syntax checks and ShellCheck 0.11.0
+clean after the native SSH keyword-case fix (6 October 2026 UTC).
 The existing-root PTY integration test runs here; it is explicitly skipped when
 the test account is not root. Tests use inert scanner commands in both cases.
 
@@ -259,3 +259,27 @@ SSH stderr excerpt could hide another error after many blank lines. An oversized
 negative fixture reproduced the false retry. SecCheck now rejects oversized
 stderr before comparing the complete short diagnostic; that fixture passes.
 The reviewer found no other issue in the padded-warning or Lynis changes.
+
+## Native SSH keyword case, 6 October 2026
+
+The first details page for `20261006T195715Z.vNLBGF` confirms that the padded
+rkhunter duplicates no longer appear and the Lynis reboot action is displayed.
+Integrity still shows 47 grouped paths. The follow-ups finish with six explained
+findings and 52 review entries; the rkhunter baseline is still missing or empty.
+
+The configuration-only SSH retry now runs successfully (exit 0), but its output
+uses canonical keyword case: `PermitRootLogin`, alongside `Port`, `AddressFamily`
+and `UsePAM`. The parser expected only lowercase, so it left a readable setting
+unknown. The displayed value is truncated in the 320-byte excerpt, so it does not
+establish the complete setting or service activity on that machine.
+
+Two new regressions reproduce canonical, uppercase and mixed-case keywords in
+both query modes, with each supported policy. Mixed-case duplicate settings must
+remain unknown, and unsupported or uppercase argument values are not normalized
+into a successful result. The implementation only folds the keyword comparison;
+original arguments and command logs remain unchanged. The native result for this
+latest parser fix still needs a rerun.
+
+All 154 fixture tests passed in 55.2 seconds. A focused read-only review approved
+the development change with no confirmed issue; its focused checks cover both
+SSH query modes, case variants, duplicate keys and invalid arguments.

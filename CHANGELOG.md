@@ -2,6 +2,8 @@
 
 ## 2.0.0 — development branch
 
+- Read the SSH root-login setting with lowercase or canonical keyword case in
+  both -T and -G output. Preserve value case, original logs and duplicate rejection.
 - Recognize rkhunter's padded file-summary columns and merge them with the
   detailed warning, without joining whitespace inside ambiguous paths.
 - Retry SSH configuration reading with `sshd -G` after the exact missing-host-key

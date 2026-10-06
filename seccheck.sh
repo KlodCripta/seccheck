@@ -347,7 +347,8 @@ sc_rkh_check_ssh() {
         fi
         ((rc == 0)) && [[ ! -s $prefix.stderr ]] || return
         while IFS= read -r line; do
-            if [[ $line == 'permitrootlogin '* ]]; then value=${line#* }; ((count+=1)); fi
+            # Native sshd versions use both lowercase and canonical keyword case.
+            if [[ ${line,,} == 'permitrootlogin '* ]]; then value=${line#* }; ((count+=1)); fi
         done < "$prefix.ssh"
         ((count == 1)) || return
         case $value in

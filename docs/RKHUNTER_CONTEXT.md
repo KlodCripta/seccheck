@@ -62,7 +62,11 @@ in 9.3; it does not load private server keys. The second query has its own
 10-second limit and `.config.ssh` / `.config.stderr` logs. The first attempt is
 retained. Older servers without `-G`, nonzero exits, stderr or ambiguous settings
 leave the warning unresolved. No server keys are generated.
-It distinguishes `yes`, `no`, key-only access and forced-command access. This does
+It distinguishes `yes`, `no`, key-only access and forced-command access. Keyword
+matching accepts both `permitrootlogin` and `PermitRootLogin` as the same setting,
+while its original argument is checked unchanged.
+Multiple occurrences, including different keyword capitalization, remain
+ambiguous and cannot close the warning. Reading the general configuration does
 not establish whether a daemon is listening, whether its launch options use a
 different configuration, or how all connection-specific `Match` blocks behave.
 Configuration advice remains separate from malware indicators.
@@ -129,6 +133,7 @@ reported tool/configuration problems are addressed on that machine.
 - [pacfile manual](https://man.archlinux.org/man/pacfile.1.en)
 - [pacfile upstream implementation](https://github.com/andrewgregory/pacutils/blob/master/src/pacfile.c)
 - [OpenSSH server manual: -G, -T, -V and Match contexts](https://man.openbsd.org/sshd)
+- [OpenSSH configuration manual: keyword and argument case](https://man.openbsd.org/sshd_config)
 - [OpenSSH 9.3 release notes: configuration-only -G](https://www.openssh.org/txt/release-9.3)
 - [OpenSSH 7.6 release notes: SSH version 1 removed](https://www.openssh.org/txt/release-7.6)
 

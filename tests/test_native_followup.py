@@ -11,6 +11,42 @@ sc_rkh_check_ssh 0; sc_render_details
 printf 'RESULT|%s|%s\\n' "${SC_F_PRIORITY[0]}" "${SC_F_CHECK_KEY[0]}"
 ''', PATH=path)
 
+    def test_native_camelcase_setting_is_read_in_both_ssh_modes(self):
+        for query in ('-T', '-G'):
+            for keyword in ('PermitRootLogin', 'PERMITROOTLOGIN', 'pErMiTrOoTlOgIn'):
+                for value, result, priority in (
+                        ('no', 'rkh_ssh_disabled', 'suggestion'),
+                        ('yes', 'rkh_ssh_allowed', 'review'),
+                        ('prohibit-password', 'rkh_ssh_keys', 'suggestion'),
+                        ('forced-commands-only', 'rkh_ssh_commands', 'suggestion')):
+                    with self.subTest(query=query, keyword=keyword, value=value):
+                        response = ("printf 'Port 22\\nAddressFamily any\\n"
+                                    "ListenAddress [::]:22\\nUsePAM yes\\n"
+                                    + keyword + ' ' + value + "\\n'\n")
+                        if query == '-G':
+                            command = '''case $1 in
+-T) echo 'sshd: no hostkeys available -- exiting.' >&2; exit 1;;
+-G) ''' + response + ''';;
+*) exit 9;;
+esac
+'''
+                        else:
+                            command = '[[ $1 == -T ]] || exit 9\n' + response
+                        out = self.ssh_check(command)
+                        self.assertIn(f'RESULT|{priority}|{result}', out)
+                        self.assertNotIn('rkh_ssh_unknown', out)
+                        suffix = '.config.ssh' if query == '-G' else '.ssh'
+                        self.assertIn(keyword + ' ' + value,
+                                      (self.folder / ('rkh-context.0' + suffix)).read_text())
+
+    def test_mixed_case_duplicate_settings_remain_unverified(self):
+        for response in ("printf 'permitrootlogin no\\nPermitRootLogin yes\\n'",
+                         "printf 'PermitRootLogin no\\nPERMITROOTLOGIN no\\n'"):
+            with self.subTest(response=response):
+                out = self.ssh_check('[[ $1 == -T ]] || exit 9\n' + response)
+                self.assertIn('RESULT|review|rkh_ssh_unknown', out)
+                self.assertNotIn('RESULT|suggestion', out)
+
     def test_missing_host_keys_uses_config_only_without_changing_files(self):
         for value, result, priority in [('no', 'rkh_ssh_disabled', 'suggestion'),
                                          ('yes', 'rkh_ssh_allowed', 'review'),
@@ -33,6 +69,8 @@ esac
         for response in ["echo 'unknown option -- G' >&2; exit 255",
                          "echo 'permitrootlogin no'; echo 'configuration warning' >&2",
                          "printf 'permitrootlogin no\\npermitrootlogin yes\\n'",
+                         "echo 'PermitRootLogin unsupported-value'",
+                         "echo 'PermitRootLogin YES'",
                          "echo 'unrecognized output'",
                          "echo 'permitrootlogin no'; exit 1"]:
             with self.subTest(response=response):
