@@ -166,7 +166,7 @@ sc_parse_rkhunter() {
     local script_re="^The command '(/[^']+)' has been replaced by a script:"
     local script_marker="' has been replaced by a script:" hidden_separator=': '
     local hidden_re='^Hidden (file|directory) found: (/.+)$'
-    local file_re='^(/[^[:space:]]+) \[ *Warning *\]$'
+    local file_re='^(/[^[:space:]]+)[[:blank:]]+\[ *Warning *\]$'
     SC_PARSE_UNKNOWN=0
     while IFS= read -r line || [[ -n $line ]]; do
         line=${line#\[??:??:??\] }
@@ -299,7 +299,7 @@ sc_rkh_check_file() {
 }
 
 sc_rkh_ssh_evidence() {
-    local i=$1 command=$2 rc=$3 prefix="$SC_RUN_DIR/rkh-context.$1" excerpt
+    local i=$1 command=$2 rc=$3 prefix=${4:-"$SC_RUN_DIR/rkh-context.$1"} excerpt
     # Show a short, inert excerpt; the full original streams stay in the report directory.
     excerpt=$(timeout 2 head -c 320 -- "$prefix.stderr" 2>/dev/null)
     [[ -n $excerpt ]] || excerpt=$(timeout 2 head -c 320 -- "$prefix.ssh" 2>/dev/null)
@@ -308,6 +308,7 @@ sc_rkh_ssh_evidence() {
 
 sc_rkh_check_ssh() {
     local i=$1 prefix="$SC_RUN_DIR/rkh-context.$1" value='' line rc major minor count=0 j executable resolved other guard_started=$SECONDS
+    local query=-T error_size
     SC_F_CHECK_KEY[i]=rkh_ssh_unknown
     SC_F_CHECK_DETAIL[i]="$(sc_t rkh_ssh_not_started)"
     executable=$(command -v sshd) || return
@@ -328,6 +329,22 @@ sc_rkh_check_ssh() {
         sc_capture "$prefix.ssh" "$prefix.stderr" 10 sshd -T
         rc=$?
         sc_rkh_ssh_evidence "$i" 'sshd -T' "$rc"
+        if ((rc == 1)); then
+            error_size=$(timeout 2 stat -c '%s' -- "$prefix.stderr") || return
+            # Never treat a truncated diagnostic excerpt as the complete error.
+            ((error_size <= 321)) || return
+            line=$(timeout 2 head -c 321 -- "$prefix.stderr") || return
+            line=${line%$'\r'}
+            # OpenSSH >= 9.3 can read settings without loading private host keys.
+            # Retry only this exact failure; retain both attempts and never create keys.
+            if [[ $line == 'sshd: no hostkeys available -- exiting.' ]]; then
+                sc_add_diagnostic rkhunter rkh_ssh_hostkeys "$line"
+                prefix+=.config; query=-G
+                sc_capture "$prefix.ssh" "$prefix.stderr" 10 sshd -G
+                rc=$?
+                sc_rkh_ssh_evidence "$i" 'sshd -G' "$rc" "$prefix"
+            fi
+        fi
         ((rc == 0)) && [[ ! -s $prefix.stderr ]] || return
         while IFS= read -r line; do
             if [[ $line == 'permitrootlogin '* ]]; then value=${line#* }; ((count+=1)); fi
@@ -342,7 +359,7 @@ sc_rkh_check_ssh() {
         esac
         SC_F_KIND[i]=hardening
         SC_F_CONFIDENCE[i]=observation
-        SC_F_CHECK_DETAIL[i]="sshd -T: PermitRootLogin=$value; log=rkh-context.$i.ssh"
+        SC_F_CHECK_DETAIL[i]="sshd $query: PermitRootLogin=$value; log=${prefix##*/}.ssh"
     else
         sc_capture "$prefix.ssh" "$prefix.stderr" 10 sshd -V
         rc=$?
@@ -464,6 +481,9 @@ sc_parse_lynis() {
         value=${line#*=}
         IFS='|' read -r id description details solution _remainder <<< "$value"
         if [[ -z $id || -z $description || $value != *'|'* ]]; then SC_PARSE_UNKNOWN=1; continue; fi
+        if [[ $id == KRNL-5830 && $description == 'Reboot of system is most likely needed' ]]; then
+            key=lynis_reboot
+        fi
         sc_add_finding lynis hardening "$priority" observation "$id" "$key" \
             "$description${details:+ | $details}${solution:+ | $solution}"
     done < "$1"
@@ -1142,6 +1162,8 @@ sc_t() {
         rkh_ssh_modern) en="The installed OpenSSH server no longer supports protocol 1. This explains the old warning."; it="Il server OpenSSH installato non supporta più il protocollo 1. Questo chiarisce il vecchio avviso.";;
         rkh_ssh_unknown) en="The SSH version or effective settings could not be checked."; it="Non è stato possibile verificare la versione o le impostazioni effettive di SSH.";;
         rkh_ssh_not_started) en="The SSH command is missing or its preliminary checks could not finish."; it="Il comando SSH manca oppure le sue verifiche preliminari non sono terminate.";;
+        rkh_ssh_hostkeys) en="SSH could not load usable server keys."; it="SSH non ha trovato chiavi del server utilizzabili.";;
+        rkh_ssh_config_only) en="The configuration was read without checking server keys. This does not check whether the service is running."; it="Letta la configurazione senza controllare le chiavi del server. Questo test non verifica se il servizio sia attivo.";;
         rkh_action_explained) en="No action needed for this warning alone."; it="Non serve intervenire per questo singolo avviso.";;
         rkh_action_file) en="If you did not make this change, ask for help using the report before replacing the file."; it="Se non hai fatto tu questa modifica, chiedi aiuto usando il rapporto prima di sostituire il file.";;
         rkh_action_unowned) en="Identify the application that created it. Being hidden or unowned is not a reason to delete it."; it="Verifica quale applicazione lo ha creato. Essere nascosto o fuori dai pacchetti non basta per eliminarlo.";;
@@ -1154,6 +1176,8 @@ sc_t() {
         rkh_warning) en='rkhunter raised an alert. Read the specific evidence: hidden files and configuration warnings can have legitimate explanations.'; it="rkhunter ha prodotto un avviso. Leggi la prova specifica: file nascosti e avvisi di configurazione possono avere spiegazioni legittime.";;
         lynis_warning) en='Lynis found a configuration issue. Use its test ID and evidence to decide what to change; this does not independently confirm malware.'; it="Lynis segnala un problema di configurazione. Usa il codice del test e i dettagli per decidere cosa cambiare; questo non conferma da solo la presenza di malware.";;
         lynis_suggestion) en='Lynis suggests stronger settings. Assess compatibility and the purpose of this machine before applying the suggestion.'; it="Lynis suggerisce impostazioni più robuste. Valuta compatibilità e uso di questo computer prima di applicare il consiglio.";;
+        lynis_reboot) en='Lynis suggests restarting the computer.'; it='Lynis suggerisce un riavvio del computer.';;
+        lynis_action_reboot) en='Save your work, restart when convenient, then repeat this check.'; it='Salva il lavoro, riavvia quando puoi e ripeti questo controllo.';;
         integrity_metadata) en="Size, type or link target differs from the package record. The cause needs checking."; it="Dimensione, tipo o destinazione del collegamento sono diversi dai dati del pacchetto. La causa va verificata.";;
         integrity_content) en="File content differs from the local package record. Explain the change before replacing anything."; it="Il contenuto è diverso da quello registrato nel pacchetto locale. La modifica va chiarita prima di sostituire il file.";;
         integrity_permissions) en="Access permissions changed: who can read, write or execute this path. A service may require this."; it="Sono cambiati i permessi: chi può leggere, scrivere o eseguire. Potrebbe essere una scelta del servizio che usa il file.";;
@@ -1458,11 +1482,17 @@ sc_render_details() {
             for j in "${members[@]}"; do
                 check=${SC_F_CHECK_KEY[j]}
                 [[ -n $check && $seen != *" $check "* ]] || continue
+                [[ ${SC_F_KEY[j]} == lynis_reboot && $check == followup_manual ]] && continue
                 seen+="$check "
                 sc_line "$(sc_t checked):" "$SC_C_PRIMARY$SC_C_BOLD"
                 sc_line "$(sc_t "$check")"
                 if ((technical)) || [[ $check == rkh_ssh_unknown ]]; then
                     [[ -z ${SC_F_CHECK_DETAIL[j]} ]] || sc_line "${SC_F_CHECK_DETAIL[j]}" "$SC_C_MUTED"
+                fi
+                if [[ $check == rkh_ssh_allowed || $check == rkh_ssh_disabled ||
+                      $check == rkh_ssh_keys || $check == rkh_ssh_commands ]] &&
+                   [[ ${SC_F_CHECK_DETAIL[j]} == 'sshd -G:'* ]]; then
+                    sc_line "$(sc_t rkh_ssh_config_only)"
                 fi
                 [[ -z $action ]] || continue
                 case $check in
@@ -1475,6 +1505,7 @@ sc_render_details() {
                     *) action=rkh_action_unknown;;
                 esac
             done
+            [[ ${SC_F_KEY[i]} != lynis_reboot ]] || action=lynis_action_reboot
             if [[ -n $action ]]; then
                 # A matching sibling must not dismiss a still-open difference.
                 if ((${#members[@]} > 1)) && [[ $priority != info && $action == rkh_action_explained ]]; then

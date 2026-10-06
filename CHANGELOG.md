@@ -2,6 +2,12 @@
 
 ## 2.0.0 — development branch
 
+- Recognize rkhunter's padded file-summary columns and merge them with the
+  detailed warning, without joining whitespace inside ambiguous paths.
+- Retry SSH configuration reading with `sshd -G` after the exact missing-host-key
+  failure. Preserve both attempts and explain the configuration-only scope.
+- Explain the recognized Lynis reboot warning directly in English/Italian,
+  keeping its original evidence and priority.
 - Group package-integrity differences by exact path in summary counts and paged
   details, preserving all raw observations and the highest unresolved priority.
   Keep suggestions separate from the remaining-assessment count.

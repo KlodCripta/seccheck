@@ -60,6 +60,27 @@ cat "$SC_TEST_DIR/pacfile.error" >&2
         self.assertEqual(len(rows), 1, out)
         self.assertIn('|rkh_script|' + str(self.sample) + '|', out)
 
+    def test_column_padding_merges_summary_with_the_verified_script(self):
+        for padding in ('    ', '\t', ' \t  '):
+            with self.subTest(padding=repr(padding)):
+                lines = (f"  {self.sample}{padding}[ Warning ]\n"
+                         f"Warning: The command '{self.sample}' has been replaced by a script: POSIX shell script")
+                out = self.scan(lines, f'    {self.sample}{padding * 2}[ Warning ]')
+                rows = [line for line in out.splitlines()
+                        if line.startswith(('urgent|', 'review|', 'suggestion|', 'info|'))]
+                self.assertEqual(len(rows), 1, out)
+                self.assertIn('info|rkh_script|' + str(self.sample) + '|rkh_file_match', out)
+
+    def test_padded_summary_of_a_changed_file_remains_open(self):
+        self.sample.write_text('modified bytes\n')
+        out = self.scan(f'{self.sample}     [ Warning ]')
+        self.assertIn('review|rkh_file_warning|' + str(self.sample) + '|rkh_file_changed', out)
+
+    def test_whitespace_inside_a_summary_path_is_not_removed_for_lookup(self):
+        out = self.scan(f'{self.sample} another-path     [ Warning ]')
+        self.assertIn('review|rkh_warning||followup_manual', out)
+        self.assertNotIn('|rkh_file_match', out)
+
     def test_baseline_notice_and_prerequisites_are_diagnostics(self):
         out = self.scan("Warning: Checking for prerequisites [ Warning ]\n"
                         "Warning: WARNING! It is the users responsibility to ensure that when the '--propupd' option")

@@ -7,6 +7,8 @@ Noninteractive scans do not run these follow-ups.
 SecCheck keeps the scanner's original stdout, stderr and log. Its interpretation
 groups the summary and detailed forms of the same warning across both streams.
 File warnings are grouped by the exact parsed path; SSH warnings by the setting.
+Spaces or tabs aligning the file-summary columns do not create extra warnings.
+Whitespace inside an ambiguous summary path is not removed to force a match.
 Unknown warnings remain visible. A hidden-files summary is omitted from the
 finding count when individual hidden-file details are available.
 SSH and diagnostic handling require recognized message prefixes; words inside a
@@ -54,10 +56,18 @@ SecCheck first checks whether the resolved SSH executable has an unresolved
 file finding, including through a symlink alias. If so, it does not launch it.
 
 For `PermitRootLogin`, SecCheck reads the general configuration with `sshd -T`.
+If its only error is `sshd: no hostkeys available -- exiting.` with exit 1,
+SecCheck retries once with `sshd -G`. OpenSSH added this configuration-only mode
+in 9.3; it does not load private server keys. The second query has its own
+10-second limit and `.config.ssh` / `.config.stderr` logs. The first attempt is
+retained. Older servers without `-G`, nonzero exits, stderr or ambiguous settings
+leave the warning unresolved. No server keys are generated.
 It distinguishes `yes`, `no`, key-only access and forced-command access. This does
 not establish whether a daemon is listening, whether its launch options use a
 different configuration, or how all connection-specific `Match` blocks behave.
 Configuration advice remains separate from malware indicators.
+After a successful `-G` retry, Details explicitly say that server keys and service
+activity were not checked.
 If the command fails or returns an unsupported response, regular Details show
 its exit code and a sanitized excerpt of at most 320 input bytes. The complete
 stdout and stderr remain in the private run directory; an excerpt never changes
@@ -71,6 +81,9 @@ for the server version. No daemon is started, restarted or reconfigured.
 ## Display and evidence
 
 Details show the warning's meaning, SecCheck's verification and the next action.
+The recognized Lynis `KRNL-5830` reboot warning gets a direct save/restart/recheck
+action in the selected language. Its original wording and priority remain intact;
+SecCheck does not reboot the computer or claim to have checked the kernel itself.
 Explained warnings have a separate informational priority and remain in the
 report. They do not increase urgent/review/suggestion counters. Pagination keeps
 all findings reachable. `checks.tsv` maps verification results to the stable
@@ -115,7 +128,8 @@ reported tool/configuration problems are addressed on that machine.
 - [GNU grep 3.8 compatibility notes](https://lists.gnu.org/archive/html/info-gnu/2022-09/msg00001.html)
 - [pacfile manual](https://man.archlinux.org/man/pacfile.1.en)
 - [pacfile upstream implementation](https://github.com/andrewgregory/pacutils/blob/master/src/pacfile.c)
-- [OpenSSH server manual: -T, -V and Match contexts](https://man.openbsd.org/sshd)
+- [OpenSSH server manual: -G, -T, -V and Match contexts](https://man.openbsd.org/sshd)
+- [OpenSSH 9.3 release notes: configuration-only -G](https://www.openssh.org/txt/release-9.3)
 - [OpenSSH 7.6 release notes: SSH version 1 removed](https://www.openssh.org/txt/release-7.6)
 
 These describe the external interfaces used by SecCheck. Their implementation

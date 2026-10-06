@@ -2,8 +2,8 @@
 
 ## Completed
 
-Latest local suite: **142 tests passing**, Bash syntax checks and ShellCheck 0.11.0
-clean after grouping integrity findings and exposing SSH failure causes (5 October 2026 UTC).
+Latest local suite: **152 tests passing**, Bash syntax checks and ShellCheck 0.11.0
+clean after the native rkhunter/SSH/Lynis follow-up fixes (6 October 2026 UTC).
 The existing-root PTY integration test runs here; it is explicitly skipped when
 the test account is not root. Tests use inert scanner commands in both cases.
 
@@ -225,3 +225,37 @@ the user's differing files or create the missing rkhunter baseline.
 A read-only review found no Critical or Important blocker. Its minor finding
 about grouped warnings losing their installation advice was reproduced and fixed:
 grouping now preserves specific guidance for missing tools.
+
+## Padded warnings and missing SSH keys, 6 October 2026
+
+The user's later details for `20261005T171900Z.oVHFcf` confirmed that grouping
+reduced integrity display entries from 146 observations to 47 paths. They also
+exposed generic duplicates of egrep/fgrep/ldd summary warnings, an SSH query
+failing with `sshd: no hostkeys available -- exiting.`, and a Lynis `KRNL-5830`
+reboot warning followed by generic ask-for-help advice.
+
+Fixtures reproduced summary columns separated by several spaces or tabs. Those
+summaries previously had no parsed path and could not merge with the detailed
+warning. The separator now accepts column padding while leaving whitespace
+inside an ambiguous path unresolved. The regression counts every finding,
+including empty-object warnings; matching and genuinely changed files are both
+covered.
+
+The SSH fallback is limited to that exact missing-key error with exit 1. A second
+`sshd -G` query can read settings without loading keys; it cannot establish that a
+service is active. Both attempts are retained. Fixtures cover recognized values,
+an unsupported option, stderr despite exit zero, duplicate settings, unknown
+output and failed exits. Other or combined errors never trigger the fallback.
+The existing flagged-executable guard remains in force. No keys are generated.
+
+The known Lynis reboot message now has a direct bilingual save/restart/recheck
+action. Its priority and original evidence remain; other IDs or wording do not
+inherit this advice. The complete 152-test fixture suite passed in 53.2 seconds.
+The missing rkhunter baseline and actual file differences remain unresolved.
+These fixes still need the user's native rerun before stable release.
+
+A focused read-only review found one low-severity retry-gate flaw: a truncated
+SSH stderr excerpt could hide another error after many blank lines. An oversized
+negative fixture reproduced the false retry. SecCheck now rejects oversized
+stderr before comparing the complete short diagnostic; that fixture passes.
+The reviewer found no other issue in the padded-warning or Lynis changes.
