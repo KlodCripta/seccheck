@@ -212,7 +212,7 @@ exit 1
             self.assertTrue(all(pid.isdigit() for pid in pids), probe.stdout)
             out = self.parse(self.warning(sample), followups=True)
             self.assertIn('|rkh_dev_process', out)
-            self.assertIn('PID ' + pids[0], out)
+            self.assertIn('PID ' + pids[0], ' '.join(out.split()))
             self.assertNotIn('info|', out)
 
     def test_process_lookup_failure_or_malformed_pids_stays_unknown(self):
