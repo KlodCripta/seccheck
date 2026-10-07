@@ -153,6 +153,14 @@ permessi di root. Controlla percorsi e informazioni nei log prima di condividerl
 No file is automatically removed, quarantined or repaired. Signature updates are
 an explicit menu action; SecCheck never resets rkhunter's file-property baseline.
 
+Follow-ups also retain the exact files listed in rkhunter's `/dev` warnings,
+record their properties and show current users when optional **psmisc/fuser** is
+available. Observed usage and familiar names do not automatically close a warning.
+
+Le verifiche aggiuntive mostrano anche i file segnalati in `/dev`, le proprietà
+e i programmi che li usano. Per quest'ultima verifica serve il pacchetto facoltativo
+**psmisc**. Il nome del file o l'uso da parte di un programma non provano che sia sicuro.
+
 ## AUR project maintenance / Manutenzione dei progetti AUR
 
 This separate module is included in full scans. It queries the official AUR RPC

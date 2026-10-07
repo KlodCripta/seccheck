@@ -2,8 +2,8 @@
 
 ## Completed
 
-Latest local suite: **154 tests passing**, Bash syntax checks and ShellCheck 0.11.0
-clean after the native SSH keyword-case fix (6 October 2026 UTC).
+Latest local suite: **178 tests passing**, Bash syntax checks and ShellCheck 0.11.0
+clean after the native /dev follow-up changes (7 October 2026 UTC).
 The existing-root PTY integration test runs here; it is explicitly skipped when
 the test account is not root. Tests use inert scanner commands in both cases.
 
@@ -26,6 +26,30 @@ the test account is not root. Tests use inert scanner commands in both cases.
 
 The tests use temporary fixtures. They do not run real security scanners, inspect
 private user homes, change packages or remove existing production reports.
+The optional fuser integration test opens and maps only its own temporary file;
+it uses real fuser/ps/readlink observations, not a system security scan. Environments
+without fuser or access to the own test-file process explicitly skip that trial.
+
+## Native /dev and baseline follow-up
+
+The user's 6 October native log confirms a missing rkhunter.dat and two indented
+paths under /dev/shm: lsp-catalog-klod.shm and .lock. The old parser kept only the
+generic /dev warning. Twenty-four regressions now exercise exact individual paths,
+stream deduplication, list boundaries, incomplete observations, process limits,
+nonregular/disappeared files and brief contextual explanations.
+
+Review reproduced NUL removal by Bash, trailing-LF removal from readlink output,
+and execution of an identified flagged utility. Each now has a failing-before /
+passing-after regression. Raw bytes are checked before lossy parsing; executable
+paths preserve their framing; the /dev helper blocks identified flagged utilities,
+including inode aliases and its indirectly used text sanitizer. The focused review
+found no remaining confirmed defect in these changes.
+
+A real own-file probe also found that installed fuser rejects the -- separator.
+The invocation now uses -v with the validated absolute /dev/ path. The real
+fuser/ps/readlink integration test passed locally, along with all inert regressions.
+This verifies the tested interface here; native Arch testing of the new revision
+and trusted initial-baseline decisions remain separate requirements.
 
 ## Decisions and remaining boundaries
 

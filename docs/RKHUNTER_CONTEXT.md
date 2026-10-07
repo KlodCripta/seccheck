@@ -13,10 +13,16 @@ Unknown warnings remain visible. A hidden-files summary is omitted from the
 finding count when individual hidden-file details are available.
 SSH and diagnostic handling require recognized message prefixes; words inside a
 filename cannot select a different check or turn a file warning into a reminder.
+The raw stream is checked for NUL before Bash can discard that byte while reading
+a line. A binary or unreadable stream stays unresolved and retains its original
+log, rather than authorizing a lookup against a changed filename.
 
 Prerequisite warnings limit coverage. Known indented causes, including a missing
 or empty `rkhunter.dat`, are retained as specific diagnostics. The warning about using `--propupd` is a
 baseline reminder, not a malware finding. SecCheck does not run `--propupd`.
+The short result calls this a missing initial file snapshot and explains that
+`--propupd` would accept the current files as a reference. Checking only warning
+paths or matching local package records does not establish a trusted first baseline.
 
 ## File checks
 
@@ -49,6 +55,59 @@ Bounds: at most 40 follow-ups and 180 seconds before starting another follow-up;
 one in-flight check may finish after that budget. Regular files are limited to
 64 MiB. Metadata reads allow 20 seconds, hashing 5 seconds and SSH queries 10
 seconds, with the existing forced-termination grace period.
+
+## Files listed under /dev
+
+Native rkhunter places individual paths on indented lines after
+`Warning: Suspicious file types found in /dev:`. SecCheck retains these exact
+paths, merges repeated evidence across streams, and omits the generic `/dev`
+summary from the follow-up result when individual paths are available. The list
+ends at the next non-path line. Ambiguous `: ` separators, paths outside `/dev`
+and paths changed by display sanitization remain unresolved, without lookups.
+
+After s/y, `stat` records type, numeric ownership, mode and owner name, without
+dereferencing a final symlink. Nonregular and disappeared paths remain open.
+For regular files, optional `fuser` from **psmisc** reports current users. It is
+invoked only with `-v ABSOLUTE_PATH`, never with process-killing or mount-wide
+options. fuser versions do not reliably accept `--`; the already validated
+absolute `/dev/` path cannot become an option.
+Its stdout must be a complete PID-only response of at most 4096 bytes; nonzero
+error exits and malformed responses cannot count as observed process usage.
+Exit 1 with no output on either stream means only that no usage was reported.
+
+Up to three reported process identities per path are queried with `ps`, followed
+by the current `/proc/PID/exe` link and `pacman -Qqo` package ownership. Queries
+stop before starting another ps/readlink/package query after 20 seconds, with
+one in-flight query allowed to finish. Supporting reads are separately bounded.
+File metadata permits 3 seconds, fuser 5 seconds and each process or
+package query 2 seconds, with the normal forced-termination grace period. These
+checks share the existing 40-check / 180-second rkhunter follow-up budget.
+Metadata and available process names/packages appear in ordinary Details;
+complete query output remains in private `rkh-context.*` logs and `checks.tsv`.
+
+Raw PID and executable-path output is validated before command substitution can
+discard NUL or trailing LF. Executable names use `readlink -n` and a preserved
+bounded record. Before these checks, SecCheck compares each required utility's
+path/inode with identified urgent or review file findings, including symlink
+aliases. A flagged utility is not launched for this follow-up.
+
+These are **live observations**, not proof of the file's creator, contents or
+trusted origin. PID reuse, processes that have exited, namespace restrictions or
+unavailable tools can limit the observations. All `/dev` findings retain review
+priority; no file contents are opened, no process is stopped and no file is deleted.
+
+Two naming conventions receive context, not an allowlist:
+
+- LSP audio plugins form `lsp-catalog-USER` and use `.shm` / `.lock` for their
+  shared catalog. See the checked upstream [catalog naming](https://github.com/lsp-plugins/lsp-plugin-fw/blob/45f2e23ba809c9661a425484db37367239f57556/src/main/core/Catalog.cpp)
+  and [shared catalog implementation](https://github.com/lsp-plugins/lsp-dsp-units/blob/8dd2a6905ca7ccefd2c3624560235680cb8761e2/src/main/shared/Catalog.cpp).
+- systemd uses `/etc/.updated` for update timestamps. See its upstream
+  [systemd-update-done manual](https://man7.org/linux/man-pages/man8/systemd-update-done.service.8.html).
+
+The exact paths or names alone do not verify the particular objects on a user's
+machine. Relevant interface behavior was checked against the upstream
+[fuser manual](https://man7.org/linux/man-pages/man1/fuser.1.html). No upstream
+implementation code is incorporated into SecCheck.
 
 ## SSH checks
 

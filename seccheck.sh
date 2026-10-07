@@ -160,19 +160,49 @@ sc_rkh_optional_reasons() {
     done < "$1"
 }
 
+sc_no_nul() {
+    # A pattern file carries the NUL byte: neither argv nor command substitution
+    # can preserve it. GNU grep checks the raw file before Bash read removes it.
+    LC_ALL=C timeout 5 grep -aqF -f <(printf '\000') -- "$1" 2>/dev/null
+    case $? in 1) return 0;; 0) return 1;; *) return 2;; esac
+}
+
 sc_parse_rkhunter() {
-    local line lower key priority object normalized description hidden_kind prerequisite=0 optional candidate
+    local line lower key priority object normalized description hidden_kind prerequisite=0 optional candidate dev_list=0
     local -a words
     local script_re="^The command '(/[^']+)' has been replaced by a script:"
     local script_marker="' has been replaced by a script:" hidden_separator=': '
     local hidden_re='^Hidden (file|directory) found: (/.+)$'
     local file_re='^(/[^[:space:]]+)[[:blank:]]+\[ *Warning *\]$'
     SC_PARSE_UNKNOWN=0
+    if ! sc_no_nul "$1"; then
+        SC_PARSE_UNKNOWN=1
+        sc_add_diagnostic rkhunter rkh_stream_unreadable "stream=$1; NUL byte or failed raw-input check"
+        sc_rkh_finding rkh_path_unreadable review '' "Unparseable rkhunter stream: $1"
+        return 0
+    fi
     while IFS= read -r line || [[ -n $line ]]; do
         line=${line#\[??:??:??\] }
         line=${line#"${line%%[![:space:]]*}"}
         line=${line%"${line##*[![:space:]]}"}
         lower=${line,,}
+        if ((dev_list)); then
+            if [[ $line == /* ]]; then
+                # Native rkhunter lists these paths on following indented lines.
+                # A repeated separator cannot identify an exact lookup target.
+                object=${line%%"$hidden_separator"*}
+                description=${line#*"$hidden_separator"}
+                if [[ $object != /dev/* || $line != *"$hidden_separator"* ||
+                      -z $description || $description == *"$hidden_separator"* ]]; then
+                    SC_PARSE_UNKNOWN=1
+                    sc_rkh_finding rkh_path_unreadable review '' "$line"
+                else
+                    sc_rkh_finding rkh_dev_file review "$object" "$line"
+                fi
+                continue
+            fi
+            dev_list=0
+        fi
         if ((prerequisite)); then
             case $line in
                 'The file of stored file properties (rkhunter.dat) does not exist,'*| \
@@ -210,7 +240,8 @@ sc_parse_rkhunter() {
                     key=rkh_ssh_protocol; object=Protocol;;
                 'checking for hidden files and directories '*) key=rkh_hidden_summary; object='hidden-files';;
                 'checking /dev for suspicious file types '*|'suspicious file types found in /dev:')
-                    key=rkh_dev; object=/dev;;
+                    key=rkh_dev; object=/dev
+                    [[ ${normalized,,} != 'suspicious file types found in /dev:' ]] || dev_list=1;;
             esac
             if [[ $key == rkh_warning ]]; then
                 if [[ $normalized =~ $script_re ]]; then
@@ -248,6 +279,105 @@ sc_parse_rkhunter() {
             fi
         fi
     done < "$1"
+}
+
+sc_rkh_tool_allowed() {
+    local executable i
+    executable=$(command -v "$1") || return 0
+    for i in "${!SC_F_MODULE[@]}"; do
+        [[ ${SC_F_PRIORITY[i]} == urgent || ${SC_F_PRIORITY[i]} == review ]] || continue
+        [[ ${SC_F_OBJECT[i]} == /* ]] || continue
+        # Bash compares inode identity without running a resolver or either file.
+        if [[ $executable == "${SC_F_OBJECT[i]}" || $executable -ef ${SC_F_OBJECT[i]} ]]; then return 1; fi
+    done
+    return 0
+}
+
+sc_rkh_check_dev() {
+    local i=$1 object=${SC_F_OBJECT[$1]} prefix="$SC_RUN_DIR/rkh-context.$1"
+    local type uid gid mode owner extra rc size pids pid line executable package tool started=$SECONDS count=0
+    local -a processes=()
+    SC_F_CHECK_KEY[i]=rkh_dev_unknown
+    SC_F_CHECK_DETAIL[i]="log=rkh-context.$i.stat / rkh-context.$i.fuser.stderr"
+    [[ $object == /dev/* ]] || return
+    for tool in timeout stat grep head tr fuser ps readlink pacman; do
+        if ! sc_rkh_tool_allowed "$tool"; then
+            SC_F_CHECK_KEY[i]=rkh_dev_tool_flagged
+            SC_F_CHECK_DETAIL[i]="$(sc_t dev_flagged_tool): $tool"
+            return
+        fi
+    done
+    if [[ ! -e $object && ! -L $object ]]; then
+        SC_F_CHECK_KEY[i]=rkh_dev_missing; return
+    fi
+    # Record link/device metadata without reading contents or following targets.
+    sc_capture "$prefix.stat" "$prefix.stat.stderr" 3 stat -c '%F|%u|%g|%a|%U' -- "$object"
+    rc=$?
+    ((rc == 0)) && [[ ! -s $prefix.stat.stderr ]] || return
+    IFS='|' read -r type uid gid mode owner extra < "$prefix.stat"
+    [[ $uid =~ ^[0-9]{1,10}$ && $gid =~ ^[0-9]{1,10}$ && $mode =~ ^[0-7]{1,4}$ && -z $extra ]] || return
+    SC_F_CHECK_DETAIL[i]="$(sc_t dev_owner): $(sc_text "$owner") (UID $uid); $(sc_t dev_permissions): $mode"
+    if [[ ( $type != 'regular file' && $type != 'regular empty file' ) || ! -f $object || -L $object ]]; then
+        SC_F_CHECK_KEY[i]=rkh_dev_nonregular; return
+    fi
+    if ! command -v fuser >/dev/null; then SC_F_CHECK_KEY[i]=rkh_dev_tool_missing; return; fi
+    # fuser does not reliably accept --. The validated absolute /dev/ path
+    # cannot be an option. No -k, signals, mount-wide search or file execution.
+    sc_capture "$prefix.fuser" "$prefix.fuser.stderr" 5 fuser -v "$object"
+    rc=$?
+    size=$(timeout 2 stat -c '%s' -- "$prefix.fuser") || return
+    [[ $size =~ ^[0-9]{1,10}$ ]] && ((size <= 4096)) || return
+    sc_no_nul "$prefix.fuser" || return
+    pids=$(<"$prefix.fuser")
+    if ((rc == 1)) && [[ -z $pids && ! -s $prefix.fuser.stderr ]]; then
+        SC_F_CHECK_KEY[i]=rkh_dev_idle; return
+    fi
+    ((rc == 0)) && [[ -n $pids && $pids != *[!0-9$' \t\r\n']* ]] || return
+    read -r -a processes <<< "${pids//$'\n'/ }"
+    ((${#processes[@]})) || return
+    for pid in "${processes[@]}"; do
+        [[ $pid =~ ^[1-9][0-9]{0,9}$ ]] || return
+    done
+    SC_F_CHECK_KEY[i]=rkh_dev_process
+    for pid in "${processes[@]}"; do
+        ((count < 3 && SECONDS-started < 20)) || {
+            SC_F_CHECK_DETAIL[i]+="; $(sc_t dev_more_processes)"; break;
+        }
+        ((count+=1))
+        # Process identity is a live observation, not proof of who created the file.
+        sc_capture "$prefix.ps.$pid" "$prefix.ps.$pid.stderr" 2 ps -p "$pid" -o pid=,uid=,comm=
+        rc=$?
+        if ((rc != 0)) || [[ -s $prefix.ps.$pid.stderr ]]; then
+            SC_F_CHECK_DETAIL[i]+="; PID $pid: $(sc_t dev_process_unavailable)"; continue
+        fi
+        sc_no_nul "$prefix.ps.$pid" || continue
+        line=$(timeout 2 head -c 256 -- "$prefix.ps.$pid")
+        if [[ ! $line =~ ^[[:blank:]]*([0-9]+)[[:blank:]]+([0-9]+)[[:blank:]]+([^$'\n']+)$ || ${BASH_REMATCH[1]} != "$pid" ]]; then
+            SC_F_CHECK_DETAIL[i]+="; PID $pid: $(sc_t dev_process_unavailable)"; continue
+        fi
+        SC_F_CHECK_DETAIL[i]+="; $(sc_t dev_program): $(sc_text "${BASH_REMATCH[3]}") (PID $pid, UID ${BASH_REMATCH[2]})"
+        ((SECONDS-started < 20)) || { SC_F_CHECK_DETAIL[i]+="; $(sc_t dev_more_processes)"; break; }
+        sc_capture "$prefix.exe.$pid" "$prefix.exe.$pid.stderr" 2 readlink -n -- "/proc/$pid/exe"
+        rc=$?
+        ((rc == 0)) && [[ ! -s $prefix.exe.$pid.stderr ]] || continue
+        size=$(timeout 2 stat -c '%s' -- "$prefix.exe.$pid") || continue
+        [[ $size =~ ^[0-9]{1,10}$ ]] || continue
+        ((size <= 4096)) || continue
+        sc_no_nul "$prefix.exe.$pid" || continue
+        # Preserve even a filename ending in LF; command substitution normally
+        # strips it and could ask pacman about an unrelated executable.
+        executable=$(timeout 2 head -c 4097 -- "$prefix.exe.$pid"; printf '.')
+        executable=${executable%.}
+        [[ $executable == /* && ${#executable} -le 4096 && $executable == "$(sc_text "$executable")" ]] || continue
+        ((SECONDS-started < 20)) || { SC_F_CHECK_DETAIL[i]+="; $(sc_t dev_more_processes)"; break; }
+        sc_capture "$prefix.package.$pid" "$prefix.package.$pid.stderr" 2 pacman -Qqo -- "$executable"
+        rc=$?
+        ((rc == 0)) && [[ ! -s $prefix.package.$pid.stderr ]] || continue
+        sc_no_nul "$prefix.package.$pid" || continue
+        package=$(timeout 2 head -c 257 -- "$prefix.package.$pid")
+        [[ ${#package} -le 256 && $package =~ ^[A-Za-z0-9@_+.-]+$ ]] || continue
+        SC_F_CHECK_DETAIL[i]+="; $(sc_t dev_program_package): $package"
+    done
 }
 
 sc_rkh_check_file() {
@@ -379,14 +509,16 @@ sc_rkh_check_ssh() {
 }
 
 sc_interpret_rkhunter() {
-    local i hidden=0 name checked=0 started=$SECONDS
+    local i hidden=0 dev=0 name checked=0 started=$SECONDS
     SC_RKH_CONTEXT_PARTIAL=0
     for name in "${SC_F_KEY[@]}"; do
         [[ $name == rkh_hidden_file || $name == rkh_hidden_directory ]] && hidden=1
+        [[ $name != rkh_dev_file ]] || dev=1
     done
-    if ((hidden)); then
+    if ((hidden || dev)); then
         for i in "${!SC_F_KEY[@]}"; do
-            [[ ${SC_F_KEY[i]} == rkh_hidden_summary ]] || continue
+            if [[ ${SC_F_KEY[i]} != rkh_hidden_summary || $hidden == 0 ]] &&
+               [[ ${SC_F_KEY[i]} != rkh_dev || $dev == 0 ]]; then continue; fi
             for name in SC_F_MODULE SC_F_KIND SC_F_PRIORITY SC_F_CONFIDENCE SC_F_OBJECT SC_F_KEY SC_F_EVIDENCE SC_F_CHECK_KEY SC_F_CHECK_DETAIL; do
                 local -n values=$name
                 unset 'values[i]'
@@ -402,20 +534,25 @@ sc_interpret_rkhunter() {
         case ${SC_F_KEY[i]} in
             rkh_hidden_directory)
                 SC_F_CHECK_KEY[i]=rkh_file_nonregular; SC_RKH_CONTEXT_PARTIAL=1; continue;;
-            rkh_script|rkh_hidden_file|rkh_file_warning|rkh_ssh_root|rkh_ssh_protocol) ;;
+            rkh_script|rkh_hidden_file|rkh_file_warning|rkh_ssh_root|rkh_ssh_protocol|rkh_dev_file) ;;
             *) continue;;
         esac
         if ((checked >= 40 || SECONDS-started >= 180)); then
             SC_F_CHECK_KEY[i]=rkh_context_limit; SC_RKH_CONTEXT_PARTIAL=1; continue
         fi
         ((checked+=1))
-        case ${SC_F_KEY[i]} in rkh_ssh_*) sc_rkh_check_ssh "$i";; *) sc_rkh_check_file "$i";; esac
+        case ${SC_F_KEY[i]} in
+            rkh_ssh_*) sc_rkh_check_ssh "$i";;
+            rkh_dev_file) sc_rkh_check_dev "$i";;
+            *) sc_rkh_check_file "$i";;
+        esac
         case ${SC_F_CHECK_KEY[i]} in
-            rkh_file_unknown|rkh_file_tool_missing|rkh_file_nonregular|rkh_context_limit|rkh_ssh_unknown|rkh_ssh_flagged)
+            rkh_file_unknown|rkh_file_tool_missing|rkh_file_nonregular|rkh_context_limit|rkh_ssh_unknown|rkh_ssh_flagged|rkh_dev_unknown|rkh_dev_tool_missing|rkh_dev_missing|rkh_dev_nonregular|rkh_dev_tool_flagged)
                 SC_RKH_CONTEXT_PARTIAL=1;;
         esac
     done
     SC_SCOPE+=('rkhunter context: up to 40 checks / 180s plus one in-flight check; regular files <=64MiB; exact pacfile MTREE record + SHA-256; local package records do not prove trusted origin. SSH uses default configuration, not every Match context or running daemon.')
+    ((dev == 0)) || SC_SCOPE+=('/dev context: exact parsed paths, stat without dereferencing links, optional fuser -v; up to three process identities per file / 20s before another ps/readlink/pacman query. Raw input is checked before Bash can discard NUL/LF; identified flagged utilities are not launched. Live usage and executable package ownership do not establish the creator or trusted origin. No file contents read, processes stopped or data removed.')
 }
 
 sc_run_rkhunter() {
@@ -987,7 +1124,8 @@ sc_t() {
         health_build) en="Read the PKGBUILD (build instructions), .install files and changes before installing or updating."; it="Prima di installare o aggiornare, leggi PKGBUILD (istruzioni di compilazione), file .install e modifiche.";;
         health_sources) en="Check download sources. If unsure, ask for help before running the build."; it="Verifica le fonti dei download. Se hai dubbi, chiedi aiuto prima di compilare.";;
         rkh_prerequisite_detail) en="Prerequisite failure reported by rkhunter:"; it="Causa segnalata da rkhunter:";;
-        rkh_baseline_missing) en="rkhunter has no usable file baseline. Do not create one until the current files have been independently checked."; it="La base di confronto di rkhunter manca o è vuota. Va creata solo dopo aver verificato i file attuali.";;
+        rkh_baseline_missing) en="The initial file snapshot (rkhunter.dat) is missing or empty. rkhunter cannot compare changes over time."; it="Manca la prima fotografia dei file (rkhunter.dat), oppure è vuota. rkhunter non può confrontare le modifiche nel tempo.";;
+        rkh_baseline_help) en="--propupd records the current files as a reference. Use it only after checking their contents and source."; it="--propupd registra i file attuali come riferimento. Va usato solo dopo averne verificato contenuto e provenienza.";;
         rkh_optional) en="Optional or unconfigured tests excluded from this scan:"; it="Test facoltativi o non configurati esclusi da questa scansione:";;
         rkh_optional_short) en="Optional tests excluded; reasons in the report."; it="Test facoltativi esclusi; motivi nel rapporto.";;
         followup_question) en="Would you like me to run the follow-up checks for you? [y/N]"; it="Vuoi che faccia io le verifiche del caso al posto tuo? [s/N]";;
@@ -1146,6 +1284,26 @@ sc_t() {
         rkh_hidden_directory) en='rkhunter reported a hidden directory. Applications commonly create these. A directory cannot be verified with a single file hash: check which application created it and examine its contents without running them.'; it="rkhunter segnala una cartella nascosta. Molte applicazioni ne creano: una cartella non si verifica con lo SHA-256 di un singolo file. Controlla quale applicazione l'ha creata e il suo contenuto, senza eseguirlo.";;
         rkh_hidden_summary) en='rkhunter reported hidden files without individually readable details. Their names are needed before a file verification can be made.'; it="rkhunter segnala file nascosti, ma non sono disponibili dettagli leggibili sui singoli file. Servono i percorsi per verificarli.";;
         rkh_dev) en='rkhunter found unexpected file types under /dev, where devices and runtime data live. Some applications create legitimate files there; this warning needs the listed paths and their origin.'; it="rkhunter segnala tipi di file inattesi in /dev, dove si trovano dispositivi e dati creati durante il funzionamento. Alcune applicazioni vi creano file legittimi: occorre verificarne percorsi e origine.";;
+        rkh_dev_file) en='An application may have created this file under /dev. SecCheck checks its properties and current users without opening its contents.'; it="Un’applicazione può aver creato questo file in /dev. SecCheck controlla le proprietà e chi lo sta usando, senza leggerne il contenuto.";;
+        rkh_dev_process) en='Processes using the file were reported. This shows current use, not who created it or whether it is safe.'; it="Sono stati rilevati processi che usano il file. Questo mostra l’uso attuale, non chi l’ha creato o se è sicuro.";;
+        rkh_dev_idle) en='No process using the file was reported. It may be leftover runtime data; its origin remains unknown.'; it="Non sono stati rilevati processi che usano il file. Può essere un dato rimasto dopo la chiusura di un’applicazione; l’origine resta sconosciuta.";;
+        rkh_dev_unknown) en='The file or its current users could not be reliably checked. See the original check logs.'; it="Non è stato possibile verificare il file o chi lo usa. Il rapporto conserva i log della verifica.";;
+        rkh_dev_missing) en='The path no longer exists. Runtime files can disappear when an application closes; this does not explain their original contents.'; it="Il percorso non esiste più. I file temporanei possono sparire quando un’applicazione si chiude; il contenuto originale resta sconosciuto.";;
+        rkh_dev_nonregular) en='The path is a link, directory or other nonregular object. Its metadata was recorded; its contents or target were not inspected.'; it="Il percorso è un collegamento, una cartella o un altro tipo di oggetto. Sono state registrate le proprietà, senza leggerne il contenuto o la destinazione.";;
+        rkh_dev_tool_missing) en='File properties were recorded. Install optional psmisc to identify current users with fuser, then repeat the check.'; it="Le proprietà del file sono state registrate. Per identificare chi lo usa serve fuser, nel pacchetto facoltativo psmisc. Poi ripeti il controllo.";;
+        rkh_dev_tool_flagged) en='A verification tool has an unresolved file warning. It was not run for this check.'; it="Uno strumento di verifica ha una segnalazione ancora aperta. Non è stato avviato per questo controllo.";;
+        rkh_stream_unreadable) en='The raw rkhunter output could not be read reliably. It remains in the original log and does not count as a verified path.'; it="Il testo originale di rkhunter non è leggibile in modo affidabile. Resta nel log originale e non viene usato per verificare un percorso.";;
+        rkh_dev_lsp) en='LSP audio plugins use names like this for shared-memory data. The name alone does not establish the origin of this file.'; it="I plugin audio LSP usano nomi come questo per dati in memoria condivisa. Il nome non basta a stabilire l’origine del file.";;
+        rkh_updated_context) en='systemd uses /etc/.updated as an update timestamp. This explains why that name can exist outside package contents, but does not verify this particular file.'; it="systemd usa /etc/.updated per registrare la data degli aggiornamenti. Questo spiega il nome e l’assenza dai pacchetti, ma non verifica questo specifico file.";;
+        dev_owner) en='Owner'; it='Proprietario';;
+        dev_permissions) en='Permissions'; it='Permessi';;
+        dev_program) en='Program'; it='Programma';;
+        dev_program_package) en='Executable package'; it="Pacchetto dell’eseguibile";;
+        dev_process_unavailable) en='identity unavailable'; it='identità non disponibile';;
+        dev_flagged_tool) en='Tool with an unresolved warning'; it='Strumento con una segnalazione aperta';;
+        dev_more_processes) en='additional processes or time limit; see logs'; it='altri processi o tempo esaurito; vedi i log';;
+        rkh_action_dev) en='Check whether the listed program is one you use. Do not delete a shared-memory file while it is in use. If the program is unfamiliar, ask for help using these details.'; it="Controlla se il programma elencato è uno che usi. Non eliminare file in memoria condivisa mentre sono in uso. Se non riconosci il programma, chiedi aiuto con questi dettagli.";;
+        rkh_action_dev_idle) en='Close your applications normally and repeat the scan. If the unexplained file remains, use its path and properties to ask for help before deleting it.'; it="Chiudi normalmente le applicazioni e ripeti la scansione. Se il file resta senza una spiegazione, chiedi aiuto indicando percorso e proprietà prima di eliminarlo.";;
         rkh_ssh_root) en="This concerns remote administrator access through SSH. The effective setting needs checking."; it="Riguarda l’accesso remoto come amministratore tramite SSH. Va controllata l’impostazione effettiva.";;
         rkh_ssh_protocol) en="This old rkhunter test concerns SSH protocol 1. The installed server version can clarify it."; it="Questo vecchio test riguarda il protocollo SSH 1. La versione del server installato può chiarire l’avviso.";;
         rkh_file_match) en="Content, type, permissions and owner match the local package record. This explains this warning."; it="Contenuto, tipo, permessi e proprietario coincidono con il pacchetto locale. Questo chiarisce l’avviso.";;
@@ -1382,6 +1540,9 @@ sc_render_summary() {
             sc_line "$(sc_t "${SC_MODULE_STATUS[$module]}") / $(sc_t findings): $count" "$color"
         fi
         [[ -z ${SC_MODULE_REASON[$module]} ]] || sc_line "$(sc_t "${SC_MODULE_REASON[$module]}")" "$SC_C_MUTED"
+        if [[ $module == rkhunter && ${SC_MODULE_REASON[$module]} == rkh_baseline_missing ]]; then
+            sc_line "$(sc_t rkh_baseline_help)" "$SC_C_MUTED"
+        fi
         if [[ $module == rkhunter && " ${SC_D_KEY[*]} " == *' rkh_optional '* ]]; then
             sc_line "$(sc_t rkh_optional_short)" "$SC_C_MUTED"
         fi
@@ -1479,6 +1640,11 @@ sc_render_details() {
                 sc_line "$(sc_t meaning):" "$SC_C_WHITE$SC_C_BOLD"
                 sc_line "$(sc_t "${SC_F_KEY[i]}")"
             fi
+            if [[ ${SC_F_KEY[i]} == rkh_dev_file && $object =~ ^/dev/shm/lsp-catalog-[A-Za-z0-9_.-]+\.(shm|lock)$ ]]; then
+                sc_line "$(sc_t rkh_dev_lsp)" "$SC_C_MUTED"
+            elif [[ ${SC_F_KEY[i]} == rkh_hidden_file && $object == /etc/.updated ]]; then
+                sc_line "$(sc_t rkh_updated_context)" "$SC_C_MUTED"
+            fi
             seen=' ' action=''
             for j in "${members[@]}"; do
                 check=${SC_F_CHECK_KEY[j]}
@@ -1487,7 +1653,7 @@ sc_render_details() {
                 seen+="$check "
                 sc_line "$(sc_t checked):" "$SC_C_PRIMARY$SC_C_BOLD"
                 sc_line "$(sc_t "$check")"
-                if ((technical)) || [[ $check == rkh_ssh_unknown ]]; then
+                if ((technical)) || [[ $check == rkh_ssh_unknown || ${SC_F_KEY[j]} == rkh_dev_file ]]; then
                     [[ -z ${SC_F_CHECK_DETAIL[j]} ]] || sc_line "${SC_F_CHECK_DETAIL[j]}" "$SC_C_MUTED"
                 fi
                 if [[ $check == rkh_ssh_allowed || $check == rkh_ssh_disabled ||
@@ -1503,6 +1669,8 @@ sc_render_details() {
                     rkh_file_tool_missing) action=rkh_action_tools;;
                     rkh_ssh_allowed|rkh_ssh_keys|rkh_ssh_commands) action=rkh_action_ssh;;
                     rkh_ssh_disabled) action=rkh_action_ssh_disabled;;
+                    rkh_dev_process) action=rkh_action_dev;;
+                    rkh_dev_idle|rkh_dev_missing) action=rkh_action_dev_idle;;
                     *) action=rkh_action_unknown;;
                 esac
             done

@@ -2,6 +2,14 @@
 
 ## 2.0.0 — development branch
 
+- Keep the individual paths in native rkhunter `/dev` warning lists. Additional
+  checks record file properties and optional `fuser` process observations, with
+  bounded process identity and executable-package queries. Preserve review
+  priority: a familiar filename or a running program is not proof of safety.
+- Explain the missing `rkhunter.dat` as an initial file snapshot, with short
+  guidance about the trust decision involved in `--propupd`. No baseline is reset.
+- Add contextual EN/IT notes for LSP shared-memory names and `/etc/.updated`,
+  without treating either naming convention as an automatic exception.
 - Read the SSH root-login setting with lowercase or canonical keyword case in
   both -T and -G output. Preserve value case, original logs and duplicate rejection.
 - Recognize rkhunter's padded file-summary columns and merge them with the
