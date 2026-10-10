@@ -261,4 +261,4 @@ exit 1
                          'sc_assess; sc_render_summary\n')
         self.assertIn('rkhunter.dat', out)
         self.assertIn('fotografia', out)
-        self.assertIn('propupd', out)
+        self.assertNotIn('propupd', out)

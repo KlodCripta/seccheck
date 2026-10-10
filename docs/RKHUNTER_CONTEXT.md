@@ -20,8 +20,8 @@ log, rather than authorizing a lookup against a changed filename.
 Prerequisite warnings limit coverage. Known indented causes, including a missing
 or empty `rkhunter.dat`, are retained as specific diagnostics. The warning about using `--propupd` is a
 baseline reminder, not a malware finding. SecCheck does not run `--propupd`.
-The short result calls this a missing initial file snapshot and explains that
-`--propupd` would accept the current files as a reference. Checking only warning
+The short result calls this a missing initial file snapshot. The technical report
+explains that `--propupd` would accept the current files as a reference. Checking only warning
 paths or matching local package records does not establish a trusted first baseline.
 
 ## File checks
@@ -161,9 +161,8 @@ matching record can explain content, permission and ownership findings; timestam
 size, link and missing-path observations remain open. Directories/links receive a
 bounded `stat` observation without following their targets or declaring their
 configuration legitimate. Paths altered by display sanitization are never used.
-Unsupported findings are explicitly labelled as requiring review. Lynis advice,
-AUR maintenance signals and strong rootkit signatures cannot be approved by a
-matching package checksum. No flagged file is executed; no file is removed,
+Unsupported findings remain open. Lynis advice and strong rootkit signatures
+cannot be approved by a matching package checksum. No flagged file is executed; no file is removed,
 replaced, reconfigured or used to reset a baseline.
 
 The short result displays remaining priorities, explained findings and items that
@@ -175,8 +174,7 @@ follow-up preserves the report; completing it updates the exit assessment too.
 
 Only a recognized skipped test immediately followed by its known reason is treated
 as an exclusion: absent skdet, absent Tripwire data, absent inetd/xinetd configuration,
-or unconfigured missing/empty log lists. The exclusion is shown in the summary and
-explained in the report. It does not claim those tests ran. Unknown skip causes,
+or unconfigured missing/empty log lists. The exclusion is retained and explained in the technical report. It does not claim those tests ran. Unknown skip causes,
 failed prerequisites and scanner errors still limit coverage.
 
 The exact egrep forwarding notice is informational. GNU grep's stray-backslash

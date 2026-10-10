@@ -62,38 +62,55 @@ echo 'demo: 1 total file, 1 altered file'
 exit 1
 ''')
         self.command('paccheck', 'echo "demo: all files match mtree sha256sums"\n')
-        master, slave = pty.openpty()
-        script = '''source "$1"
+        for index, (answers, analyzed) in enumerate([
+                (b's\n0\n', True), (b'm\n0\ns\n0\n', True),
+                (b'm\n3\n0\n0\n', False), (b'0\n', False)]):
+            with self.subTest(answers=answers):
+                master, slave = pty.openpty()
+                run_name = f'run-{index}'
+                script = '''source "$1"
 sc_parse_args --lang it --scan integrity --no-color; sc_ui_init
 sc_require_scan_host() { return 0; }
-sc_prepare_run() { SC_RUN_DIR="$SC_TEST_DIR/run"; mkdir -m 700 "$SC_RUN_DIR"; }
+sc_prepare_run() { SC_RUN_DIR="$SC_TEST_DIR/$SC_TEST_RUN"; mkdir -m 700 "$SC_RUN_DIR"; }
 sc_run_requested
 '''
-        process = subprocess.Popen(['bash', '-c', script, 'test', str(SCRIPT)],
-                                   stdin=slave, stdout=slave, stderr=slave,
-                                   env=dict(os.environ, PATH=path, SC_TEST_DIR=str(self.folder), NO_COLOR='1'))
-        os.close(slave)
-        data = b''
-        try:
-            os.write(master, b's\n0\n')
-            until = time.monotonic() + 10
-            while time.monotonic() < until:
-                if select.select([master], [], [], 0.1)[0]:
-                    try:
-                        data += os.read(master, 65536)
-                    except OSError:
-                        break
-                elif process.poll() is not None:
-                    break
-            self.assertEqual(process.wait(timeout=2), 0, data.decode())
-            self.assertIn(b'Vuoi che faccia io le verifiche del caso al posto tuo?', data)
-            self.assertIn('integrity_rechecked', (self.folder / 'run/checks.tsv').read_text())
-            self.assertIn('\tinfo\t', (self.folder / 'run/findings.tsv').read_text())
-            self.assertIn('original', (self.folder / 'run/report.txt').read_text().lower())
-        finally:
-            if process.poll() is None:
-                process.kill()
-            os.close(master)
+                process = subprocess.Popen(['bash', '-c', script, 'test', str(SCRIPT)],
+                                           stdin=slave, stdout=slave, stderr=slave,
+                                           env=dict(os.environ, PATH=path, SC_TEST_DIR=str(self.folder),
+                                                    SC_TEST_RUN=run_name, NO_COLOR='1'))
+                os.close(slave)
+                data = b''
+                try:
+                    os.write(master, answers)
+                    until = time.monotonic() + 10
+                    while time.monotonic() < until:
+                        if select.select([master], [], [], 0.1)[0]:
+                            try:
+                                data += os.read(master, 65536)
+                            except OSError:
+                                break
+                        elif process.poll() is not None:
+                            break
+                    self.assertEqual(process.wait(timeout=2), 0 if analyzed else 1, data.decode())
+                    question = 'Vuoi che faccia io le verifiche del caso al posto tuo?'
+                    text = data.decode()
+                    self.assertIn(question, text)
+                    self.assertNotIn(str(self.folder / 'sample'), text.split(question)[0])
+                    run = self.folder / run_name
+                    checks = (run / 'checks.tsv').read_text()
+                    self.assertEqual('integrity_rechecked' in checks, analyzed)
+                    self.assertEqual('\tinfo\t' in (run / 'findings.tsv').read_text(), analyzed)
+                    self.assertIn('original', (run / 'report.txt').read_text().lower())
+                    if answers.startswith(b'm'):
+                        self.assertIn(str(self.folder / 'sample'), text)
+                        self.assertGreaterEqual(text.count(question), 2)
+                    if b'3\n' in answers:
+                        self.assertIn('SHA256 checksum mismatch', text)
+                        self.assertIn(str(run / 'report.txt'), text)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    os.close(master)
 
     def test_confirmation_is_explicit_and_uses_existing_privileges(self):
         for answer, called in [('s', True), ('S', True), ('y', True), ('n', False), ('', False)]:
@@ -120,7 +137,7 @@ sc_run_requested
         self.assertFalse((self.folder / 'CALLED').exists())
 
     def test_followups_preserve_urgent_and_uncheckable_findings_and_private_report(self):
-        out = self.shell('sc_reset "rkhunter integrity lynis aur-health"; SC_LANG=it; sc_ui_init\n'
+        out = self.shell('sc_reset "rkhunter integrity lynis"; SC_LANG=it; sc_ui_init\n'
                          'sc_prepare_run "$SC_TEST_DIR/reports" || exit\n'
                          'sc_module_set rkhunter partial rkh_regex\n'
                          'sc_add_finding rkhunter suspicious urgent unconfirmed signature rkh_signature "Possible rootkit"\n'

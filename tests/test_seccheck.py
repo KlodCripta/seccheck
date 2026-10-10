@@ -15,10 +15,10 @@ class SecCheckCase(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.folder = pathlib.Path(self.temp.name)
 
-    def shell(self, body, **extra_env):
+    def shell(self, body, timeout=15, **extra_env):
         env = dict(os.environ, SC_TEST_DIR=str(self.folder), NO_COLOR="1", **extra_env)
         result = subprocess.run(["bash", "-c", 'source "$1"\n' + body, "test", str(SCRIPT)],
-                                text=True, capture_output=True, env=env, timeout=15)
+                                text=True, capture_output=True, env=env, timeout=timeout)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertEqual(result.stderr, "", result.stderr)
         return result.stdout.strip()
@@ -97,7 +97,7 @@ class AdapterTests(SecCheckCase):
         self.assertIn('skdet', out)
         self.assertIn('xinetd', out)
         self.assertIn('stray', out)
-        self.assertIn('compatibility', out)
+        self.assertIn('compatib', out.lower())
         self.assertTrue(out.endswith('partial|0'), out)
 
     def test_egrep_deprecation_alone_does_not_discard_completed_rkhunter_coverage(self):
@@ -175,7 +175,7 @@ class AdapterTests(SecCheckCase):
 
 class EvidenceTests(SecCheckCase):
     def test_failed_empty_modules_are_incomplete(self):
-        out = self.shell('sc_reset "rkhunter lynis integrity aur-health"\n'
+        out = self.shell('sc_reset "rkhunter lynis integrity"\n'
                          'for m in "${SC_SELECTED[@]}"; do sc_module_set "$m" failed command_failed; done\n'
                          'sc_assess\nprintf "%s|%s" "$SC_INCOMPLETE" "$SC_ASSESSMENT"')
         self.assertEqual(out, "1|unknown")
@@ -197,7 +197,7 @@ class EvidenceTests(SecCheckCase):
 
     def test_only_selected_modules_count_for_coverage(self):
         out = self.shell('sc_reset "lynis"\nsc_module_set lynis completed ""\nsc_assess\n'
-                         'printf "%s|%s|%s" "$SC_INCOMPLETE" "$SC_COMPLETED" "${SC_MODULE_STATUS[aur-health]}"')
+                         'printf "%s|%s|%s" "$SC_INCOMPLETE" "$SC_COMPLETED" "${SC_MODULE_STATUS[rkhunter]}"')
         self.assertEqual(out, "0|1|not-run")
 
     def test_partial_scan_keeps_urgent_findings(self):

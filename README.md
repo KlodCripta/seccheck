@@ -1,18 +1,11 @@
 # SecCheck 2.0 — development
 
-A bilingual terminal security assistant for **Arch Linux and its derivatives**.
-Petrolio colors, readable findings, explicit coverage and practical next steps.
+A terminal security assistant for **Arch Linux and its derivatives**.
+Choose English or Italian, start a scan and let SecCheck investigate the warnings.
 
-![Petrolio terminal demo](screenshots/seccheck-v2-petrolio.png)
+![Current menu](screenshots/seccheck-v2-menu.png)
 
-Actual demo output captured from a terminal; the background belongs to the terminal
-theme. SecCheck respects the user's terminal background.
-
-**Development version:** automated tests run on Ubuntu with inert scanner fixtures.
-A real Arch/derivative validation pass is still required before release. The existing
-poster and 1.x screenshots are historical; the poster will be refreshed separately.
-
-## Start / Avvio
+## Start
 
 ```bash
 git clone --branch codex/seccheck-2.0 https://github.com/KlodCripta/seccheck.git
@@ -20,220 +13,92 @@ cd seccheck
 bash seccheck.sh
 ```
 
-Choose **1 English** or **2 Italiano** at startup. Root is requested only when
-needed; your chosen language and display options are retained through sudo. On Arch and its
-derivatives, the interactive startup checks the scanner dependencies, explains
-their purpose and offers to install missing packages. You can decline and continue.
+Choose **1 English** or **2 Italiano**. SecCheck checks the tools at startup and
+shows missing packages only. Accept their installation with pacman or continue
+with the available checks. Scans request root through sudo when needed.
 
-Scegli **1 English** o **2 Italiano** all'avvio. I permessi di root vengono richiesti
-quando servono; lingua e opzioni di visualizzazione vengono mantenute dopo sudo. Il controllo
-iniziale mostra gli strumenti disponibili e quelli mancanti, spiegando a cosa
-servono. Puoi accettare l'installazione con pacman oppure proseguire con i controlli
-disponibili. Vengono richiesti solo i pacchetti mancanti, senza conferme automatiche.
+The main menu has three actions:
 
-**1 — Full scan / Scansione completa** includes **2, 3, 4 and 5**. Options 6–8
-are separate tools: dependencies, signature updates and the example result.
-See the [current terminal menu](screenshots/seccheck-v2-menu.png).
+1. **Full scan:** rkhunter, Lynis and package-file integrity.
+2. **Individual checks:** choose one of those checks.
+3. **Tools:** dependencies or rkhunter signature updates.
 
-Try the interface anywhere, without root or scanners:
+## After a scan
 
-```bash
-bash seccheck.sh --lang it --demo review
-bash seccheck.sh --lang en --demo urgent
-bash seccheck.sh --lang it --demo incomplete --ascii --no-color
-bash seccheck.sh --lang en --demo clean
-```
+The initial result shows the number of items to verify and any incomplete checks.
+It asks: **“Vuoi che faccia io le verifiche del caso al posto tuo?”**
 
-## Checks / Controlli
+- **s** in Italian, **y** in English: analyze the warnings automatically.
+- **m**: show the warnings first, then return to the choice. The technical report
+  is available here too, without accepting automatic analysis.
+- **0** or Enter: finish with the initial result.
 
-| Module | What it checks / Cosa controlla |
+Automatic analysis compares supported files with their local package records,
+checks SSH settings/version and investigates reported temporary files under `/dev`.
+It uses the existing privileges. The final result separates explained warnings,
+remaining items and optional improvements. Original evidence remains available.
+
+**Remaining items** shows only unresolved warnings, five per page, with an
+explanation and a next step. **Other results** contains improvements, explained
+warnings, a short report and the full technical report. Logs are shown on request.
+
+![Sample result](screenshots/seccheck-v2-result.png)
+
+## Understanding the result
+
+| Colour | Meaning |
 | --- | --- |
-| rkhunter | Known rootkit indicators and suspicious properties / Indicatori di rootkit e proprietà sospette |
-| Lynis | System configuration and hardening advice / Configurazione e consigli di sicurezza |
-| Integrity | pacman metadata **and** paccheck SHA-256 against local package records / Metadati e contenuto dei file rispetto ai dati locali dei pacchetti |
-| AUR / Project health | Installed versions, out-of-date flags, orphan status, age and maintainer changes / Versioni, segnalazioni di mancato aggiornamento, orfani, anzianità e cambi di maintainer |
+| Green | No unresolved warnings in the completed, selected checks. |
+| Orange | Warnings need investigation, or checks are incomplete. |
+| Red | A serious indicator needs priority investigation. |
 
-Tools: Bash 4.4+, pacman, GNU coreutils/grep; `rkhunter`, `lynis`, `pacutils`
-for their respective modules. Online AUR maintenance checks also require `python`
-(Python 3 standard library) and `curl`. `paccheck` and `pacfile` are supplied by `pacutils`. Missing scanner
-packages can be installed through the menu, with pacman's confirmation. No AUR
-helper is invoked. A missing scanner leaves its module unavailable and coverage incomplete.
+Warnings are not an infection count. Configuration files can change during normal
+use. Optional Lynis suggestions are separate from unresolved warnings and do not
+turn an otherwise complete, clear result orange. A missing check cannot be green.
+SecCheck gives no percentage of infection or guarantee of safety.
 
-## Read the result / Leggere il risultato
+The interface uses cold white, bold and italic text, red SEC/white CHECK, and
+orange/green result indicators. It keeps your terminal background. Narrow terminals,
+`NO_COLOR`, `--no-color` and `--ascii` are supported.
 
-- **Urgent / Urgente:** investigate a strong unresolved indicator. This is not an automatic diagnosis of infection.
-- **Review needed / Da verificare:** explain a change, a trace or a configuration warning before taking action.
-- **Improvements / Miglioramenti:** software maintenance or configuration suggestions, not independent evidence of malware.
-- **Undetermined / Non determinabile:** checks failed, were unavailable or could not finish.
-- **No unresolved findings / Nessuna segnalazione aperta:** no open findings in the completed checks and stated scope. Explained warnings remain in the report; this is no guarantee of safety.
+## Tools and command line
 
-**Coverage and priority are separate.** A partial scan can still find an urgent
-indicator. Counts and bars show findings and completed modules, never a supposed
-probability of infection. Choosing one module does not imply a full-system scan.
-
-**Copertura e priorità sono separate.** Una scansione parziale può comunque trovare
-un indicatore urgente. Barre e conteggi mostrano segnali e moduli conclusi, non una
-probabilità di infezione. Un singolo modulo non equivale a una scansione completa.
-
-Findings explain their meaning, uncertainty and next step. Original scanner evidence
-keeps its original language. Configuration edits are labelled without automatically
-dismissing changed executables. Lynis advice never confirms an unrelated rootkit alert.
-
-After an interactive scan, SecCheck asks **“Vuoi che faccia io le verifiche del caso al posto tuo? [s/N]”** (English: **“Would you like me to run the follow-up checks for you? [y/N]”**).
-Answering **s** or **y** starts read-only checks with the existing root permissions.
-Enter, n or end-of-input leaves the initial results unchanged. It checks the
-exact file's package record and SHA-256, or queries the SSH server's configuration
-and version. Duplicate summary/log messages are grouped. A warning explained by
-these checks remains visible as **Explained**, with its evidence, instead of being
-counted as an unresolved warning. Strong rootkit signatures are never cleared by a
-matching package file. Integrity follow-ups compare supported regular files and
-record current properties of directories/links. Unexplained changes, unavailable
-checks and advice requiring a human decision remain visible. The report is updated
-in the same private run directory; original scanner logs are retained.
-See [how these checks work and their limits](docs/RKHUNTER_CONTEXT.md).
-
-Nei dettagli trovi **Cosa significa**, **Verifica di SecCheck** e **Cosa fare**.
-Gli avvisi spiegati restano consultabili; quelli che SecCheck non riesce a verificare
-mantengono una spiegazione del limite. Con **s** avvii le verifiche aggiuntive;
-il programma aggiorna il risultato senza modificare file o impostazioni. Le pagine dei dettagli permettono di leggere
-anche le segnalazioni successive alle prime dieci.
-
-The integrity module distinguishes changed content, permissions, owner/group and
-modification time. A difference is a result, not automatically an incomplete check.
-Read failures, missing package reference data and unsupported output instead limit
-coverage. The short summary gives the reason; the full report retains exact
-messages and technical diagnostics.
-
-Il controllo di integrità distingue contenuto, permessi, proprietario/gruppo e data
-di modifica. Le differenze restano da verificare anche per file modificati spesso dai
-servizi. Se il controllo è parziale, il riepilogo indica lo strumento e il motivo;
-il rapporto completo conserva tutti i messaggi originali.
-
-## CLI
+Requires Bash 4.4+, pacman and GNU coreutils/grep. Scanner packages are **rkhunter**,
+**lynis** and **pacutils** (`paccheck` and `pacfile`). Optional **psmisc** supplies
+`fuser` for temporary-file observations. Python is used only by development tests.
 
 ```bash
 sudo bash seccheck.sh --lang it --scan full
 sudo bash seccheck.sh --lang en --scan integrity --no-color
-sudo bash seccheck.sh --lang it --scan aur-health
-sudo bash seccheck.sh --lang it --scan full --offline
+bash seccheck.sh --lang it --demo review
 bash seccheck.sh --help
 ```
 
-Noninteractive scans require `--lang` and perform the initial scan only: follow-up
-checks require the interactive confirmation. No input is read from a batch pipeline. `NO_COLOR`, `--no-color`, `TERM=dumb` and
-redirected output disable color; `--ascii` provides basic character output. Layouts
-adapt to narrow terminals. Interactive results offer details, a full report and rescan.
+Batch scans require `--lang` and perform the initial checks. Automatic follow-ups
+require the interactive choice; a pipeline cannot silently approve them.
+Exit status: **0** no urgent/review items in completed checks; **1** unresolved
+items; **2** incomplete checks; other values indicate setup errors.
 
-The summary and paged details group package-integrity differences by exact path.
-Several warnings about one file become one item, with all differences listed.
-Suggestions are separate from items still requiring review. Grouping does not
-clear a finding; the full report and TSVs preserve every original observation.
+Reports are private under `/var/log/seccheck/run.*` (directory 700, files 600).
+`report.txt` retains full evidence; `findings.tsv`, `checks.tsv`, `modules.tsv` and
+original scanner logs support technical analysis. Review private paths before sharing.
 
-Riepilogo e Dettagli riuniscono le differenze dei pacchetti per percorso: un file
-compare una sola volta, con tutte le differenze rilevate. I consigli restano
-separati dalle voci da chiarire. Il rapporto completo conserva gli avvisi originali.
+SecCheck investigates and suggests next steps. It does not reset the rkhunter
+baseline, restore modified configuration files, delete reported files or apply
+hardening rules automatically. A trustworthy initial baseline needs an informed
+decision, especially if changes remain unexplained.
 
-Batch scan exit codes: **0** no urgent/review findings (suggestions may exist), **1**
-urgent/review findings, **2** incomplete coverage even when findings also exist.
-Setup errors: 64 arguments, 73 report storage, 77 privilege, 78 unsupported system;
-130 interrupted. Demonstrations return 0 and are labelled as invented results.
+This is a **development version**. Test on Arch and its derivatives before release.
+See [verification notes](docs/VALIDATION.md) and
+[automatic-check details](docs/RKHUNTER_CONTEXT.md).
 
-## Reports / Rapporti
-
-Each actual run writes a new private directory under `/var/log/seccheck`, mode 700,
-with mode-600 files: `report.txt`, `findings.tsv`, `checks.tsv`, `modules.tsv` and raw scanner logs.
-`checks.tsv` associates each additional verification with its finding number;
-`rkh-context.*` files retain the command output and hashes used in those checks.
-Reports include versions, return statuses and scope. Existing runs are preserved.
-
-Ogni scansione crea una cartella privata nuova in `/var/log/seccheck`. Il rapporto
-spiega i risultati; i TSV e i log conservano i dati tecnici. Per leggerli servono
-permessi di root. Controlla percorsi e informazioni nei log prima di condividerli.
-
-No file is automatically removed, quarantined or repaired. Signature updates are
-an explicit menu action; SecCheck never resets rkhunter's file-property baseline.
-
-Follow-ups also retain the exact files listed in rkhunter's `/dev` warnings,
-record their properties and show current users when optional **psmisc/fuser** is
-available. Observed usage and familiar names do not automatically close a warning.
-
-Le verifiche aggiuntive mostrano anche i file segnalati in `/dev`, le proprietà
-e i programmi che li usano. Per quest'ultima verifica serve il pacchetto facoltativo
-**psmisc**. Il nome del file o l'uso da parte di un programma non provano che sia sicuro.
-
-## AUR project maintenance / Manutenzione dei progetti AUR
-
-This separate module is included in full scans. It queries the official AUR RPC
-over HTTPS, sending the names of installed **foreign packages** (`pacman -Qm`).
-Those packages are not necessarily from AUR. `--offline` skips these online queries
-and leaves this module unavailable. The three local modules can still run.
-
-The public package page supplies co-maintainers when the RPC omits that field.
-An unavailable page, invalid metadata, failed request or mismatching maintainer
-between page and RPC leaves coverage partial. No login, build script download,
-package execution or AUR helper is used. See [metadata sources](docs/AUR_HEALTH.md).
-
-| Signal / Segnale | Meaning / Significato |
-| --- | --- |
-| Update available / Versione disponibile | Installed version is behind the AUR recipe, compared using `vercmp`; VCS versions can be dynamic |
-| Flagged out of date / Segnalato non aggiornato | AUR's user-submitted flag, not a vulnerability diagnosis |
-| Orphan / Orfano | No primary AUR maintainer; unrelated to unused local dependencies |
-| No recipe change for 365 days / Ricetta ferma da 365 giorni | A review prompt; stable software is not automatically abandoned |
-| Unlisted / Non presente | No exact AUR match; a local/custom package may never have been on AUR |
-| Disappeared / Non più presente | An earlier SecCheck snapshot saw it on AUR; now it is absent from a valid response |
-| Maintainer or co-maintainer change / Cambio di gestione | Compared with the preceding complete snapshot; a change is not proof of danger |
-
-The first successful scan records a **baseline**, not a trusted-owner approval.
-It cannot discover all changes before installation or before SecCheck was first run.
-Private snapshots live in `/var/lib/seccheck/aur-maintainers.json`. Only a complete
-scan atomically updates that file. Failed/partial/offline runs preserve it, and a
-lock prevents concurrent updates. Each run keeps its own observations and findings.
-Changes are observed between scans, not monitored continuously.
-
-AUR maintenance is menu option **5**. SecCheck no longer includes the campaign-specific
-Atomic Arch scanner or its `--scan aur` / `--aur-path` options.
-
-Install only packages you need and review the PKGBUILD, associated install scripts
-and changes before building or updating. Maintenance metadata cannot certify a
-package or its build instructions. More than **50 installed packages confirmed in
-AUR** triggers an inventory-review suggestion. This is a reminder chosen by SecCheck,
-not a security threshold; unlisted foreign packages do not count toward it.
-
-Installa solo ciò che ti serve e controlla PKGBUILD, file .install e modifiche prima
-di compilare o aggiornare. Oltre 50 pacchetti riconosciuti su AUR compare un invito
-a rivederli: non significa che siano pericolosi né che sotto quella soglia siano sicuri.
-
-La prima scansione completa registra una **fotografia iniziale**, senza certificare
-l'affidabilità dei maintainer. Le successive segnalano cambi del responsabile e
-aggiunte/rimozioni di co-maintainer. Non viene inventato uno storico precedente.
-Gli errori di rete non diventano falsi pacchetti rimossi né azzerano lo storico.
-
-Bounds: 2,000 foreign packages, batches of 50, up to one page per package base when
-needed, 2 MiB per response and a 300-second module timeout. Exceeding a bound makes
-coverage partial. The report states counts and the 365-day age threshold; this does
-not establish the upstream project's activity or responsiveness.
-
-## Limits / Limiti
-
-This is a live-system assistant, not a forensic acquisition environment. A running
-rootkit may hide artifacts. It cannot rule out past execution or data theft, and
-matching local package records does not prove that those packages were trustworthy.
-
-## Development and validation
+## Development
 
 ```bash
 bash -n seccheck.sh seccheck_test.sh
+shellcheck --severity=warning seccheck.sh seccheck_test.sh
 bash seccheck_test.sh
 ```
 
-Development tests use Python 3's standard library and temporary inert fixtures.
-They cover failure handling, evidence separation, upstream output formats, static
-AUR reading, language/CLI behavior, narrow output and private reports. No test runs
-real scanners, changes installed packages or deletes production logs.
-
-Before release, test on Arch and at least one derivative: full/individual scans,
-real scanner versions, missing tools, interrupted/offline runs, sudo language retention,
-report permissions and a normal package update. Preserve fixture
-outputs for any newly observed upstream format. Demo success is not native validation.
-
-MIT — Klod Cripta.
+Tests use temporary files and inert scanner commands. License: [MIT](LICENSE).
+External scanner implementations are not bundled.

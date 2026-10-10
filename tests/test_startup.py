@@ -85,8 +85,32 @@ chmod +x "$SC_TEST_DIR/bin/pacfile"
         self.assertNotIn('Installare con pacman', out)
         self.assertFalse((self.folder / 'transaction').exists())
 
+    def test_startup_requires_only_the_security_tools(self):
+        self.command('pacfile', 'exit 0\n')
+        (self.bindir / 'python3').unlink()
+        (self.bindir / 'curl').unlink()
+        out = self.interactive('sc_main --lang it --ascii', '0\n')
+        self.assertIn('Strumenti pronti', out)
+        self.assertNotIn('python', out)
+        self.assertNotIn('curl', out)
+        self.assertNotIn('Installare con pacman', out)
+
     def test_demo_does_not_start_dependency_installation(self):
         out = self.interactive('sc_main --lang it --ascii --demo clean', '')
         self.assertIn('DEMO', out)
         self.assertNotIn('Installare con pacman', out)
         self.assertFalse((self.folder / 'transaction').exists())
+
+    def test_manual_report_is_reachable_without_findings_or_followup_consent(self):
+        out = self.interactive('''sc_reset rkhunter; SC_LANG=it; sc_ui_init
+SC_RUN_DIR="$SC_TEST_DIR"
+sc_module_set rkhunter partial unfinished
+sc_add_diagnostic rkhunter scanner_error PRIVATE-DIAGNOSTIC
+sc_assess; sc_save_report
+sc_run_followups() { printf 'UNEXPECTED-FOLLOWUPS\\n'; }
+sc_offer_followups
+''', 'm\n3\n0\n0\n')
+        self.assertIn('PRIVATE-DIAGNOSTIC', out)
+        self.assertIn(str(self.folder / 'report.txt'), out)
+        self.assertNotIn('UNEXPECTED-FOLLOWUPS', out)
+        self.assertIn('PRIVATE-DIAGNOSTIC', (self.folder / 'report.txt').read_text())

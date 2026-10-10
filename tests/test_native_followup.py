@@ -124,7 +124,10 @@ printf 'RESULT|%s\\n' "${SC_F_PRIORITY[0]}"
         self.assertIn('Salva il lavoro', out)
         self.assertIn('riavvia', out)
         self.assertIn('KRNL-5830', out)
-        self.assertIn('Reboot of system is most likely needed', out)
+        self.assertNotIn('Reboot of system is most likely needed', out)
+        technical = self.shell('sc_reset lynis; SC_LANG=it; sc_ui_init; '
+                               'sc_parse_lynis "$SC_TEST_DIR/lynis.dat"; sc_render_details 0 0 1')
+        self.assertIn('Reboot of system is most likely needed', technical)
         self.assertIn('RESULT|review', out)
         self.assertNotIn('Usalo per chiedere aiuto', out)
 
@@ -136,4 +139,4 @@ printf 'RESULT|%s\\n' "${SC_F_PRIORITY[0]}"
 sc_parse_lynis "$SC_TEST_DIR/lynis.dat"; sc_render_details
 ''')
         self.assertNotIn('Salva il lavoro', out)
-        self.assertIn('Unrecognized kernel warning', out)
+        self.assertIn('rapporto tecnico', out)

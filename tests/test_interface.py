@@ -21,7 +21,8 @@ class InterfaceTests(SecCheckCase):
         self.assertEqual(version.stdout.strip(), 'SecCheck 2.0.0')
         help_result = self.cli('--lang', 'it', '--help')
         self.assertEqual(help_result.returncode, 0)
-        self.assertIn('integrity|aur-health', help_result.stdout)
+        self.assertIn('--scan full|rkhunter|lynis|integrity', help_result.stdout)
+        self.assertNotIn('aur-health', help_result.stdout)
         self.assertNotIn('--aur-path', help_result.stdout)
         self.assertIn('Uso:', help_result.stdout)
 
@@ -51,7 +52,7 @@ class InterfaceTests(SecCheckCase):
         result = self.cli('--lang', 'it', '--demo', 'urgent')
         self.assertIn('URGENTE', result.stdout)
         self.assertIn('INCOMPLETA', result.stdout)
-        self.assertIn('3/4', result.stdout)
+        self.assertIn('2/3', result.stdout)
         self.assertNotIn('SISTEMA SICURO', result.stdout)
 
     def test_ascii_output_fits_narrow_and_wide_terminals(self):
@@ -149,14 +150,6 @@ class InterfaceTests(SecCheckCase):
         self.assertIn('rkh_file_match', (folder / 'checks.tsv').read_text())
         self.assertEqual((folder / 'checks.tsv').stat().st_mode & 0o777, 0o600)
 
-    def test_aur_maintenance_advice_has_matching_summary_guidance(self):
-        out = self.shell('sc_reset aur-health; SC_LANG=en; SC_ASCII=1; SC_NO_COLOR=1; sc_ui_init\n'
-                         'sc_module_set aur-health completed ""\n'
-                         'sc_add_finding aur-health maintenance suggestion observation demo health_inactive "days=400"\n'
-                         'sc_assess; sc_render_summary')
-        self.assertIn('Read each package or configuration suggestion.', out)
-        self.assertNotIn('completed checks found configuration improvements', out)
-
     def test_signature_update_exit_two_is_success(self):
         path = self.command('rkhunter', 'exit 2\n')
         out = self.shell('SC_LANG=en; SC_RUN_DIR="$SC_TEST_DIR"\n'
@@ -171,12 +164,11 @@ class InterfaceTests(SecCheckCase):
         self.assertIn('failed', out)
         self.assertTrue(out.endswith('|1'))
 
-    def test_sudo_retains_language_scan_and_display_network_flags(self):
+    def test_sudo_retains_language_scan_and_display_flags(self):
         path = self.command('sudo', 'printf "%s\\n" "$@"\n')
-        out = self.shell('SC_LANG=it; SC_SCAN=aur-health; SC_ASCII=1; SC_NO_COLOR=1; SC_OFFLINE=1\n'
+        out = self.shell('SC_LANG=it; SC_SCAN=integrity; SC_ASCII=1; SC_NO_COLOR=1\n'
                          'sc_elevate scan', PATH=path)
-        self.assertIn('--lang\nit\n--scan\naur-health', out)
-        self.assertIn('--offline', out)
+        self.assertIn('--lang\nit\n--scan\nintegrity', out)
         self.assertIn('--ascii', out)
         self.assertIn('--no-color', out)
 

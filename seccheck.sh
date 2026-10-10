@@ -4,7 +4,7 @@
 # Sourcing this file defines functions only: no traps, privilege changes or I/O.
 
 SC_VERSION=2.0.0
-SC_ALL_MODULES='rkhunter lynis integrity aur-health'
+SC_ALL_MODULES='rkhunter lynis integrity'
 
 # ---- Evidence model ---------------------------------------------------------
 sc_text() {
@@ -32,16 +32,15 @@ sc_reset() {
         SC_MODULE_VERSION[$module]=''
     done
     for module in ${1:-$SC_ALL_MODULES}; do
-        case $module in rkhunter|lynis|integrity|aur-health) SC_SELECTED+=("$module");; *) return 2;; esac
+        case $module in rkhunter|lynis|integrity) SC_SELECTED+=("$module");; *) return 2;; esac
     done
     SC_INCOMPLETE=1 SC_COMPLETED=0 SC_URGENT=0 SC_REVIEW=0 SC_SUGGESTIONS=0 SC_INFO=0
     SC_ASSESSMENT=unknown
-    SC_HEALTH_NOTE=''
 }
 
 sc_module_set() {
     local module=$1 status=$2 reason=${3-}
-    case $module in rkhunter|lynis|integrity|aur-health) ;; *) return 2;; esac
+    case $module in rkhunter|lynis|integrity) ;; *) return 2;; esac
     case $status in not-run|running|completed|partial|failed|skipped) ;; *) return 2;; esac
     SC_MODULE_STATUS[$module]=$status
     SC_MODULE_REASON[$module]=$reason
@@ -59,7 +58,7 @@ sc_add_diagnostic() {
 
 sc_add_finding() {
     local module=$1 kind=$2 priority=$3 confidence=$4 object=$5 key=$6 evidence=$7 i
-    case $module in rkhunter|lynis|integrity|aur-health) ;; *) return 2;; esac
+    case $module in rkhunter|lynis|integrity) ;; *) return 2;; esac
     case $priority in urgent|review|suggestion|info) ;; *) return 2;; esac
     object=$(sc_text "$object")
     evidence=$(sc_text "$evidence")
@@ -93,7 +92,6 @@ sc_assess() {
     done
     if ((SC_URGENT)); then SC_ASSESSMENT=urgent
     elif ((SC_REVIEW)); then SC_ASSESSMENT=review
-    elif ((SC_SUGGESTIONS)); then SC_ASSESSMENT=advice
     elif ((SC_INCOMPLETE)); then SC_ASSESSMENT=unknown
     else SC_ASSESSMENT=clear
     fi
@@ -745,394 +743,86 @@ sc_run_integrity() {
     SC_SCOPE+=("integrity: pacman metadata + paccheck SHA-256 against local package MTREE; includes backup files; excludes NoExtract/NoUpgrade")
 }
 
-# ---- Online AUR project health: optional Python stdlib + curl ---------------
-sc_run_aur_health() {
-    SC_HEALTH_NOTE=''
-    if [[ ${SC_OFFLINE:-0} == 1 ]]; then sc_module_set aur-health skipped offline; return 0; fi
-    local tool rc priority key object evidence state note
-    for tool in python3 curl pacman vercmp; do
-        if ! command -v "$tool" >/dev/null; then sc_module_set aur-health skipped missing_health_tools; return 0; fi
-    done
-    sc_module_set aur-health running ''
-    SC_MODULE_VERSION[aur-health]='AUR RPC v5 + public package page'
-    # This path is internal; the CLI deliberately offers no arbitrary root-state path.
-    local state_dir=${SC_STATE_DIR:-/var/lib/seccheck}
-    if [[ -L $state_dir ]]; then sc_module_set aur-health failed health_state; return 0; fi
-    if [[ ! -e $state_dir ]]; then (umask 077; mkdir -- "$state_dir") || { sc_module_set aur-health failed health_state; return 0; }; fi
-    if [[ ! -d $state_dir || $(stat -c '%u' -- "$state_dir") != "$EUID" ]]; then
-        sc_module_set aur-health failed health_state; return 0
-    fi
-    chmod 700 -- "$state_dir" || { sc_module_set aur-health failed health_state; return 0; }
-    timeout --kill-after=5s 300s python3 -I - "$SC_RUN_DIR" "$state_dir" > "$SC_RUN_DIR/aur-health.stdout" 2> "$SC_RUN_DIR/aur-health.stderr" <<'PY'
-import fcntl
-import json
-import os
-import pathlib
-import re
-import subprocess
-import sys
-import tempfile
-import time
-import urllib.parse
-from email.utils import parsedate_to_datetime
-from html.parser import HTMLParser
-
-run, state = map(pathlib.Path, sys.argv[1:])
-os.umask(0o077)
-started = time.monotonic()
-now = int(time.time())
-partial = False
-findings = []
-notes = []
-diagnostics = []
-baseline_note = 'health_not_updated'
-next_request = started
-requests_stopped = False
-package_re = re.compile(r'[A-Za-z0-9@_+.-]{1,255}\Z')
-user_re = re.compile(r'[A-Za-z0-9_.+@-]{1,255}\Z')
-
-def issue(key, name, evidence, priority='review'):
-    findings.append((priority, key, name, evidence))
-
-def load_json(path):
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > 8388608:
-        raise ValueError('invalid JSON file')
-    return json.loads(path.read_text())
-
-def text(value):
-    return ''.join(c if c.isprintable() else '?' for c in str(value))
-
-class RequestError(ValueError):
-    pass
-
-def http_response(headers_path):
-    status, headers = 0, {}
-    if not headers_path.exists(): return status, headers
-    with headers_path.open('rb') as stream: raw = stream.read(65537)
-    if len(raw) > 65536: raise ValueError('AUR response headers exceed 64 KiB')
-    for line in raw.decode('iso-8859-1').splitlines():
-        match = re.match(r'HTTP/\S+\s+(\d{3})(?:\s|$)', line)
-        if match:
-            # A proxy CONNECT response can precede the actual HTTP response.
-            status, headers = int(match[1]), {}
-        elif ':' in line:
-            key, value = line.split(':', 1)
-            headers[key.lower().strip()] = value.strip()
-    return status, headers
-
-def retry_delay(value):
-    # Respect Retry-After seconds and HTTP dates. Missing/invalid values use a
-    # conservative fallback; never shorten a long server-requested delay.
-    if value.isascii() and value.isdecimal():
-        digits = value.lstrip('0') or '0'
-        # A huge valid integer still requests a long wait; do not let Python's
-        # integer conversion limit turn it into an ignored Retry-After value.
-        if len(digits) > 9: return float('inf')
-        return max(5, int(digits))
-    try:
-        stamp = parsedate_to_datetime(value)
-        if stamp.tzinfo is not None: return max(5, stamp.timestamp() - time.time())
-    except (ValueError, TypeError, OverflowError):
-        pass
-    return 5
-
-def fetch(url, stem):
-    global next_request, requests_stopped
-    if requests_stopped: raise RequestError('AUR requests stopped for this scan')
-    delay = 0
-    for attempt in range(2):
-        wait = max(0, delay, next_request - time.monotonic())
-        if time.monotonic() + wait + 23 > started + 260:
-            requests_stopped = True
-            diagnostics.append(('health_budget', 'request-budget=260s; URL=' + url))
-            raise RequestError('request budget exhausted')
-        if wait: time.sleep(wait)
-        next_request = time.monotonic() + 1.1
-        attempt_stem = stem if attempt == 0 else stem + '.retry1'
-        (run / (attempt_stem + '.request.txt')).write_text(url + '\n')
-        headers_path = run / (attempt_stem + '.headers')
-        try:
-            result = subprocess.run(['curl', '--disable', '--proto', '=https', '--tlsv1.2',
-                '--fail', '--silent', '--show-error', '--connect-timeout', '5', '--max-time', '20',
-                '--max-filesize', '2097152', '--dump-header', str(headers_path),
-                '--header', 'Accept-Language: en-US',
-                '--user-agent', 'SecCheck/2.0 (AUR maintenance check)', url],
-                capture_output=True, timeout=23, env=dict(os.environ, LC_ALL='C'))
-            output, errors, code = result.stdout, result.stderr, result.returncode
-        except subprocess.TimeoutExpired as error:
-            output, errors, code = error.stdout or b'', error.stderr or b'', 28
-            errors += b'\nSecCheck: curl exceeded the 23-second process deadline\n'
-        (run / (attempt_stem + '.raw')).write_bytes(output[:2097152])
-        (run / (attempt_stem + '.stderr')).write_bytes(errors[:65536])
-        status, headers = http_response(headers_path)
-        detail = 'curl=' + str(code) + '; HTTP=' + str(status) + '; URL=' + url + \
-                 '; log=' + attempt_stem + '.stderr; ' + \
-                 text(errors.decode('utf-8', errors='replace').strip())[:500]
-        if status == 429:
-            value = headers.get('retry-after', '')
-            delay = retry_delay(value)
-            detail += '; Retry-After=' + text(value or 'absent')[:256]
-            # One retry at most. A long cooldown or another 429 stops all further
-            # AUR requests in this run, including requests for other packages.
-            if attempt == 0 and delay <= 30 and time.monotonic() + delay + 23 <= started + 260:
-                notes.append('AUR HTTP 429: wait=' + str(delay) + 's; URL=' + url)
-                continue
-            requests_stopped = True
-            diagnostics.append(('health_rate_limited', detail))
-            raise RequestError(detail)
-        if not code and len(output) <= 2097152:
-            if attempt:
-                diagnostics.append(('health_retry', 'URL=' + url + '; wait=' + str(delay) +
-                                    's; logs=' + stem + '.stderr / ' + attempt_stem + '.raw'))
-            return output.decode('utf-8')
-        key = {5: 'health_dns', 6: 'health_dns', 7: 'health_connection', 22: 'health_http',
-               28: 'health_timeout', 35: 'health_tls', 60: 'health_tls'}.get(code, 'health_fetch')
-        if len(output) > 2097152: detail += '; response exceeds 2 MiB'
-        diagnostics.append((key, detail))
-        raise RequestError(detail)
-
-class MaintainerRow(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.in_row = self.in_cell = False
-        self.parts = []
-        self.rows = 0
-        self.cells = self.closed_cells = self.closed_rows = 0
-        self.malformed = False
-    def handle_starttag(self, tag, attrs):
-        if tag == 'tr' and 'pkgmaint' in dict(attrs).get('class', '').split():
-            if self.in_row: self.malformed = True
-            self.in_row = True
-            self.rows += 1
-        elif tag == 'td' and self.in_row:
-            if self.in_cell: self.malformed = True
-            self.in_cell = True
-            self.cells += 1
-    def handle_endtag(self, tag):
-        if tag == 'tr':
-            if self.in_row:
-                if self.in_cell: self.malformed = True
-                self.closed_rows += 1
-            self.in_row = self.in_cell = False
-        elif tag == 'td' and self.in_row:
-            if not self.in_cell: self.malformed = True
-            else: self.closed_cells += 1
-            self.in_cell = False
-    def handle_data(self, data):
-        if self.in_cell: self.parts.append(data)
-
-def co_from_page(html, maintainer):
-    parser = MaintainerRow()
-    parser.feed(html)
-    parser.close()
-    value = ' '.join(''.join(parser.parts).split())
-    match = re.fullmatch(r'([^\s()]+)(?:\s*\(([^()]*)\))?', value)
-    if parser.malformed or parser.rows != 1 or parser.closed_rows != 1 or parser.cells != 1 or \
-            parser.closed_cells != 1 or parser.in_row or parser.in_cell or not match or match[1] != (maintainer or 'None'):
-        raise ValueError('maintainer page unavailable or disagrees with RPC')
-    result = [] if not match[2] else [x.strip() for x in match[2].split(',')]
-    if not all(user_re.fullmatch(x) for x in result):
-        raise ValueError('unknown co-maintainer format')
-    return sorted(set(result))
-
-def validate_package(pkg):
-    for key in ('Name', 'PackageBase', 'Version', 'Maintainer', 'LastModified', 'OutOfDate'):
-        if key not in pkg: raise ValueError('missing metadata field: ' + key)
-    for key in ('Name', 'PackageBase'):
-        if not isinstance(pkg[key], str) or not package_re.fullmatch(pkg[key]):
-            raise ValueError('invalid package identity')
-    if not isinstance(pkg['Version'], str) or not re.fullmatch(r'[^\s\x00-\x1f\x7f]{1,255}', pkg['Version']):
-        raise ValueError('invalid version')
-    if pkg['Maintainer'] is not None and (not isinstance(pkg['Maintainer'], str) or not user_re.fullmatch(pkg['Maintainer'])):
-        raise ValueError('invalid maintainer')
-    if type(pkg['LastModified']) is not int or not 0 < pkg['LastModified'] <= now + 86400:
-        raise ValueError('invalid last-modified timestamp')
-    if pkg['OutOfDate'] is not None and (type(pkg['OutOfDate']) is not int or not 0 < pkg['OutOfDate'] <= now + 86400):
-        raise ValueError('invalid out-of-date timestamp')
-    if 'CoMaintainers' in pkg and (not isinstance(pkg['CoMaintainers'], list) or
-            not all(isinstance(x, str) and user_re.fullmatch(x) for x in pkg['CoMaintainers'])):
-        raise ValueError('invalid co-maintainers')
-
-def execute():
-    global partial, baseline_note
-    lock = os.open(state / 'aur-health.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise ValueError('another AUR health scan is updating the baseline')
-    baseline_path = state / 'aur-maintainers.json'
-    baseline = {'schema': 1, 'observed_at': 0, 'packages': {}}
-    first = not baseline_path.exists()
-    if baseline_path.is_symlink(): raise ValueError('unsafe baseline')
-    if first: baseline_note = 'health_no_baseline'
-    if not first:
-        baseline = load_json(baseline_path)
-        if baseline.get('schema') != 1 or not isinstance(baseline.get('packages'), dict):
-            raise ValueError('invalid baseline schema')
-        for name, previous in baseline['packages'].items():
-            if not package_re.fullmatch(name) or not isinstance(previous, dict):
-                raise ValueError('invalid baseline package')
-            if previous.get('maintainer') is not None and not user_re.fullmatch(previous['maintainer']):
-                raise ValueError('invalid baseline maintainer')
-            if not isinstance(previous.get('co_maintainers'), list) or not all(
-                    isinstance(x, str) and user_re.fullmatch(x) for x in previous['co_maintainers']):
-                raise ValueError('invalid baseline co-maintainers')
-        baseline_note = 'health_preserved'
-    result = subprocess.run(['pacman', '-Qm'], capture_output=True, text=True, timeout=30,
-                            env=dict(os.environ, LC_ALL='C'))
-    (run / 'aur-health-inventory.txt').write_text(result.stdout)
-    if result.returncode not in (0, 1) or result.stderr or (result.returncode == 1 and result.stdout.strip()):
-        raise ValueError('foreign package inventory failed')
-    installed = {}
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if len(fields) != 2 or not package_re.fullmatch(fields[0]):
-            raise ValueError('unknown inventory format')
-        installed[fields[0]] = fields[1]
-    names = sorted(installed)
-    if len(names) > 2000:
-        partial = True
-        notes.append('inventory exceeds 2000-package limit')
-    current = dict(baseline['packages'])
-    observed = {}
-    page_cache = {}
-    page_serial = 0
-    for start in range(0, min(len(names), 2000), 50):
-        batch = names[start:start+50]
-        try:
-            data = json.loads(fetch('https://aur.archlinux.org/rpc/v5/info?' +
-                urllib.parse.urlencode([('arg[]', name) for name in batch]), 'aur-rpc.' + str(start//50)))
-            if not isinstance(data, dict) or data.get('version') != 5 or data.get('type') != 'multiinfo' or \
-                    not isinstance(data.get('results'), list) or data.get('resultcount') != len(data['results']):
-                raise ValueError('invalid AUR RPC response')
-            packages = {}
-            for pkg in data['results']:
-                validate_package(pkg)
-                if pkg['Name'] not in batch or pkg['Name'] in packages:
-                    raise ValueError('unexpected or duplicate package identity')
-                packages[pkg['Name']] = pkg
-        except (ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
-            partial = True; notes.append(text(error))
-            if not isinstance(error, RequestError):
-                diagnostics.append(('health_data_error', 'AUR RPC: ' + text(error)))
-            continue
-        for name in batch:
-            if name not in packages:
-                issue('health_removed' if name in baseline['packages'] else 'health_unlisted', name,
-                      'No exact match in a valid AUR RPC response',
-                      'review' if name in baseline['packages'] else 'suggestion')
-                continue
-            pkg = packages[name]
-            maintainer = pkg['Maintainer']
-            if maintainer is None: issue('health_orphan', name, 'AUR Maintainer=null')
-            if pkg['OutOfDate'] is not None: issue('health_flagged', name, 'AUR OutOfDate=' + str(pkg['OutOfDate']))
-            days = max(0, (now - pkg['LastModified']) // 86400)
-            if days >= 365: issue('health_inactive', name, 'LastModified=' + str(pkg['LastModified']) + '; days=' + str(days), 'suggestion')
-            compared = subprocess.run(['vercmp', installed[name], pkg['Version']], capture_output=True, text=True, timeout=5)
-            if compared.returncode or compared.stdout.strip() not in ('-1', '0', '1'):
-                partial = True; notes.append('version comparison failed: ' + name)
-            elif compared.stdout.strip() == '-1':
-                issue('health_upgrade', name, 'installed=' + installed[name] + '; AUR=' + pkg['Version'], 'suggestion')
-            previous = baseline['packages'].get(name)
-            if previous and previous['maintainer'] != maintainer:
-                issue('health_maintainer', name, str(previous['maintainer']) + ' -> ' + str(maintainer) +
-                      '; previous observation=' + str(previous.get('seen_at', baseline.get('observed_at', '?'))))
-            try:
-                if 'CoMaintainers' in pkg:
-                    co = sorted(set(pkg['CoMaintainers']))
-                else:
-                    if pkg['PackageBase'] not in page_cache:
-                        # Count attempts, not successful cache entries: a failed
-                        # request must never have its logs overwritten by the next.
-                        stem = 'aur-page.' + str(page_serial)
-                        page_serial += 1
-                        page_cache[pkg['PackageBase']] = fetch('https://aur.archlinux.org/packages/' +
-                            urllib.parse.quote(name, safe=''), stem)
-                    co = co_from_page(page_cache[pkg['PackageBase']], maintainer)
-                item = dict(base=pkg['PackageBase'], maintainer=maintainer, co_maintainers=co, seen_at=now)
-                previous = baseline['packages'].get(name)
-                if previous:
-                    period = '; previous observation=' + str(previous.get('seen_at', baseline.get('observed_at', '?')))
-                    added = sorted(set(co) - set(previous['co_maintainers']))
-                    removed = sorted(set(previous['co_maintainers']) - set(co))
-                    if added: issue('health_co_added', name, ', '.join(added) + period)
-                    if removed: issue('health_co_removed', name, ', '.join(removed) + period)
-                current[name] = observed[name] = item
-            except (ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
-                partial = True; notes.append(name + ': ' + text(error))
-                if not isinstance(error, RequestError):
-                    diagnostics.append(('health_data_error', name + ': ' + text(error)))
-                observed[name] = dict(base=pkg['PackageBase'], maintainer=maintainer, co_maintainers=None, seen_at=now)
-    if len(observed) > 50:
-        issue('health_many', 'AUR', 'AUR matches=' + str(len(observed)) + '; reminder-threshold=50', 'suggestion')
-    (run / 'aur-health-observed.json').write_text(json.dumps(dict(observed_at=now, packages=observed), indent=2) + '\n')
-    if not partial:
-        # A complete snapshot is atomically replaced, never merged from a failed query.
-        fd, temporary = tempfile.mkstemp(prefix='aur-maintainers.', suffix='.next', dir=state)
-        with os.fdopen(fd, 'w') as stream:
-            json.dump(dict(schema=1, observed_at=now, packages=current), stream, indent=2)
-            stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
-        os.replace(temporary, baseline_path)
-    notes.append('foreign=' + str(len(names)) + '; AUR observed=' + str(len(observed)) +
-                 '; age-threshold=365 days; max-packages=2000; request-budget=260s; request-spacing=1.1s; max-429-retries=1; baseline=' +
-                 (('not-created' if first else 'preserved') if partial else 'updated'))
-    return baseline_note if partial else ('health_baseline' if first else 'health_compared')
-
-try:
-    note = execute()
-except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
-    partial = True; note = baseline_note; notes.append(text(error))
-    if not isinstance(error, RequestError): diagnostics.append(('health_data_error', text(error)))
-with (run / 'aur-health-findings.tsv').open('w') as stream:
-    for finding in findings: stream.write('\t'.join(map(text, finding)) + '\n')
-(run / 'aur-health-scope.txt').write_text('\n'.join(map(text, notes)) + '\n')
-with (run / 'aur-health-diagnostics.tsv').open('w') as stream:
-    for diagnostic in diagnostics: stream.write('\t'.join(map(text, diagnostic)) + '\n')
-print(('partial' if partial else 'completed') + '\t' + note)
-PY
-    rc=$?; SC_MODULE_RC[aur-health]=$rc
-    if [[ -r $SC_RUN_DIR/aur-health-diagnostics.tsv ]]; then
-        while IFS=$'\t' read -r key evidence; do
-            [[ -z $key ]] || sc_add_diagnostic aur-health "$key" "$evidence"
-        done < "$SC_RUN_DIR/aur-health-diagnostics.tsv"
-    fi
-    if [[ -f $SC_RUN_DIR/aur-health-findings.tsv ]]; then
-        while IFS=$'\t' read -r priority key object evidence; do
-            [[ -n $key ]] && sc_add_finding aur-health maintenance "$priority" observation "$object" "$key" "$evidence"
-        done < "$SC_RUN_DIR/aur-health-findings.tsv"
-    fi
-    if ((rc)) || [[ -s $SC_RUN_DIR/aur-health.stderr ]]; then
-        sc_module_set aur-health partial health_unavailable
-        SC_HEALTH_NOTE=health_not_updated
-        sc_add_diagnostic aur-health scanner_error "exit=$rc; aur-health.stderr"
-    else
-        IFS=$'\t' read -r state note < "$SC_RUN_DIR/aur-health.stdout"
-        SC_HEALTH_NOTE=$note
-        if [[ $state == completed ]]; then sc_module_set aur-health completed ''
-        else sc_module_set aur-health partial health_unavailable; fi
-    fi
-    if [[ -r $SC_RUN_DIR/aur-health-scope.txt ]]; then
-        while IFS= read -r evidence; do SC_SCOPE+=("AUR health: $(sc_text "$evidence")"); done < "$SC_RUN_DIR/aur-health-scope.txt"
-    fi
-    return 0
-}
-
 # ---- Language: authored explanations, never translate upstream evidence -----
 sc_t() {
     local en it
     case $1 in
-        health_build) en="Read the PKGBUILD (build instructions), .install files and changes before installing or updating."; it="Prima di installare o aggiornare, leggi PKGBUILD (istruzioni di compilazione), file .install e modifiche.";;
-        health_sources) en="Check download sources. If unsure, ask for help before running the build."; it="Verifica le fonti dei download. Se hai dubbi, chiedi aiuto prima di compilare.";;
+        context_accounts) en="These files record accounts, passwords and groups. They change when users or services are added."; it="Questi file registrano account, password e gruppi. Cambiano quando aggiungi utenti o servizi.";;
+        action_accounts) en="Check accounts you do not recognize. Restoring the package defaults can remove your access."; it="Controlla gli account che non riconosci. Ripristinare gli originali può farti perdere l’accesso.";;
+        context_dns) en="These settings control network name resolution. Your connection may update them."; it="Queste impostazioni traducono i nomi di rete in indirizzi. La connessione può aggiornarle.";;
+        action_dns) en="Compare the settings with those provided by your network or chosen by you."; it="Confronta le impostazioni con quelle della tua rete o scelte da te.";;
+        context_repositories) en="These settings choose the software repositories and download servers."; it="Queste impostazioni scelgono i repository del software e i server di download.";;
+        action_repositories) en="Check that the repositories and mirrors are the ones you chose. Keep signature verification enabled."; it="Verifica che repository e mirror siano quelli scelti da te. Mantieni attiva la verifica delle firme.";;
+        context_login) en="These rules control login and administrator access."; it="Queste regole controllano l’accesso al computer e i permessi di amministratore.";;
+        action_login) en="Review the changes carefully. Incorrect rules can block login."; it="Verifica con attenzione le modifiche. Regole sbagliate possono bloccare l’accesso.";;
+        context_preferences) en="This file records enabled languages or login shells. System setup can change it."; it="Questo file registra le lingue o le shell abilitate. La configurazione del sistema può cambiarlo.";;
+        action_preferences) en="Compare it with your chosen languages or shells before restoring it."; it="Confrontalo con le lingue o le shell che hai scelto prima di ripristinarlo.";;
+        lynis_audit) en="Lynis suggests an extra check for known package vulnerabilities."; it="Lynis suggerisce un controllo aggiuntivo delle vulnerabilità note dei pacchetti.";;
+        lynis_action_audit) en="Consider arch-audit for this check. A vulnerability advisory is different from an infection."; it="Valuta arch-audit per questo controllo. Una vulnerabilità segnalata è diversa da un’infezione.";;
+        lynis_updates) en="Lynis reminds you to update this rolling-release system."; it="Lynis ricorda di aggiornare il sistema, che riceve aggiornamenti continui.";;
+        lynis_action_updates) en="Read your distribution update notices, then perform a full system update."; it="Leggi gli avvisi della tua distribuzione, poi esegui un aggiornamento completo.";;
+        lynis_services) en="Service isolation could be strengthened."; it="L’isolamento dei servizi potrebbe essere migliorato.";;
+        lynis_action_services) en="Review individual services with systemd-analyze security. Apply changes only when compatible with the service."; it="Valuta i singoli servizi con systemd-analyze security. Applica solo modifiche compatibili con il servizio.";;
+        lynis_dumps) en="Crash reports may contain private data from program memory."; it="I rapporti di arresto dei programmi possono contenere dati privati della memoria.";;
+        lynis_action_dumps) en="Consider whether you need these diagnostic reports before changing their settings."; it="Valuta se ti servono questi rapporti diagnostici prima di cambiarne le impostazioni.";;
+        lynis_passwords) en="Password storage settings could be strengthened."; it="Le impostazioni di protezione delle password potrebbero essere migliorate.";;
+        lynis_password_strength) en="Lynis suggests checking the strength of new passwords."; it="Lynis suggerisce di verificare la robustezza delle nuove password.";;
+        lynis_action_passwords) en="Review the authentication settings with your distribution guidance; an incorrect change can block login."; it="Valuta le impostazioni di autenticazione con le istruzioni della distribuzione: un errore può bloccare l’accesso.";;
+        lynis_password_expiry) en="Lynis suggests password expiry or age rules."; it="Lynis propone regole sulla scadenza o sull’età delle password.";;
+        lynis_action_password_expiry) en="Decide whether those rules suit the accounts on this computer."; it="Valuta se queste regole sono adatte agli account di questo computer.";;
+        lynis_permissions) en="Default file access rules could be more restrictive."; it="Le regole di accesso ai file potrebbero essere più restrittive.";;
+        lynis_action_permissions) en="Review the affected file and its use before changing permissions."; it="Valuta il file interessato e il suo uso prima di cambiare i permessi.";;
+        lynis_storage) en="A separate /var partition can limit disruption when logs fill the disk."; it="Una partizione separata per /var può limitare i problemi quando i log riempiono il disco.";;
+        lynis_action_storage) en="This is a disk-layout choice for a future installation or planned migration."; it="È una scelta per una futura installazione o una migrazione pianificata.";;
+        lynis_unused) en="Lynis suggests disabling hardware or network features you do not use."; it="Lynis propone di disabilitare funzioni hardware o di rete inutilizzate.";;
+        lynis_action_unused) en="Check the exact feature named in the technical report before disabling it."; it="Verifica la funzione indicata nel rapporto tecnico prima di disabilitarla.";;
+        lynis_dns) en="Lynis suggests checking the computer name and network name settings."; it="Lynis suggerisce di verificare il nome del computer e le impostazioni dei nomi di rete.";;
+        lynis_remote_logs) en="Logs could also be stored on another computer."; it="I log potrebbero essere conservati anche su un altro computer.";;
+        lynis_action_optional) en="This is an optional configuration choice. Consider your needs before adding tools or services."; it="È una scelta di configurazione facoltativa. Valuta le tue esigenze prima di aggiungere strumenti o servizi.";;
+        lynis_deleted) en="Some processes may still use files removed during an update."; it="Alcuni processi potrebbero usare file rimossi durante un aggiornamento.";;
+        lynis_action_deleted) en="Save your work and check whether the affected application or computer needs restarting."; it="Salva il lavoro e valuta se riavviare l’applicazione interessata o il computer.";;
+        lynis_banner) en="Lynis suggests a message warning against unauthorized login."; it="Lynis propone un messaggio che avverte contro gli accessi non autorizzati.";;
+        lynis_logging) en="Lynis suggests collecting more activity records for later investigation."; it="Lynis propone di registrare più informazioni sulle attività per analisi successive.";;
+        lynis_certificates) en="Some certificates may need an expiry check."; it="Alcuni certificati richiedono un controllo della scadenza.";;
+        lynis_action_certificates) en="Identify the certificate and the service that uses it before renewing it."; it="Identifica il certificato e il servizio che lo usa prima di rinnovarlo.";;
+        lynis_monitor) en="Lynis suggests monitoring changes to important files over time."; it="Lynis suggerisce di seguire nel tempo le modifiche ai file importanti.";;
+        lynis_action_monitor) en="SecCheck checks files now. Continuous monitoring requires a separate tool and a verified reference."; it="SecCheck controlla i file attuali. Il monitoraggio continuo richiede uno strumento dedicato e un riferimento verificato.";;
+        lynis_automation) en="Lynis checks whether system administration is automated."; it="Lynis verifica se l’amministrazione del sistema è automatizzata.";;
+        lynis_kernel) en="Some kernel settings differ from the Lynis reference profile."; it="Alcune impostazioni del kernel differiscono dal profilo di riferimento di Lynis.";;
+        lynis_action_kernel) en="Review each setting before changing it: a desktop may need different values from a server."; it="Valuta ogni impostazione prima di modificarla: un desktop può avere esigenze diverse da un server.";;
+        lynis_compilers) en="Lynis suggests limiting who can compile programs."; it="Lynis propone di limitare chi può compilare programmi.";;
+        lynis_action_compilers) en="Consider your use of development tools before restricting them."; it="Valuta il tuo uso degli strumenti di sviluppo prima di limitarli.";;
+        lynis_unmapped) en="This Lynis message has no specific explanation yet. The original text is in the technical report."; it="Questo avviso di Lynis non ha ancora una spiegazione specifica. Il testo originale è nel rapporto tecnico.";;
+        menu_single) en="Individual checks"; it="Controlli singoli";;
+        main_tools) en="Tools"; it="Strumenti";;
+        analysis_choices) en="y  Analyze for me   m  Show warnings   0  Finish"; it="s  Analizza per me   m  Mostrami gli avvisi   0  Termina";;
+        optional_count) en="Optional improvements"; it="Miglioramenti facoltativi";;
+        checks_count) en="Checks completed"; it="Controlli conclusi";;
+        scan_count) en="Items to verify"; it="Elementi da verificare";;
+        analysis_explained) en="Explained"; it="Chiariti";;
+        rkh_baseline_short) en="The initial file snapshot (rkhunter.dat) is missing: no historical comparison."; it="Manca la fotografia iniziale dei file (rkhunter.dat): confronto storico non eseguito.";;
+        partial_short) en="Not all tests completed. The technical report has the cause."; it="Non tutti i test sono riusciti. La causa è nel rapporto tecnico.";;
+        attention) en="ITEMS STILL TO CHECK"; it="ELEMENTI ANCORA DA VERIFICARE";;
+        suggestions) en="OPTIONAL IMPROVEMENTS"; it="MIGLIORAMENTI FACOLTATIVI";;
+        explained_results) en="EXPLAINED WARNINGS"; it="AVVISI CHIARITI";;
+        other_results) en="OTHER RESULTS"; it="ALTRI RISULTATI";;
+        other_menu) en="1  Improvements   2  Explained warnings   3  Short report   4  Technical report   0  Back"; it="1  Miglioramenti   2  Avvisi chiariti   3  Rapporto breve   4  Rapporto tecnico   0  Indietro";;
+        back) en="Back"; it="Indietro";;
+        no_filtered_findings) en="No items in this section."; it="Nessun elemento in questa sezione.";;
+        saved_report) en="Report saved. Open Other results to read it."; it="Rapporto salvato. Lo trovi in Altri risultati.";;
+        next_final_review) en="Some changes remain unexplained. Open Remaining items for the next steps."; it="Alcune modifiche restano da chiarire. In Elementi rimasti trovi cosa fare.";;
+        next_final_clear) en="No action needed for the warnings checked."; it="Per gli avvisi verificati non serve intervenire.";;
+        followup_lynis) en="Preparing explanations for the configuration warnings..."; it="Preparo le spiegazioni degli avvisi di configurazione...";;
         rkh_prerequisite_detail) en="Prerequisite failure reported by rkhunter:"; it="Causa segnalata da rkhunter:";;
         rkh_baseline_missing) en="The initial file snapshot (rkhunter.dat) is missing or empty. rkhunter cannot compare changes over time."; it="Manca la prima fotografia dei file (rkhunter.dat), oppure è vuota. rkhunter non può confrontare le modifiche nel tempo.";;
         rkh_baseline_help) en="--propupd records the current files as a reference. Use it only after checking their contents and source."; it="--propupd registra i file attuali come riferimento. Va usato solo dopo averne verificato contenuto e provenienza.";;
         rkh_optional) en="Optional or unconfigured tests excluded from this scan:"; it="Test facoltativi o non configurati esclusi da questa scansione:";;
         rkh_optional_short) en="Optional tests excluded; reasons in the report."; it="Test facoltativi esclusi; motivi nel rapporto.";;
-        followup_question) en="Would you like me to run the follow-up checks for you? [y/N]"; it="Vuoi che faccia io le verifiche del caso al posto tuo? [s/N]";;
+        followup_question) en="Would you like me to run the follow-up checks for you?"; it="Vuoi che faccia io le verifiche del caso al posto tuo?";;
         followups) en="ADDITIONAL CHECKS"; it="VERIFICHE AGGIUNTIVE";;
         followup_rootkit) en="Checking reported files and SSH settings..."; it="Verifico i file segnalati e le impostazioni SSH...";;
         followup_files) en="Comparing reported files with local package records..."; it="Confronto i file segnalati con i dati dei pacchetti...";;
-        followup_manual) en="This finding cannot be resolved automatically. Follow the advice above or ask for help using the report."; it="Questa segnalazione richiede una valutazione. Segui il consiglio sopra o chiedi aiuto usando il rapporto.";;
+        followup_manual) en="Automatic verification is not available for this finding."; it="Per questo avviso non è disponibile una verifica automatica.";;
         followup_pending) en="Still to assess"; it="Voci ancora da chiarire";;
         followup_group_note) en="File differences are grouped by path in Findings. Suggestions are separate."; it="Nei Dettagli le differenze sullo stesso file sono riunite. I consigli sono separati.";;
         grouped_findings) en="Warnings for this path"; it="Avvisi su questo percorso";;
@@ -1145,7 +835,7 @@ sc_t() {
         field_integrity_missing) en="missing file"; it="file assente";;
         followup_interrupted) en="Additional checks were interrupted. Unfinished findings remain open."; it="Verifiche aggiuntive interrotte. Gli avvisi non verificati restano aperti.";;
         rkh_ssh_flagged) en="The SSH executable has an unresolved warning. It was not run."; it="L’eseguibile SSH ha una segnalazione aperta. Non è stato avviato.";;
-        followup_finished) en="Checks finished. Open Findings to see what remains and why."; it="Verifiche terminate. Nei Dettagli trovi ciò che resta da chiarire e perché.";;
+        followup_finished) en="Checks finished. You can view the remaining items."; it="Verifiche terminate. Puoi aprire gli elementi rimasti.";;
         integrity_rechecked) en="The file now matches the local package content, permissions and ownership. The original difference is kept in the report."; it="Ora contenuto, permessi e proprietario coincidono con il pacchetto locale. La differenza iniziale resta nel rapporto.";;
         integrity_hash_only) en="Content matches the local package. This does not explain the original timestamp, size or path warning."; it="Il contenuto coincide con il pacchetto locale. La differenza iniziale di data, dimensione o percorso resta da chiarire.";;
         integrity_special) en="This is a directory, link or other nonregular path. Its current properties were read; the difference still needs assessment."; it="È una cartella, un collegamento o un altro tipo di file speciale. Ho letto le proprietà; la differenza resta da valutare.";;
@@ -1153,7 +843,7 @@ sc_t() {
         welcome) en='Choose what to check'; it="Scegli cosa controllare";;
         menu_scans) en='SCANS'; it="SCANSIONI";;
         menu_tools) en='TOOLS'; it="STRUMENTI";;
-        full_includes) en='Runs all four checks: options 2, 3, 4 and 5.'; it="Esegue tutti e quattro i controlli: voci 2, 3, 4 e 5.";;
+        full_includes) en="rkhunter, Lynis and installed package files."; it="rkhunter, Lynis e file dei pacchetti installati.";;
         tools_separate) en='Dependency installation, signature updates and the demo are separate actions.'; it="Installazione dipendenze, aggiornamento firme ed esempio sono azioni separate.";;
         menu_full) en='Full scan'; it="Scansione completa";;
         menu_rkhunter) en='Rootkit indicators'; it="Indicatori di rootkit";;
@@ -1174,15 +864,15 @@ sc_t() {
         unknown) en='RESULT UNDETERMINED'; it="ESITO NON DETERMINABILE";;
         clear) en='NO UNRESOLVED FINDINGS'; it="NESSUNA SEGNALAZIONE APERTA";;
         why_urgent) en="A strong warning needs expert investigation."; it="Un segnale importante richiede una verifica esperta.";;
-        why_review) en="Some changes still need an explanation. This does not establish an infection."; it="Alcune modifiche restano da chiarire. Non significa che il PC sia infetto.";;
+        why_review) en="Warnings need checking; they do not confirm an infection."; it="Gli avvisi restano da verificare: non confermano un’infezione.";;
         why_advice) en="Maintenance or configuration can be improved."; it="Puoi migliorare manutenzione e configurazione.";;
-        why_unknown) en="Some checks are missing. See the reason beside each module."; it="Mancano alcuni controlli. La causa è indicata accanto al modulo.";;
-        why_clear) en="No unresolved findings in the checks performed."; it="Nessuna segnalazione aperta nei controlli eseguiti.";;
+        why_unknown) en="Some checks could not finish."; it="Alcuni controlli non sono riusciti.";;
+        why_clear) en="No unresolved warnings in the completed checks."; it="Nessun avviso aperto nei controlli conclusi.";;
         coverage) en="CHECKS PERFORMED"; it="CONTROLLI ESEGUITI";;
         complete) en="COMPLETED"; it="COMPLETATI";;
         incomplete) en='INCOMPLETE'; it="INCOMPLETA";;
         scope_selected) en="Selected modules only."; it="Solo i controlli scelti.";;
-        scope_full) en='All four modules selected. Each has its own detection limits.'; it="Selezionati tutti e quattro i moduli. Ogni controllo ha limiti propri.";;
+        scope_full) en="All three security checks selected."; it="Selezionati tutti e tre i controlli di sicurezza.";;
         coverage_note) en="Completed checks, not a security score."; it="Controlli conclusi, non un punteggio di sicurezza.";;
         module) en='Module'; it="Modulo";;
         status) en='Status'; it="Stato";;
@@ -1190,41 +880,7 @@ sc_t() {
         rkhunter) en='Rootkit / rkhunter'; it="Rootkit / rkhunter";;
         lynis) en='Configuration / Lynis'; it="Configurazione / Lynis";;
         integrity) en='Package integrity'; it="Integrità pacchetti";;
-        aur-health) en='AUR / Project health'; it="AUR / Manutenzione";;
-        health_network) en="AUR maintenance uses the internet and sends package names to AUR. --offline skips it."; it="La manutenzione AUR usa internet e invia ad AUR i nomi dei pacchetti. --offline la salta.";;
-        health_guide) en='AUR: INFORMED USE'; it="AUR: USO CONSAPEVOLE";;
-        health_habits) en="Install only what you need."; it="Installa solo ciò che ti serve.";;
-        health_limits) en="Good maintenance does not guarantee safe code."; it="Una buona manutenzione non garantisce che il codice sia sicuro.";;
-        health_many) en="Over 50 AUR packages: do you still need them all? Check dependencies before removing any. 50 is a reminder, not a security threshold."; it="Oltre 50 pacchetti AUR: ti servono tutti? Controlla le dipendenze prima di rimuoverli. 50 è un promemoria, non un limite di sicurezza.";;
         confidence_explained) en="Explained by additional checks"; it="Chiarito dalle verifiche aggiuntive";;
-        offline) en='Online AUR metadata skipped (--offline).'; it="Dati AUR online non consultati (--offline).";;
-        missing_health_tools) en='AUR metadata requires python, curl, pacman and vercmp.'; it="I dati AUR richiedono python, curl, pacman e vercmp.";;
-        health_state) en='Cannot safely open the private AUR comparison history.'; it="Impossibile aprire in sicurezza lo storico privato dei confronti AUR.";;
-        health_unavailable) en="Some AUR data is unavailable. Try again later; details are in the report."; it="Alcuni dati AUR non sono disponibili. Riprova più tardi; dettagli nel rapporto.";;
-        health_no_baseline) en='No AUR baseline was created: this first scan was incomplete. Maintainer changes can be compared after a complete snapshot is saved.'; it="La prima scansione AUR è incompleta: non è stata creata una base per i confronti. Per seguire i cambi di maintainer serve prima una scansione completa.";;
-        health_preserved) en='The previous AUR baseline was preserved. This incomplete scan did not replace the history used to compare maintainers.'; it="La precedente base AUR è stata conservata. Questa scansione incompleta non ha sostituito lo storico usato per confrontare i maintainer.";;
-        health_not_updated) en='The AUR baseline update could not be confirmed. Resolve the history or execution error before comparing maintainer changes.'; it="Non è stato possibile confermare il salvataggio della base AUR. Risolvi il problema dello storico o dell'esecuzione prima di confrontare i cambi di maintainer.";;
-        health_dns) en='The AUR address could not be resolved. Check DNS and the connection; this does not mean a package was removed.'; it="Impossibile risolvere l'indirizzo di AUR. Controlla DNS e connessione; questo errore non significa che un pacchetto sia stato rimosso.";;
-        health_connection) en='The connection to AUR failed. Check connectivity and any proxy settings, then repeat this module.'; it="Connessione ad AUR non riuscita. Controlla la rete e le eventuali impostazioni proxy, poi ripeti questo modulo.";;
-        health_timeout) en='An AUR request timed out. Repeat this module when the service is reachable; its error log is listed below.'; it="Una richiesta AUR ha superato il tempo disponibile. Ripeti questo modulo quando il servizio è raggiungibile; sotto è indicato il log dell'errore.";;
-        health_http) en='AUR returned an HTTP error. Read the code below: 429 means too many requests; 5xx indicates a server error. Repeat the module later.'; it="AUR ha risposto con un errore HTTP. Leggi il codice qui sotto: 429 indica troppe richieste; 5xx un errore del server. Ripeti il modulo più tardi.";;
-        health_rate_limited) en='Requests stopped: AUR is limiting access (HTTP 429). The requested wait is too long for this scan, or one retry was insufficient. Repeat this module later; no package or maintainer removal is inferred from this error.'; it="Richieste interrotte: AUR sta limitando gli accessi (HTTP 429). L'attesa richiesta supera il limite di questa scansione oppure un nuovo tentativo non è bastato. Ripeti questo modulo più tardi; questo errore non indica la rimozione di pacchetti o maintainer.";;
-        health_retry) en='AUR temporarily limited requests. SecCheck waited and the next attempt succeeded:'; it="AUR ha limitato temporaneamente le richieste. SecCheck ha atteso e il tentativo successivo è riuscito:";;
-        health_budget) en='The online time limit was reached. Remaining AUR requests were stopped and coverage is partial.'; it="È stato raggiunto il limite di tempo per i controlli online. Le richieste AUR rimanenti sono state interrotte e la copertura è parziale.";;
-        health_tls) en='The secure AUR connection could not be verified. Check the clock, certificates and proxy; do not disable certificate checks.'; it="Impossibile verificare la connessione sicura ad AUR. Controlla orologio, certificati e proxy; mantieni attiva la verifica dei certificati.";;
-        health_fetch) en='An AUR request failed. The URL, command exit code and original error below identify the failed operation.'; it="Una richiesta AUR è fallita. URL, codice di uscita ed errore originale qui sotto identificano l'operazione non riuscita.";;
-        health_data_error) en='Some AUR data could not be read or validated. Unknown maintainer information is not treated as a removal.'; it="Alcuni dati AUR non sono leggibili o verificabili. Un maintainer non verificato non viene considerato rimosso.";;
-        health_baseline) en='First AUR snapshot recorded. Earlier maintainer changes are unknown; comparison starts with the next successful AUR check (option 5 or a full scan).'; it="Registrata la prima fotografia AUR. I cambi di maintainer precedenti sono sconosciuti; il confronto inizia dal prossimo controllo AUR riuscito (voce 5 o scansione completa).";;
-        health_compared) en='AUR maintainers compared with the preceding successful AUR check. Changes are observations, not evidence of malicious intent.'; it="Maintainer confrontati con il precedente controllo AUR riuscito. I cambi sono osservazioni, non prove di intenzioni malevole.";;
-        health_orphan) en="No primary maintainer is listed. Check support or look for a maintained alternative. This is not the same as an unused dependency."; it="Manca un responsabile principale (maintainer). Verifica il supporto o valuta un’alternativa mantenuta. Non significa dipendenza inutilizzata.";;
-        health_flagged) en="A user marked the build recipe out of date. Check the AUR page; this is not a confirmed vulnerability."; it="Un utente segnala che la ricetta non è aggiornata. Controlla la pagina AUR: non è una vulnerabilità confermata.";;
-        health_upgrade) en="AUR lists a newer version. Read the build changes before updating; VCS versions can be dynamic."; it="AUR indica una versione più nuova. Leggi le modifiche prima di aggiornare; le versioni VCS possono essere dinamiche.";;
-        health_inactive) en="The recipe has not changed for 365 days. This does not prove abandonment: check the original project."; it="La ricetta non cambia da almeno 365 giorni. Non significa abbandono: controlla l’attività del progetto originale.";;
-        health_unlisted) en="No exact match in AUR. It may be a custom, renamed or removed package; check its origin."; it="Nessuna corrispondenza in AUR. Potrebbe essere un pacchetto personalizzato, rinominato o rimosso: controllane l’origine.";;
-        health_removed) en="Previously found in AUR, now absent. Check for a rename, merge or removal."; it="Prima era presente in AUR, ora non risulta. Controlla se è stato rinominato, unito o rimosso.";;
-        health_maintainer) en="The primary maintainer changed. Handovers can be legitimate; review recent build changes."; it="È cambiato il responsabile principale. Può essere un passaggio legittimo: leggi le ultime modifiche alla ricetta.";;
-        health_co_added) en="New co-maintainers appeared. Review the handover and build changes; this alone is not a threat."; it="Sono stati aggiunti collaboratori alla manutenzione. Controlla passaggio di gestione e modifiche: da solo non è un allarme.";;
-        health_co_removed) en="Some co-maintainers are no longer listed. Check whether the package still has support."; it="Alcuni collaboratori non risultano più presenti. Verifica che il pacchetto abbia ancora supporto.";;
         not-run) en='Not selected'; it="Non selezionato";;
         running) en='Running'; it="In corso";;
         completed) en='Completed'; it="Completato";;
@@ -1234,14 +890,14 @@ sc_t() {
         missing_rkhunter) en='Install rkhunter to run this module.'; it="Installa rkhunter per eseguire questo modulo.";;
         missing_lynis) en='Install lynis to run this module.'; it="Installa lynis per eseguire questo modulo.";;
         missing_pacman) en='pacman is unavailable.'; it="pacman non disponibile.";;
-        missing_paccheck) en="SHA-256 unavailable: install pacutils (menu 6), then repeat menu 4."; it="Manca pacutils: installalo dalla voce 6, poi ripeti la voce 4 per verificare il contenuto dei file.";;
+        missing_paccheck) en="pacutils is missing: install it from Tools, then repeat the check."; it="Manca pacutils: installalo da Strumenti, poi ripeti il controllo.";;
         rkh_limited) en="Some rkhunter tests could not run. The report lists the causes."; it="Alcuni test di rkhunter non sono riusciti. Le cause sono nel rapporto.";;
         rkh_skipped) en='Tests not performed by rkhunter. They may require optional tools, services or different settings; this result does not cover them:'; it="Test non eseguiti da rkhunter. Possono dipendere da strumenti facoltativi, servizi o impostazioni; questo risultato non li copre:";;
         rkh_legacy_grep) en='Compatibility notice: rkhunter uses the obsolete egrep name, which still forwards to grep -E. This notice alone does not invalidate the scan:'; it="Avviso di compatibilità: rkhunter usa il nome obsoleto egrep, che richiama ancora grep -E. Questo avviso da solo non invalida la scansione:";;
-        rkh_regex) en="rkhunter/grep compatibility problem: check distribution updates, then repeat menu 2."; it="Problema di compatibilità tra rkhunter e grep. Verifica gli aggiornamenti della distribuzione, poi ripeti la voce 2.";;
+        rkh_regex) en="rkhunter and grep are incompatible. Check updates, then repeat the rootkit check."; it="rkhunter e grep non sono compatibili. Verifica gli aggiornamenti, poi ripeti il controllo rootkit.";;
         rkh_unparsed) en='rkhunter returned a warning exit code, but no corresponding finding was recognized. Read the original logs before drawing conclusions:'; it="rkhunter ha restituito un codice di avviso, ma non è stata riconosciuta la segnalazione corrispondente. Leggi i log originali prima di trarre conclusioni:";;
         scanner_error) en='The scanner reported an execution or reading problem. Original message:'; it="Lo scanner ha segnalato un problema di esecuzione o lettura. Messaggio originale:";;
-        diagnostics_more) en='Further diagnostic details are included in the full report (option 2).'; it="Altri dettagli diagnostici sono nel rapporto completo (voce 2).";;
+        diagnostics_more) en="More details are in the technical report."; it="Altri dettagli sono nel rapporto tecnico.";;
         check_details) en='Warnings, read errors or an unknown output format reduced coverage. Read the raw logs.'; it="Avvisi, errori di lettura o un formato inatteso hanno limitato il controllo. Consulta i log originali.";;
         unfinished) en='The scanner did not report a normal completion.'; it="Lo scanner non ha comunicato una conclusione regolare.";;
         command_failed) en='The command failed without usable results.'; it="Il comando non ha prodotto risultati utilizzabili.";;
@@ -1249,7 +905,7 @@ sc_t() {
         interrupted) en='Interrupted by the user.'; it="Interrotto dall'utente.";;
         next) en='WHAT TO DO NEXT'; it="COSA FARE ADESSO";;
         next_urgent) en="Ask an expert to investigate the urgent findings before changing files."; it="Chiedi aiuto esperto per i segnali urgenti prima di modificare i file.";;
-        next_review) en="Use the additional checks below. Unexplained changes remain in Findings."; it="Usa le verifiche aggiuntive qui sotto. Le modifiche ancora dubbie restano nei Dettagli.";;
+        next_review) en="Use automatic analysis to investigate the warnings."; it="Usa l’analisi automatica per approfondire gli avvisi.";;
         next_advice) en="Read each package or configuration suggestion."; it="Leggi i consigli nei Dettagli e valuta quelli utili al tuo computer.";;
         next_unknown) en="Resolve the listed missing checks, then repeat the scan."; it="Risolvi le cause indicate e ripeti i controlli mancanti.";;
         next_clear) en="Keep the system updated and review software before installing it."; it="Mantieni il sistema aggiornato e controlla il software prima di installarlo.";;
@@ -1273,14 +929,15 @@ sc_t() {
         explained_note) en='These stay in the details and report. A matching local package record does not certify the package source or the whole system.'; it="Restano consultabili nei dettagli e nel rapporto. La corrispondenza con i dati locali non certifica la provenienza del pacchetto o l'intero sistema.";;
         priority_info) en='Explained'; it="Spiegato";;
         page) en='Page'; it="Pagina";;
-        pages_menu) en='1  Next page   2  Previous page   0  Back to result'; it="1  Pagina successiva   2  Pagina precedente   0  Torna al risultato";;
+        pages_menu) en='1  Next page   2  Previous page   3  Technical report   0  Back'; it="1  Pagina successiva   2  Pagina precedente   3  Rapporto tecnico   0  Torna";;
+        empty_pages_menu) en='3  Technical report   0  Back'; it="3  Rapporto tecnico   0  Torna";;
         rkh_prerequisite) en="rkhunter prerequisites need attention. See the exact cause in the report."; it="Un requisito di rkhunter manca o non funziona. La causa precisa è nel rapporto.";;
         rkh_baseline_notice) en='This is a reminder about rkhunter baseline updates, not a detected threat. Do not use --propupd to silence warnings before checking their cause.'; it="Questo è un promemoria sull'aggiornamento della base di confronto di rkhunter, non una minaccia rilevata. Non usare --propupd per azzerare gli avvisi prima di averne verificato la causa.";;
         rkh_context_limited) en="Some additional checks were unavailable. See the finding details."; it="Alcune verifiche aggiuntive non sono riuscite. Vedi i dettagli delle segnalazioni.";;
         rkh_script) en="rkhunter found a script where it expected a program. Legitimate packages can contain scripts."; it="rkhunter ha trovato uno script dove si aspettava un programma. Anche i pacchetti legittimi possono contenerne.";;
         rkh_file_warning) en='rkhunter flagged this file. SecCheck checks whether it belongs to an installed package and whether its contents match the recorded SHA-256.'; it="rkhunter ha segnalato questo file. SecCheck verifica a quale pacchetto appartiene e se il contenuto coincide con lo SHA-256 registrato.";;
         rkh_path_unreadable) en='Control characters or ambiguous text separators prevent reliable identification of the reported path. No automatic file verification was attempted. Inspect the original rkhunter log before acting on the path.'; it="Caratteri di controllo o separatori ambigui nel testo impediscono di identificare con certezza il percorso segnalato. La verifica automatica del file non è stata tentata. Consulta il log originale di rkhunter prima di intervenire sul percorso.";;
-        rkh_hidden_file) en='The name starts with a dot, which hides it in ordinary file listings. That is common on Linux and does not by itself indicate malware. SecCheck checks its package record when available.'; it="Il nome inizia con un punto e quindi il file è nascosto negli elenchi ordinari. È comune su Linux e non indica da solo malware. SecCheck verifica i dati del pacchetto, quando disponibili.";;
+        rkh_hidden_file) en="A name starting with a dot is hidden; this alone is not a threat."; it="Un nome che inizia con un punto è nascosto; da solo non indica una minaccia.";;
         rkh_hidden_directory) en='rkhunter reported a hidden directory. Applications commonly create these. A directory cannot be verified with a single file hash: check which application created it and examine its contents without running them.'; it="rkhunter segnala una cartella nascosta. Molte applicazioni ne creano: una cartella non si verifica con lo SHA-256 di un singolo file. Controlla quale applicazione l'ha creata e il suo contenuto, senza eseguirlo.";;
         rkh_hidden_summary) en='rkhunter reported hidden files without individually readable details. Their names are needed before a file verification can be made.'; it="rkhunter segnala file nascosti, ma non sono disponibili dettagli leggibili sui singoli file. Servono i percorsi per verificarli.";;
         rkh_dev) en='rkhunter found unexpected file types under /dev, where devices and runtime data live. Some applications create legitimate files there; this warning needs the listed paths and their origin.'; it="rkhunter segnala tipi di file inattesi in /dev, dove si trovano dispositivi e dati creati durante il funzionamento. Alcune applicazioni vi creano file legittimi: occorre verificarne percorsi e origine.";;
@@ -1306,7 +963,7 @@ sc_t() {
         rkh_action_dev_idle) en='Close your applications normally and repeat the scan. If the unexplained file remains, use its path and properties to ask for help before deleting it.'; it="Chiudi normalmente le applicazioni e ripeti la scansione. Se il file resta senza una spiegazione, chiedi aiuto indicando percorso e proprietà prima di eliminarlo.";;
         rkh_ssh_root) en="This concerns remote administrator access through SSH. The effective setting needs checking."; it="Riguarda l’accesso remoto come amministratore tramite SSH. Va controllata l’impostazione effettiva.";;
         rkh_ssh_protocol) en="This old rkhunter test concerns SSH protocol 1. The installed server version can clarify it."; it="Questo vecchio test riguarda il protocollo SSH 1. La versione del server installato può chiarire l’avviso.";;
-        rkh_file_match) en="Content, type, permissions and owner match the local package record. This explains this warning."; it="Contenuto, tipo, permessi e proprietario coincidono con il pacchetto locale. Questo chiarisce l’avviso.";;
+        rkh_file_match) en="Content and file properties match the local package record."; it="Contenuto e proprietà coincidono con il pacchetto locale.";;
         rkh_file_changed) en="The content differs from the local package. The warning remains open."; it="Il contenuto è diverso da quello registrato dal pacchetto. La segnalazione resta aperta.";;
         rkh_file_metadata) en="Content matches, but permissions or ownership differ."; it="Il contenuto coincide, ma permessi o proprietario sono diversi.";;
         rkh_file_unknown) en="The exact file could not be verified using package data."; it="Non ho ottenuto dati sufficienti per verificare questo file.";;
@@ -1323,13 +980,13 @@ sc_t() {
         rkh_ssh_not_started) en="The SSH command is missing or its preliminary checks could not finish."; it="Il comando SSH manca oppure le sue verifiche preliminari non sono terminate.";;
         rkh_ssh_hostkeys) en="SSH could not load usable server keys."; it="SSH non ha trovato chiavi del server utilizzabili.";;
         rkh_ssh_config_only) en="The configuration was read without checking server keys. This does not check whether the service is running."; it="Letta la configurazione senza controllare le chiavi del server. Questo test non verifica se il servizio sia attivo.";;
-        rkh_action_explained) en="No action needed for this warning alone."; it="Non serve intervenire per questo singolo avviso.";;
-        rkh_action_file) en="If you did not make this change, ask for help using the report before replacing the file."; it="Se non hai fatto tu questa modifica, chiedi aiuto usando il rapporto prima di sostituire il file.";;
+        rkh_action_explained) en="No action needed for this warning."; it="Per questo avviso non serve intervenire.";;
+        rkh_action_file) en="Check why the file changed before restoring it."; it="Verifica perché il file è cambiato prima di ripristinarlo.";;
         rkh_action_unowned) en="Identify the application that created it. Being hidden or unowned is not a reason to delete it."; it="Verifica quale applicazione lo ha creato. Essere nascosto o fuori dai pacchetti non basta per eliminarlo.";;
-        rkh_action_tools) en='Install pacutils using option 6, then repeat this scan.'; it="Installa pacutils dalla voce 6, poi ripeti questo controllo.";;
-        rkh_action_ssh) en='If direct root access is unnecessary, consider PermitRootLogin no. Check Include and Match rules before changing the configuration; validate it with sshd -t and keep an existing remote session open.'; it="Se l'accesso diretto come root non ti serve, valuta PermitRootLogin no. Controlla le regole Include e Match prima di modificare la configurazione; validala con sshd -t e mantieni aperta un'eventuale sessione remota.";;
+        rkh_action_tools) en="Install pacutils from Tools, then repeat the check."; it="Installa pacutils da Strumenti, poi ripeti il controllo.";;
+        rkh_action_ssh) en="If remote root login is not needed, consider disabling it. Validate changes before closing a remote session."; it="Se non ti serve l’accesso remoto come root, valuta di disabilitarlo. Verifica le modifiche prima di chiudere una sessione remota.";;
         rkh_action_ssh_disabled) en='No change is needed for the general root-login setting. If you use SSH, also review any connection-specific Match rules.'; it="Non serve cambiare l'impostazione generale del login di root. Se usi SSH, controlla anche le eventuali regole Match per connessioni specifiche.";;
-        rkh_action_unknown) en="The report contains the original warning and the failed check. Use it to ask for help."; it="Nel rapporto trovi avviso originale e verifica tentata. Usalo per chiedere aiuto.";;
+        rkh_action_unknown) en="Read the explanation or ask for help with the technical report."; it="Leggi la spiegazione o chiedi aiuto con il rapporto tecnico.";;
         rkh_signature) en='rkhunter reported a possible rootkit signature. It remains unresolved even if package checks pass. Check the exact signature and its context with expert help.'; it="rkhunter segnala una possibile firma di rootkit. Resta da chiarire anche se i pacchetti superano il controllo. Verifica la firma precisa e il contesto con aiuto esperto.";;
         rkh_properties) en='rkhunter found changed file properties. Updates can cause this, but the change needs checking. Do not reset its baseline before investigating.'; it="rkhunter ha trovato proprietà di file cambiate. Gli aggiornamenti possono causarlo, ma occorre verificare. Non azzerare la base di confronto prima di approfondire.";;
         rkh_warning) en='rkhunter raised an alert. Read the specific evidence: hidden files and configuration warnings can have legitimate explanations.'; it="rkhunter ha prodotto un avviso. Leggi la prova specifica: file nascosti e avvisi di configurazione possono avere spiegazioni legittime.";;
@@ -1352,13 +1009,14 @@ sc_t() {
         integrity_no_results) en='The tool produced no interpretable file result or package summary. SecCheck cannot count this as a completed comparison.'; it="Lo strumento non ha prodotto risultati interpretabili sui file o riepiloghi dei pacchetti. SecCheck non può considerarlo un confronto completato.";;
         integrity_exit_unexplained) en='The tool reported a problem through its exit code, but no corresponding file difference was found in the interpreted output. Its original logs need review.'; it="Il codice di uscita dello strumento segnala un problema, ma nei messaggi interpretati non compare una differenza sui file che lo spieghi. Occorre controllare i log originali.";;
         integrity_missing) en="A packaged file is missing. Check exclusions and recent changes before restoring it."; it="Manca un file previsto dal pacchetto. Verifica esclusioni e modifiche recenti prima di ripristinarlo.";;
-        file_config) en='Configuration/backup path: an intentional edit is possible, but must be verified.'; it="Percorso di configurazione o backup: la modifica può essere voluta, ma va verificata.";;
+        file_config) en="Configuration files can change during normal use."; it="I file di configurazione possono cambiare durante l’uso normale.";;
         demo) en='DEMO - INVENTED RESULTS. No system scan was performed.'; it="DEMO - RISULTATI DI ESEMPIO. Nessuna scansione del sistema eseguita.";;
         report) en='Private report'; it="Rapporto privato";;
         report_info) en="Root is needed to read the report. Review private paths before sharing."; it="Il rapporto richiede root. Contiene percorsi privati: controllalo prima di condividerlo.";;
         scope_report) en='TECHNICAL SCOPE / ORIGINAL LOGS'; it="AMBITO TECNICO / LOG ORIGINALI";;
         limits) en="No scan can guarantee a secure system."; it="Nessuna scansione garantisce da sola un sistema sicuro.";;
-        result_menu) en='1  Findings   2  Full report   3  Repeat scan   0  Main menu'; it="1  Dettagli   2  Rapporto   3  Ripeti scansione   0  Menu";;
+        result_menu) en="1  Remaining items   2  Other results   0  Finish"; it="1  Elementi rimasti   2  Altri risultati   0  Termina";;
+        short_report_help) en="Original evidence is available in the technical report."; it="Le prove originali sono disponibili nel rapporto tecnico.";;
         more) en='More findings are available on the following pages and in the full report.'; it="Le altre segnalazioni sono nelle pagine successive e nel rapporto completo.";;
         unsupported) en='Scanning requires Arch Linux or an Arch derivative with pacman.'; it="La scansione richiede Arch Linux o una derivata con pacman.";;
         root) en='This action requires root. SecCheck will request permission through sudo.'; it="Questa azione richiede root. SecCheck chiederà i permessi tramite sudo.";;
@@ -1368,16 +1026,14 @@ sc_t() {
         deps) en='TOOLS AND PURPOSE'; it="STRUMENTI E FUNZIONE";;
         deps_startup) en='STARTUP CHECK'; it="CONTROLLO INIZIALE";;
         deps_explain) en='SecCheck checks which tools are available before you choose a scan.'; it="SecCheck verifica gli strumenti disponibili prima di scegliere una scansione.";;
-        deps_ready) en='Tools ready: all scan dependencies are available.'; it="Strumenti pronti: sono disponibili tutte le dipendenze delle scansioni.";;
+        deps_ready) en="Tools ready: rkhunter, Lynis and pacutils."; it="Strumenti pronti: rkhunter, Lynis e pacutils.";;
         deps_missing) en='Missing packages'; it="Pacchetti mancanti";;
-        deps_continue) en='You can continue. Checks needing missing tools will remain incomplete. Use option 6 to install them later.'; it="Puoi proseguire. I controlli che richiedono gli strumenti mancanti resteranno incompleti. Puoi installarli in seguito dalla voce 6.";;
-        deps_pacutils) en='File contents and automatic verification of rkhunter file warnings (paccheck + pacfile)'; it="Contenuto dei file e verifica automatica degli avvisi di rkhunter (paccheck + pacfile)";;
-        deps_python) en='Read AUR metadata and compare maintainer history'; it="Lettura dei dati AUR e confronto dello storico dei maintainer";;
-        deps_curl) en='HTTPS connection to AUR for maintenance information'; it="Collegamento HTTPS ad AUR per i dati sulla manutenzione";;
+        deps_continue) en="You can continue; checks needing missing tools stay incomplete."; it="Puoi proseguire; i controlli senza strumenti resteranno incompleti.";;
+        deps_pacutils) en="File verification (paccheck + pacfile)."; it="Verifica dei file (paccheck + pacfile).";;
         available) en='available'; it="disponibile";;
         absent) en='missing'; it="mancante";;
         install_question) en='Install the missing packages with pacman? [y/N]'; it="Installare con pacman i pacchetti mancanti? [s/N]";;
-        install_note) en='pacman will show its own transaction confirmation. No AUR helper is used.'; it="pacman mostrerà la propria conferma della transazione. Non viene usato un helper AUR.";;
+        install_note) en="pacman will ask you to confirm the installation."; it="pacman chiederà la conferma dell’installazione.";;
         install_failed) en='Installation did not complete.'; it="Installazione non completata.";;
         signatures_updated) en='rkhunter signatures updated.'; it="Firme di rkhunter aggiornate.";;
         signatures_current) en='rkhunter signatures are already current.'; it="Le firme di rkhunter sono già aggiornate.";;
@@ -1399,22 +1055,19 @@ sc_ascii_text() {
     printf '%s' "$value" | LC_ALL=C tr '\200-\377' '?'
 }
 
-# ---- Petrolio terminal rendering: no cursor tricks, real counts only --------
+# ---- Terminal rendering: no cursor tricks, real counts only --------
 sc_ui_init() {
     SC_WIDTH=${COLUMNS:-80}
     if [[ -t 1 ]] && command -v tput >/dev/null; then SC_WIDTH=$(tput cols 2>/dev/null) || SC_WIDTH=80; fi
     [[ $SC_WIDTH =~ ^[0-9]{1,4}$ ]] || SC_WIDTH=80
     ((SC_WIDTH < 24)) && SC_WIDTH=24
     ((SC_WIDTH > 120)) && SC_WIDTH=120
-    SC_C_PRIMARY='' SC_C_MUTED='' SC_C_RED='' SC_C_AMBER='' SC_C_GREEN='' SC_C_WHITE='' SC_C_RESET='' SC_C_BOLD=''
+    SC_C_PRIMARY='' SC_C_MUTED='' SC_C_RED='' SC_C_AMBER='' SC_C_GREEN='' SC_C_WHITE='' SC_C_RESET='' SC_C_BOLD='' SC_C_ITALIC=''
     if [[ -t 1 && ${TERM:-dumb} != dumb && ${SC_NO_COLOR:-0} == 0 && ! ${NO_COLOR+x} ]]; then
-        SC_C_RESET=$'\e[0m' SC_C_BOLD=$'\e[1m'
-        SC_C_PRIMARY=$'\e[38;5;80m' SC_C_MUTED=$'\e[38;5;109m'
-        SC_C_RED=$'\e[38;5;203m' SC_C_AMBER=$'\e[38;5;222m' SC_C_GREEN=$'\e[38;5;114m'
+        SC_C_RESET=$'\e[0m' SC_C_BOLD=$'\e[1m' SC_C_ITALIC=$'\e[3m'
+        SC_C_PRIMARY=$'\e[38;5;255m' SC_C_MUTED=$'\e[38;5;255m\e[2m'
+        SC_C_RED=$'\e[38;5;203m' SC_C_AMBER=$'\e[38;5;208m' SC_C_GREEN=$'\e[38;5;114m'
         SC_C_WHITE=$'\e[38;5;255m'
-        if [[ ${COLORTERM:-} == truecolor || ${COLORTERM:-} == 24bit ]]; then
-            SC_C_PRIMARY=$'\e[38;2;122;205;216m' SC_C_MUTED=$'\e[38;2;140;168;185m'
-        fi
     fi
     SC_RULE_CHAR='─' SC_BAR_CHAR='━' SC_EMPTY_CHAR='─' SC_DOT='●'
     if [[ ${SC_ASCII:-0} == 1 || ${TERM:-} == dumb || ${LC_ALL:-${LC_CTYPE:-${LANG:-C}}} != *[Uu][Tt][Ff]* ]]; then
@@ -1425,7 +1078,7 @@ sc_ui_init() {
 sc_repeat() { local i; for ((i=0;i<$2;i++)); do printf '%s' "$1"; done; }
 
 sc_line() {
-    local value=${1-} color=${2-} word line='' width=$((SC_WIDTH-4))
+    local value=${1-} color=${2:-$SC_C_WHITE} word line='' width=$((SC_WIDTH-4))
     value=$(sc_text "$value")
     if [[ ${SC_ASCII:-0} == 1 ]]; then value=$(sc_ascii_text "$value"); fi
     local -a words=()
@@ -1446,33 +1099,41 @@ sc_rule() { printf '  %s' "$SC_C_MUTED"; sc_repeat "$SC_RULE_CHAR" "$((SC_WIDTH-
 sc_cell() { printf '%s%*s' "$1" "$(( $2 - ${#1} ))" ''; }
 sc_heading() { printf '\n'; sc_line "$(sc_t "$1")" "${2:-$SC_C_PRIMARY}$SC_C_BOLD"; sc_rule; }
 sc_brand() {
-    printf '\n'
-    if ((SC_WIDTH >= 68)) && [[ ${SC_ASCII:-0} == 0 ]]; then
+    local tl='╭' tr='╮' bl='╰' br='╯' edge='│' line='─' pad=4
+    ((SC_WIDTH >= 27)) || pad=1
+    if [[ ${SC_ASCII:-0} == 1 ]]; then tl='+'; tr='+'; bl='+'; br='+'; edge='|'; line='-'; fi
+    if ((SC_WIDTH >= 55)); then
         local i
         local -a sec=(
-            '███████╗███████╗ ██████╗'
-            '██╔════╝██╔════╝██╔════╝'
-            '███████╗█████╗  ██║     '
-            '╚════██║██╔══╝  ██║     '
-            '███████║███████╗╚██████╗'
-            '╚══════╝╚══════╝ ╚═════╝'
+            ' ___   ____  ____'
+            '|     |     |    '
+            '|___  |___  |    '
+            '    | |     |    '
+            ' ___| |____ |____'
         ) check=(
-            ' ██████╗██╗  ██╗███████╗ ██████╗██╗  ██╗'
-            '██╔════╝██║  ██║██╔════╝██╔════╝██║ ██╔╝'
-            '██║     ███████║█████╗  ██║     █████╔╝ '
-            '██║     ██╔══██║██╔══╝  ██║     ██╔═██╗ '
-            '╚██████╗██║  ██║███████╗╚██████╗██║  ██╗'
-            ' ╚═════╝╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝'
+            ' ____ |   |  ____  ____ |  / '
+            '|     |   | |     |     | /  '
+            '|     |___| |___  |     |<   '
+            '|     |   | |     |     | \  '
+            '|____ |   | |____ |____ |  \ '
         )
-        for ((i=0;i<6;i++)); do
-            printf '  %s%s%s %s%s%s\n' "$SC_C_PRIMARY$SC_C_BOLD" "${sec[i]}" "$SC_C_RESET" "$SC_C_WHITE$SC_C_BOLD" "${check[i]}" "$SC_C_RESET"
+        printf '\n  %s%s' "$SC_C_WHITE" "$tl"; sc_repeat "$line" 51; printf '%s%s\n' "$tr" "$SC_C_RESET"
+        for ((i=0;i<5;i++)); do
+            printf '  %s%s  %s%s %s%s  %s%s%s\n' "$SC_C_WHITE" "$edge" "$SC_C_RED$SC_C_BOLD" "${sec[i]}" "$SC_C_WHITE$SC_C_BOLD" "${check[i]}" "$SC_C_WHITE" "$edge" "$SC_C_RESET"
         done
-        printf '\n'
+        printf '  %s%s' "$SC_C_WHITE" "$bl"; sc_repeat "$line" 51; printf '%s%s\n\n' "$br" "$SC_C_RESET"
     else
-        sc_rule; sc_line 'S E C C H E C K' "$SC_C_PRIMARY$SC_C_BOLD"; sc_rule
+    printf '\n  %s%s' "$SC_C_WHITE" "$tl"; sc_repeat "$line" "$((15+2*pad))"; printf '%s%s\n' "$tr" "$SC_C_RESET"
+    printf '  %s%s%*s%sS E C %sC H E C K%*s%s%s%s\n' "$SC_C_WHITE" "$edge" "$pad" '' "$SC_C_RED$SC_C_BOLD" "$SC_C_WHITE$SC_C_BOLD" "$pad" '' "$SC_C_WHITE" "$edge" "$SC_C_RESET"
+    printf '  %s%s' "$SC_C_WHITE" "$bl"; sc_repeat "$line" "$((15+2*pad))"; printf '%s%s\n\n' "$br" "$SC_C_RESET"
     fi
-    sc_line 'Security & Integrity Checker for Arch Linux' "$SC_C_PRIMARY$SC_C_BOLD"
-    sc_line "v$SC_VERSION | KlodCripta" "$SC_C_WHITE"
+    if ((SC_WIDTH >= 46)); then
+        printf '  %sSecurity%s & Integrity Checker for Arch Linux%s\n' "$SC_C_RED$SC_C_ITALIC" "$SC_C_WHITE$SC_C_ITALIC" "$SC_C_RESET"
+    else
+        sc_line 'Security & Integrity Checker' "$SC_C_RED$SC_C_ITALIC"
+        sc_line 'for Arch Linux' "$SC_C_WHITE$SC_C_ITALIC"
+    fi
+    sc_line "v$SC_VERSION | KlodCripta" "$SC_C_MUTED"
 }
 sc_header() {
     sc_brand; sc_rule; printf '\n'
@@ -1480,7 +1141,7 @@ sc_header() {
 }
 
 sc_status_color() {
-    case $1 in urgent|failed) printf '%s' "$SC_C_RED";; review|advice|partial) printf '%s' "$SC_C_AMBER";;
+    case $1 in urgent|failed) printf '%s' "$SC_C_RED";; review|advice|partial|unknown|skipped) printf '%s' "$SC_C_AMBER";;
         clear|completed) printf '%s' "$SC_C_GREEN";; info|suggestion) printf '%s' "$SC_C_PRIMARY";; *) printf '%s' "$SC_C_MUTED";; esac
 }
 
@@ -1499,7 +1160,7 @@ sc_render_diagnostics() {
     return 0
 }
 
-sc_render_summary() {
+sc_render_technical_summary() {
     local module count i color label bar total=${#SC_SELECTED[@]} urgent=0 review=0 suggestions=0 explained=0
     sc_detail_groups
     for i in "${SC_DETAIL_GROUPS[@]}"; do
@@ -1520,7 +1181,7 @@ sc_render_summary() {
     sc_line "$SC_COMPLETED/$total  $label" "$color"
     bar="$(sc_repeat "$SC_BAR_CHAR" "$SC_COMPLETED")$(sc_repeat "$SC_EMPTY_CHAR" "$((total-SC_COMPLETED))")"
     sc_line "[$bar]" "$color"
-    if ((total < 4)); then sc_line "$(sc_t scope_selected)"; fi
+    if ((total < 3)); then sc_line "$(sc_t scope_selected)"; fi
     printf '\n'
     if ((SC_WIDTH >= 64)); then
         printf '  %s%-24s %-17s %7s%s\n' "$SC_C_MUTED" "$(sc_t module)" "$(sc_t status)" "$(sc_t findings)" "$SC_C_RESET"
@@ -1570,23 +1231,64 @@ sc_render_summary() {
     if ((SC_FOLLOWUPS_DONE)) && [[ $SC_ASSESSMENT != urgent ]]; then sc_line "$(sc_t followup_finished)"
     else sc_line "$(sc_t "next_$SC_ASSESSMENT")"; fi
     sc_line "$(sc_t limits)" "$SC_C_MUTED"
-    if [[ ${SC_MODULE_STATUS[aur-health]} != not-run ]]; then
-        sc_heading health_guide
-        sc_line "- $(sc_t health_habits)"
-        sc_line "- $(sc_t health_build)"
-        sc_line "- $(sc_t health_sources)"
-        sc_line "$(sc_t health_limits)" "$SC_C_MUTED"
-        for i in "${SC_F_KEY[@]}"; do
-            [[ $i == health_many ]] || continue
-            sc_line "$(sc_t health_many)" "$SC_C_AMBER"; break
-        done
+
+}
+
+# The normal screen is a decision, not a log viewer.
+sc_render_summary() {
+    local i module reason urgent=0 review=0 suggestions=0 explained=0 total=${#SC_SELECTED[@]}
+    sc_detail_groups
+    for i in "${SC_DETAIL_GROUPS[@]}"; do
+        i=${i%% *}
+        case ${SC_F_PRIORITY[i]} in
+            urgent) ((urgent+=1));; review) ((review+=1));;
+            suggestion) ((suggestions+=1));; info) ((explained+=1));;
+        esac
+    done
+    sc_heading result
+    sc_line "$SC_DOT $(sc_t "$SC_ASSESSMENT")" "$(sc_status_color "$SC_ASSESSMENT")$SC_C_BOLD"
+    if ((SC_FOLLOWUPS_DONE)); then
+        sc_line "$(sc_t analysis_explained): $explained" "$SC_C_WHITE$SC_C_BOLD"
+        sc_line "$(sc_t followup_pending): $((urgent+review))" "$SC_C_WHITE$SC_C_BOLD"
+    else
+        sc_line "$(sc_t scan_count): $((urgent+review))" "$SC_C_WHITE$SC_C_BOLD"
     fi
+    ((urgent == 0)) || sc_line "$(sc_t priority_urgent): $urgent" "$SC_C_RED$SC_C_BOLD"
+    ((suggestions == 0)) || sc_line "$(sc_t optional_count): $suggestions"
+    if ((SC_INCOMPLETE)); then
+        sc_line "$(sc_t checks_count): $SC_COMPLETED/$total - $(sc_t incomplete)" "$SC_C_AMBER"
+        for module in "${SC_SELECTED[@]}"; do
+            [[ ${SC_MODULE_STATUS[$module]} != completed ]] || continue
+            reason=${SC_MODULE_REASON[$module]}
+            case $reason in
+                rkh_baseline_missing) reason=rkh_baseline_short;;
+                missing_rkhunter|missing_lynis|missing_paccheck|missing_pacman|rkh_regex|interrupted) ;;
+                *) reason=partial_short;;
+            esac
+            sc_line "$module: $(sc_t "$reason")" "$SC_C_WHITE$SC_C_ITALIC"
+        done
+    else sc_line "$(sc_t checks_count): $SC_COMPLETED/$total" "$SC_C_MUTED"; fi
+    ((total == 3)) || sc_line "$(sc_t scope_selected)" "$SC_C_MUTED"
+    if ((SC_FOLLOWUPS_INTERRUPTED)); then sc_line "$(sc_t followup_interrupted)" "$SC_C_AMBER"; fi
+    if [[ $SC_ASSESSMENT == urgent ]]; then
+        sc_line "$(sc_t next_urgent)" "$SC_C_RED"
+    elif ((SC_FOLLOWUPS_DONE)); then
+        if ((review)); then sc_line "$(sc_t next_final_review)"
+        elif ((SC_INCOMPLETE == 0)); then sc_line "$(sc_t next_final_clear)"; fi
+    elif ((review)); then sc_line "$(sc_t why_review)" "$SC_C_WHITE$SC_C_ITALIC"; fi
+    sc_line "$(sc_t limits)" "$SC_C_MUTED$SC_C_ITALIC"
+}
+
+sc_render_short_report() {
+    sc_brand
+    sc_render_summary
+    sc_line "$(sc_t short_report_help)" "$SC_C_MUTED"
 }
 
 # Group only the presentation, never the original evidence or its assessment.
 # The first member has the highest priority. Ambiguous paths remain separate.
 sc_detail_groups() {
-    local technical=${1:-0} priority i g first found
+    local technical=${1:-0} filter=${2:-all} priority i g first found group
     declare -ga SC_DETAIL_GROUPS=()
     for priority in urgent review suggestion info; do
         for i in "${!SC_F_MODULE[@]}"; do
@@ -1604,20 +1306,100 @@ sc_detail_groups() {
             else SC_DETAIL_GROUPS+=("$i"); fi
         done
     done
+    # Filter whole paths after grouping. A matching content check does not hide
+    # an unresolved timestamp or permissions warning for that same path.
+    local -a groups=("${SC_DETAIL_GROUPS[@]}")
+    SC_DETAIL_GROUPS=()
+    for group in "${groups[@]}"; do
+        first=${group%% *}; priority=${SC_F_PRIORITY[first]}
+        case $filter:$priority in
+            all:*|attention:urgent|attention:review|suggestions:suggestion|explained:info)
+                SC_DETAIL_GROUPS+=("$group");;
+        esac
+    done
+}
+
+# These explanations describe purpose, not legitimacy. They never clear a
+# finding. Lynis mappings require both the test ID and the observed message.
+sc_finding_guidance() {
+    local i=$1 object=${SC_F_OBJECT[$1]} description=${SC_F_EVIDENCE[$1]%% | *}
+    SC_GUIDANCE_MEANING='' SC_GUIDANCE_ACTION=''
+    if [[ ${SC_F_MODULE[i]} == integrity ]]; then
+        case $object in
+            /etc/passwd|/etc/shadow|/etc/group|/etc/gshadow|/etc/subuid|/etc/subgid)
+                SC_GUIDANCE_MEANING=context_accounts; SC_GUIDANCE_ACTION=action_accounts;;
+            /etc/resolv.conf|/etc/hosts)
+                SC_GUIDANCE_MEANING=context_dns; SC_GUIDANCE_ACTION=action_dns;;
+            /etc/pacman.conf|/etc/pacman.d/mirrorlist)
+                SC_GUIDANCE_MEANING=context_repositories; SC_GUIDANCE_ACTION=action_repositories;;
+            /etc/pam.d/*|/etc/sudoers|/etc/sudoers.d/*)
+                SC_GUIDANCE_MEANING=context_login; SC_GUIDANCE_ACTION=action_login;;
+            /etc/locale.gen|/etc/locale.conf|/etc/shells)
+                SC_GUIDANCE_MEANING=context_preferences; SC_GUIDANCE_ACTION=action_preferences;;
+        esac
+    elif [[ ${SC_F_MODULE[i]} == lynis ]]; then
+        case $object:$description in
+            PKGS-7320:'Consider installing arch-audit to determine vulnerable packages'*|PKGS-7398:'Install a package audit tool to determine vulnerable packages'*)
+                SC_GUIDANCE_MEANING=lynis_audit; SC_GUIDANCE_ACTION=lynis_action_audit;;
+            PKGS-7312:'Perform update of system updates as this system uses rolling updates'*)
+                SC_GUIDANCE_MEANING=lynis_updates; SC_GUIDANCE_ACTION=lynis_action_updates;;
+            BOOT-5264:'Consider hardening system services'*)
+                SC_GUIDANCE_MEANING=lynis_services; SC_GUIDANCE_ACTION=lynis_action_services;;
+            KRNL-5820:'If not required, consider explicit disabling of core dump'*)
+                SC_GUIDANCE_MEANING=lynis_dumps; SC_GUIDANCE_ACTION=lynis_action_dumps;;
+            AUTH-9230:'Configure password hashing rounds'*|AUTH-9262:'Password hash rounds are not configured'*)
+                SC_GUIDANCE_MEANING=lynis_passwords; SC_GUIDANCE_ACTION=lynis_action_passwords;;
+            AUTH-9262:'Install a PAM module for password strength testing'*)
+                SC_GUIDANCE_MEANING=lynis_password_strength; SC_GUIDANCE_ACTION=lynis_action_passwords;;
+            AUTH-9282:'When possible set expire dates for all password protected accounts'*|AUTH-9286:'Configure minimum password age'*|AUTH-9286:'Configure maximum password age'*)
+                SC_GUIDANCE_MEANING=lynis_password_expiry; SC_GUIDANCE_ACTION=lynis_action_password_expiry;;
+            AUTH-9328:'Default umask'*|FILE-7524:'Consider restricting file permissions'*)
+                SC_GUIDANCE_MEANING=lynis_permissions; SC_GUIDANCE_ACTION=lynis_action_permissions;;
+            FILE-6310:'To decrease the impact of a full /var file system'*)
+                SC_GUIDANCE_MEANING=lynis_storage; SC_GUIDANCE_ACTION=lynis_action_storage;;
+            USB-1000:'Disable drivers like USB storage'*|STRG-1846:'Disable drivers like firewire storage'*|NETW-3200:'Determine if protocol '*' is really needed on this system'*)
+                SC_GUIDANCE_MEANING=lynis_unused; SC_GUIDANCE_ACTION=lynis_action_unused;;
+            NAME-4028:'Check DNS configuration for the dns domain name'*|NAME-4404:'Add the IP name and FQDN to /etc/hosts'*)
+                SC_GUIDANCE_MEANING=lynis_dns; SC_GUIDANCE_ACTION=action_dns;;
+            LOGG-2154:'Enable logging to an external logging host'*)
+                SC_GUIDANCE_MEANING=lynis_remote_logs; SC_GUIDANCE_ACTION=lynis_action_optional;;
+            LOGG-2190:'Check what deleted files are still in use and why.'*)
+                SC_GUIDANCE_MEANING=lynis_deleted; SC_GUIDANCE_ACTION=lynis_action_deleted;;
+            BANN-7126:'Add a legal banner to /etc/issue'*)
+                SC_GUIDANCE_MEANING=lynis_banner; SC_GUIDANCE_ACTION=lynis_action_optional;;
+            ACCT-9622:'Enable process accounting'*|ACCT-9626:'Enable sysstat'*|ACCT-9628:'Enable auditd'*)
+                SC_GUIDANCE_MEANING=lynis_logging; SC_GUIDANCE_ACTION=lynis_action_optional;;
+            CRYP-7902:'Check available certificates for expiration'*)
+                SC_GUIDANCE_MEANING=lynis_certificates; SC_GUIDANCE_ACTION=lynis_action_certificates;;
+            FINT-4350:'Install a file integrity tool'*)
+                SC_GUIDANCE_MEANING=lynis_monitor; SC_GUIDANCE_ACTION=lynis_action_monitor;;
+            TOOL-5002:'Determine if automation tools are present'*)
+                SC_GUIDANCE_MEANING=lynis_automation; SC_GUIDANCE_ACTION=lynis_action_optional;;
+            KRNL-6000:'One or more sysctl values differ from the scan profile'*)
+                SC_GUIDANCE_MEANING=lynis_kernel; SC_GUIDANCE_ACTION=lynis_action_kernel;;
+            HRDN-7222:'Harden compilers'*)
+                SC_GUIDANCE_MEANING=lynis_compilers; SC_GUIDANCE_ACTION=lynis_action_compilers;;
+            *)
+                [[ ${SC_F_KEY[i]} == lynis_reboot ]] || {
+                    SC_GUIDANCE_MEANING=lynis_unmapped; SC_GUIDANCE_ACTION=rkh_action_unknown;
+                };;
+        esac
+    fi
 }
 
 sc_render_details() {
-    local limit=${1:-0} offset=${2:-0} technical=${3:-0} i j group shown=0 visited=0 priority object check action fields seen key config
+    local limit=${1:-0} offset=${2:-0} technical=${3:-0} filter=${4:-all} i j group shown=0 visited=0 priority object check action fields seen key config
     local -a members=()
-    sc_heading details
-    ((${#SC_F_MODULE[@]})) || { sc_line "$(sc_t none)"; return 0; }
-    sc_detail_groups "$technical"
+    case $filter in attention) sc_heading attention;; suggestions) sc_heading suggestions;; explained) sc_heading explained_results;; *) sc_heading details;; esac
+    sc_detail_groups "$technical" "$filter"
+    ((${#SC_DETAIL_GROUPS[@]})) || { sc_line "$(sc_t no_filtered_findings)"; return 0; }
     for group in "${SC_DETAIL_GROUPS[@]}"; do
             read -r -a members <<< "$group"
             i=${members[0]}; priority=${SC_F_PRIORITY[i]}
             ((visited+=1)); ((visited > offset)) || continue
             if ((limit && shown >= limit)); then sc_line "$(sc_t more)"; return 0; fi
             ((shown+=1)); object=${SC_F_OBJECT[i]}
+            sc_finding_guidance "$i"
             printf '\n'
             sc_line "#$((i+1)) / $(sc_t "priority_$priority") / $(sc_t "${SC_F_MODULE[i]}")" "$(sc_status_color "$priority")"
             if [[ $priority == info && -n ${SC_F_CHECK_KEY[i]} ]]; then
@@ -1638,7 +1420,10 @@ sc_render_details() {
                 sc_line "$(sc_t integrity_fields): $fields"
             else
                 sc_line "$(sc_t meaning):" "$SC_C_WHITE$SC_C_BOLD"
-                sc_line "$(sc_t "${SC_F_KEY[i]}")"
+                sc_line "$(sc_t "${SC_GUIDANCE_MEANING:-${SC_F_KEY[i]}}")"
+            fi
+            if ((${#members[@]} > 1)) && [[ -n $SC_GUIDANCE_MEANING ]]; then
+                sc_line "$(sc_t "$SC_GUIDANCE_MEANING")"
             fi
             if [[ ${SC_F_KEY[i]} == rkh_dev_file && $object =~ ^/dev/shm/lsp-catalog-[A-Za-z0-9_.-]+\.(shm|lock)$ ]]; then
                 sc_line "$(sc_t rkh_dev_lsp)" "$SC_C_MUTED"
@@ -1649,6 +1434,7 @@ sc_render_details() {
             for j in "${members[@]}"; do
                 check=${SC_F_CHECK_KEY[j]}
                 [[ -n $check && $seen != *" $check "* ]] || continue
+                if ((technical == 0)) && [[ ${SC_F_MODULE[i]} == lynis && $check == followup_manual ]]; then continue; fi
                 [[ ${SC_F_KEY[j]} == lynis_reboot && $check == followup_manual ]] && continue
                 seen+="$check "
                 sc_line "$(sc_t checked):" "$SC_C_PRIMARY$SC_C_BOLD"
@@ -1675,6 +1461,7 @@ sc_render_details() {
                 esac
             done
             [[ ${SC_F_KEY[i]} != lynis_reboot ]] || action=lynis_action_reboot
+            if [[ -n $SC_GUIDANCE_ACTION && $priority != info ]]; then action=$SC_GUIDANCE_ACTION; fi
             if [[ -n $action ]]; then
                 # A matching sibling must not dismiss a still-open difference.
                 if ((${#members[@]} > 1)) && [[ $priority != info && $action == rkh_action_explained ]]; then
@@ -1685,27 +1472,29 @@ sc_render_details() {
             if [[ ${SC_F_MODULE[i]} == integrity ]]; then
                 config=0; [[ $object != /etc/* ]] || config=1
                 for j in "${members[@]}"; do [[ ${SC_F_EVIDENCE[j]} != *'backup file:'* ]] || config=1; done
-                ((config == 0)) || sc_line "$(sc_t file_config)"
+                if ((config)) && [[ -z $SC_GUIDANCE_MEANING ]]; then sc_line "$(sc_t file_config)"; fi
             fi
-            if ((technical)) || [[ ${SC_F_MODULE[i]} == lynis || ${SC_F_KEY[i]} == rkh_signature || ${SC_F_KEY[i]} == rkh_warning ]]; then
+            if ((technical)); then
                 sc_line "$(sc_t evidence): ${SC_F_EVIDENCE[i]}" "$SC_C_MUTED"
             fi
     done
 }
 
 sc_browse_details() {
-    sc_detail_groups
-    local page=0 pages=$(((${#SC_DETAIL_GROUPS[@]}+9)/10)) answer
-    ((pages)) || { sc_render_details; return; }
+    local filter=${1:-all}
+    sc_detail_groups 0 "$filter"
+    local page=0 pages=$(((${#SC_DETAIL_GROUPS[@]}+4)/5)) answer
     while :; do
-        sc_line "$(sc_t page) $((page+1)) / $pages" "$SC_C_PRIMARY"
-        sc_render_details 10 "$((page*10))"
+        if ((pages)); then sc_line "$(sc_t page) $((page+1)) / $pages" "$SC_C_PRIMARY"; fi
+        sc_render_details 5 "$((page*5))" 0 "$filter"
         [[ -t 0 ]] || return 0
-        printf '\n'; sc_line "$(sc_t pages_menu)"
+        printf '\n'
+        if ((pages)); then sc_line "$(sc_t pages_menu)"; else sc_line "$(sc_t empty_pages_menu)"; fi
         printf '  > '; IFS= read -r answer || return 0
         case $answer in
             1) ((page+1 < pages)) && ((page+=1));;
             2) ((page > 0)) && ((page-=1));;
+            3) sc_line "$(sc_t report): $SC_RUN_DIR/report.txt"; sc_line "$(sc_t report_info)"; sc_render_report;;
             0) return 0;;
             *) sc_line "$(sc_t invalid)";;
         esac
@@ -1726,16 +1515,15 @@ sc_prepare_run() {
 }
 
 sc_render_report() {
-    sc_header; sc_render_summary; sc_render_details 0 0 1
+    sc_header; sc_render_technical_summary; sc_render_details 0 0 1
     sc_heading scope_report
     sc_line "SecCheck=$SC_VERSION; started=${SC_STARTED:-demo}"
-    ((${#SC_SELECTED[@]} != 4)) || sc_line "$(sc_t scope_full)"
+    ((${#SC_SELECTED[@]} != 3)) || sc_line "$(sc_t scope_full)"
     local module value
     for module in "${SC_SELECTED[@]}"; do
         sc_line "$module: version=${SC_MODULE_VERSION[$module]}; exit=${SC_MODULE_RC[$module]}; reason=${SC_MODULE_REASON[$module]}"
         sc_render_diagnostics "$module" 0
     done
-    [[ -z ${SC_HEALTH_NOTE:-} ]] || sc_line "$(sc_t "$SC_HEALTH_NOTE")"
     for value in "${SC_SCOPE[@]}"; do sc_line "$value"; done
     sc_line "$(sc_t report_info)"
 }
@@ -1786,21 +1574,19 @@ sc_is_arch() {
 
 sc_help() {
     printf '%s bash seccheck.sh [options]\n\n' "$(sc_t usage)"
-    printf '%s\n' '  --lang en|it' '  --scan full|rkhunter|lynis|integrity|aur-health' \
-        '  --offline' '  --no-color' '  --ascii' \
+    printf '%s\n' '  --lang en|it' '  --scan full|rkhunter|lynis|integrity' \
+        '  --no-color' '  --ascii' \
         '  --demo [review|urgent|incomplete|clean]' '  --help' '  --version'
     printf '\n%s\n' "$(sc_t batch_usage)"
-    printf '%s\n' "$(sc_t health_network)"
 }
 
 sc_parse_args() {
-    SC_LANG='' SC_SCAN='' SC_DEMO=0 SC_SCENARIO=review SC_NO_COLOR=0 SC_ASCII=0 SC_ACTION='' SC_OFFLINE=0
+    SC_LANG='' SC_SCAN='' SC_DEMO=0 SC_SCENARIO=review SC_NO_COLOR=0 SC_ASCII=0 SC_ACTION=''
     while (($#)); do
         case $1 in
             --lang) (($# >= 2)) || return 64; case $2 in en|it) SC_LANG=$2;; *) return 64;; esac; shift;;
-            --scan) (($# >= 2)) || return 64; case $2 in full|rkhunter|lynis|integrity|aur-health) SC_SCAN=$2;; *) return 64;; esac; shift;;
+            --scan) (($# >= 2)) || return 64; case $2 in full|rkhunter|lynis|integrity) SC_SCAN=$2;; *) return 64;; esac; shift;;
             --no-color) SC_NO_COLOR=1;;
-            --offline) SC_OFFLINE=1;;
             --ascii) SC_ASCII=1;;
             --demo) SC_DEMO=1
                 if (($# > 1)) && [[ $2 != --* ]]; then
@@ -1834,7 +1620,6 @@ sc_elevate() {
     case $action in scan) args+=(--scan "$SC_SCAN");; install) args+=(--install-tools);; update) args+=(--update-signatures);; esac
     [[ ${SC_NO_COLOR:-0} == 0 && ! ${NO_COLOR+x} ]] || args+=(--no-color)
     [[ ${SC_ASCII:-0} == 0 ]] || args+=(--ascii)
-    [[ ${SC_OFFLINE:-0} == 0 ]] || args+=(--offline)
     path=$(readlink -f -- "${BASH_SOURCE[0]}") || return 77
     sudo -- bash "$path" "${args[@]}"
 }
@@ -1857,13 +1642,11 @@ sc_demo() {
         review)
             sc_add_finding integrity integrity review observation /etc/example.conf integrity_content 'DEMO: SHA-256 differs from local package record'
             sc_add_finding lynis hardening suggestion observation SSH-DEMO lynis_suggestion 'DEMO: review SSH configuration'
-            sc_add_finding aur-health maintenance review observation example-app health_maintainer 'DEMO: old-owner -> new-owner'
-            sc_add_finding aur-health maintenance suggestion observation example-tool health_inactive 'DEMO: days=420'
             sc_add_finding rkhunter suspicious info observation /usr/bin/example-tool rkh_script 'DEMO: The command is a script'
             SC_F_CHECK_KEY[${#SC_F_MODULE[@]}-1]=rkh_file_match
             SC_F_CHECK_DETAIL[${#SC_F_MODULE[@]}-1]='DEMO: example-package / SHA-256';;
     esac
-    sc_assess; sc_header; sc_render_summary; sc_render_details 6
+    sc_assess; sc_header; sc_render_summary
 }
 
 sc_update_signatures() {
@@ -1881,24 +1664,24 @@ sc_update_signatures() {
 sc_dependencies() {
     local mode=${1:-menu} tool label answer package purpose color missing_tool
     local -a missing=() install=()
-    if [[ $mode == startup ]]; then sc_heading deps_startup; sc_line "$(sc_t deps_explain)"
+    if [[ $mode == startup ]]; then sc_heading deps_startup
     else sc_heading deps; fi
-    for package in rkhunter lynis pacutils python curl; do
+    for package in rkhunter lynis pacutils; do
         missing_tool=0
         case $package in
             rkhunter) tool=rkhunter; purpose=menu_rkhunter;;
             lynis) tool=lynis; purpose=menu_lynis;;
             pacutils) tool=paccheck; purpose=deps_pacutils; command -v pacfile >/dev/null || missing_tool=1;;
-            python) tool=python3; purpose=deps_python;;
-            curl) tool=curl; purpose=deps_curl;;
         esac
         command -v "$tool" >/dev/null || missing_tool=1
         label=$(sc_t available); color=$SC_C_GREEN
         if ((missing_tool)); then missing+=("$package"); label=$(sc_t absent); color=$SC_C_AMBER; fi
-        printf '\n'; sc_line "$package: $label" "$color$SC_C_BOLD"
-        sc_line "$(sc_t "$purpose")"
+        if [[ $mode != startup ]] || ((missing_tool)); then
+            sc_line "$package: $label" "$color$SC_C_BOLD"
+            sc_line "$(sc_t "$purpose")" "$SC_C_WHITE$SC_C_ITALIC"
+        fi
     done
-    if ((${#missing[@]} == 0)); then printf '\n'; sc_line "$(sc_t deps_ready)" "$SC_C_GREEN"; return 0; fi
+    if ((${#missing[@]} == 0)); then sc_line "$(sc_t deps_ready)" "$SC_C_GREEN"; return 0; fi
     printf '\n'; sc_line "$(sc_t deps_missing): ${missing[*]}" "$SC_C_AMBER"
     if [[ $mode == report ]]; then sc_line "$(sc_t deps_continue)"; return 1; fi
     [[ -t 0 ]] || return 1
@@ -1945,21 +1728,18 @@ sc_scan_once() {
     SC_RUN_ACTIVE=1
     trap sc_abort INT TERM
     sc_header; sc_line "$(sc_t wait)" "$SC_C_MUTED"
-    if [[ $SC_SCAN == full || $SC_SCAN == aur-health ]]; then sc_line "$(sc_t health_network)" "$SC_C_MUTED"; fi
     for module in "${SC_SELECTED[@]}"; do
         ((step+=1)); printf '\n'
         sc_line "[$step/${#SC_SELECTED[@]}] $(sc_t scanning): $(sc_t "$module")" "$SC_C_PRIMARY"
-        case $module in rkhunter) sc_run_rkhunter;; lynis) sc_run_lynis;; integrity) sc_run_integrity;; aur-health) sc_run_aur_health;; esac
+        case $module in rkhunter) sc_run_rkhunter;; lynis) sc_run_lynis;; integrity) sc_run_integrity;; esac
         sc_line "$(sc_t "${SC_MODULE_STATUS[$module]}")" "$(sc_status_color "${SC_MODULE_STATUS[$module]}")"
-        [[ -z ${SC_MODULE_REASON[$module]} ]] || sc_line "$(sc_t "${SC_MODULE_REASON[$module]}")" "$SC_C_MUTED"
     done
     sc_assess
     SC_RUN_ACTIVE=0
     trap - INT TERM
     sc_render_summary
     sc_save_report || { sc_line "$(sc_t save_error)"; return 73; }
-    printf '\n'; sc_line "$(sc_t report): $SC_RUN_DIR/report.txt" "$SC_C_PRIMARY"
-    sc_line "$(sc_t report_info)" "$SC_C_MUTED"
+    if [[ ! -t 0 ]]; then sc_line "$(sc_t report): $SC_RUN_DIR/report.txt"; fi
     ((SC_INCOMPLETE == 0)) || return 2
     ((SC_URGENT == 0 && SC_REVIEW == 0)) || return 1
     return 0
@@ -2035,14 +1815,22 @@ sc_run_followups() {
     SC_RUN_ACTIVE=0 SC_FOLLOWUPS_ACTIVE=0
     trap - INT TERM
     sc_render_summary
-    sc_line "$(sc_t report): $SC_RUN_DIR/report.txt" "$SC_C_PRIMARY"
+    sc_line "$(sc_t saved_report)" "$SC_C_MUTED"
 }
 
 sc_offer_followups() {
     local answer
-    printf '\n'; sc_line "$(sc_t followup_question)" "$SC_C_PRIMARY$SC_C_BOLD"
-    printf '  > '; IFS= read -r answer || return 0
-    case $answer in s|S|y|Y) sc_run_followups;; *) return 0;; esac
+    while :; do
+        printf '\n'; sc_line "$(sc_t followup_question)" "$SC_C_WHITE$SC_C_BOLD"
+        sc_line "$(sc_t analysis_choices)"
+        printf '  > '; IFS= read -r answer || return 0
+        case $answer in
+            s|S|y|Y|1) sc_run_followups; return $?;;
+            m|M|2) sc_browse_details attention;;
+            0|n|N|'') return 0;;
+            *) sc_line "$(sc_t invalid)";;
+        esac
+    done
 }
 
 sc_result_code() {
@@ -2058,50 +1846,92 @@ sc_run_requested() {
         if [[ ! -t 0 ]]; then printf '%s\n' "$(sc_t need_root)" >&2; return 77; fi
         sc_line "$(sc_t root)"; sc_elevate scan; return $?
     fi
+    sc_scan_once; rc=$?
+    [[ -t 0 && $rc -le 2 ]] || return "$rc"
+    sc_offer_followups || return $?
+    sc_result_code; rc=$?
+    ((SC_FOLLOWUPS_DONE)) || return "$rc"
     while :; do
-        sc_scan_once; rc=$?
-        [[ -t 0 && $rc -le 2 ]] || return "$rc"
-        sc_offer_followups || return $?
-        sc_result_code; rc=$?
-        while :; do
-            printf '\n'; sc_line "$(sc_t result_menu)"
-            printf '  > '; IFS= read -r answer || return "$rc"
-            case $answer in
-                1) sc_browse_details;;
-                2) sc_render_report;;
-                3) break;;
-                0) return "$rc";;
-                *) sc_line "$(sc_t invalid)";;
-            esac
-        done
+        printf '\n'; sc_line "$(sc_t result_menu)"
+        printf '  > '; IFS= read -r answer || return "$rc"
+        case $answer in
+            1) sc_browse_details attention;;
+            2) sc_other_results;;
+            0) return "$rc";;
+            *) sc_line "$(sc_t invalid)";;
+        esac
+    done
+}
+
+sc_other_results() {
+    local answer
+    while :; do
+        sc_heading other_results
+        sc_line "$(sc_t other_menu)"
+        printf '  > '; IFS= read -r answer || return 0
+        case $answer in
+            1) sc_browse_details suggestions;;
+            2) sc_browse_details explained;;
+            3) sc_render_short_report;;
+            4) sc_line "$(sc_t report): $SC_RUN_DIR/report.txt"; sc_line "$(sc_t report_info)"; sc_render_report;;
+            0) return 0;;
+            *) sc_line "$(sc_t invalid)";;
+        esac
     done
 }
 
 sc_menu() {
     local answer
     while :; do
-        SC_DEMO=0; sc_header; sc_heading welcome
-        sc_line "$(sc_t health_network)" "$SC_C_MUTED"; printf '\n'
-        sc_heading menu_scans
-        sc_line "1  $(sc_t menu_full)" "$SC_C_PRIMARY$SC_C_BOLD"
-        sc_line "$(sc_t full_includes)" "$SC_C_WHITE"; printf '\n'
-        sc_line "2  $(sc_t menu_rkhunter)"; sc_line "3  $(sc_t menu_lynis)"
-        sc_line "4  $(sc_t menu_integrity)"; sc_line "5  $(sc_t aur-health)"
-        sc_heading menu_tools "$SC_C_AMBER"
-        sc_line "6  $(sc_t menu_deps)"; sc_line "7  $(sc_t menu_update)"
-        sc_line "8  $(sc_t menu_demo)"
-        sc_line "$(sc_t tools_separate)" "$SC_C_MUTED"
-        printf '\n'; sc_line "0  $(sc_t exit)" "$SC_C_WHITE"
+        SC_DEMO=0; sc_brand
+        sc_heading welcome
+        sc_line "1  $(sc_t menu_full)" "$SC_C_WHITE$SC_C_BOLD"
+        sc_line "$(sc_t full_includes)" "$SC_C_WHITE$SC_C_ITALIC"
+        sc_line "2  $(sc_t menu_single)"
+        sc_line "3  $(sc_t main_tools)"
+        sc_line "0  $(sc_t exit)"
         printf '\n  %s > ' "$(sc_t choose)"; IFS= read -r answer || return 0
         case $answer in
             1) SC_SCAN=full; sc_run_requested;;
-            2) SC_SCAN=rkhunter; sc_run_requested;;
-            3) SC_SCAN=lynis; sc_run_requested;;
-            4) SC_SCAN=integrity; sc_run_requested;;
-            5) SC_SCAN=aur-health; sc_run_requested;;
-            6) sc_dependencies;;
-            7) sc_update_action;;
-            8) SC_DEMO=1; sc_demo review;;
+            2) sc_single_menu;;
+            3) sc_tools_menu;;
+            0) return 0;;
+            *) sc_line "$(sc_t invalid)";;
+        esac
+    done
+}
+
+sc_single_menu() {
+    local answer
+    sc_heading menu_single
+    sc_line "1  $(sc_t menu_rkhunter)"
+    sc_line "2  $(sc_t menu_lynis)"
+    sc_line "3  $(sc_t menu_integrity)"
+    sc_line "0  $(sc_t back)"
+    while :; do
+        printf '  > '; IFS= read -r answer || return 0
+        case $answer in
+            1) SC_SCAN=rkhunter;;
+            2) SC_SCAN=lynis;;
+            3) SC_SCAN=integrity;;
+            0) return 0;;
+            *) sc_line "$(sc_t invalid)"; continue;;
+        esac
+        sc_run_requested; return $?
+    done
+}
+
+sc_tools_menu() {
+    local answer
+    sc_heading main_tools
+    sc_line "1  $(sc_t menu_deps)"
+    sc_line "2  $(sc_t menu_update)"
+    sc_line "0  $(sc_t back)"
+    while :; do
+        printf '  > '; IFS= read -r answer || return 0
+        case $answer in
+            1) sc_dependencies; return $?;;
+            2) sc_update_action; return $?;;
             0) return 0;;
             *) sc_line "$(sc_t invalid)";;
         esac

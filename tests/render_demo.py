@@ -48,30 +48,35 @@ process.wait(timeout=5)
 os.close(master)
 assert process.returncode == 0
 lines = data.decode().replace('\r', '').splitlines()
-if args.screen == 'demo':
-    end = next(i for i, line in enumerate(lines) if 'DETTAGLI DELLE SEGNALAZIONI' in line)
-    lines = lines[:end-1]
 font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', 17)
 bold = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf', 17)
+italic = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf', 17)
+bold_italic = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf', 17)
 cell = font.getlength('M')
-canvas = Image.new('RGB', (int(cell*90+40), len(lines)*24+66), '#0d2028')
+canvas = Image.new('RGB', (int(cell*90+40), len(lines)*24+66), '#111418')
 draw = ImageDraw.Draw(canvas)
-draw.rounded_rectangle((12, 12, canvas.width-12, 47), radius=8, fill='#183642')
-draw.text((30, 20), 'SecCheck 2.0  |  ' + args.screen.title() + '  |  Terminale 88 colonne', font=font, fill='#8ca8b9')
-palette = {80:'#7acdd8', 109:'#8ca8b9', 203:'#ff5f5f', 222:'#ffdf87', 114:'#87d787', 255:'#eeeeee'}
-color = '#e6edf0'
-weight = font
+draw.rounded_rectangle((12, 12, canvas.width-12, 47), radius=8, fill='#25282c')
+draw.text((30, 20), 'SecCheck 2.0  |  ' + args.screen.title() + '  |  Terminale 88 colonne', font=font, fill='#eeeeee')
+palette = {203:'#ff5f5f', 208:'#ff8700', 114:'#87d787', 255:'#eeeeee'}
+color = '#eeeeee'
+is_bold = is_italic = is_dim = False
 for row, line in enumerate(lines):
     x = 20
     for part in re.split(r'(\x1b\[[0-9;]*m)', line):
         if part.startswith('\x1b['):
             codes = [int(x) for x in part[2:-1].split(';') if x] or [0]
-            if codes == [0]: color, weight = '#e6edf0', font
-            elif codes == [1]: weight = bold
+            if codes == [0]:
+                color = '#eeeeee'
+                is_bold = is_italic = is_dim = False
+            elif codes == [1]: is_bold = True
+            elif codes == [2]: is_dim = True
+            elif codes == [3]: is_italic = True
             elif codes[:2] == [38, 5]: color = palette[codes[2]]
             elif codes[:2] == [38, 2]: color = tuple(codes[2:5])
         else:
-            draw.text((x, 58+row*24), part, font=weight, fill=color)
+            weight = (bold_italic if is_bold else italic) if is_italic else (bold if is_bold else font)
+            fill = '#bbbbbb' if is_dim and color == '#eeeeee' else color
+            draw.text((x, 58+row*24), part, font=weight, fill=fill)
             x += font.getlength(part)
-filename = 'seccheck-v2-petrolio.png' if args.screen == 'demo' else 'seccheck-v2-menu.png'
+filename = 'seccheck-v2-result.png' if args.screen == 'demo' else 'seccheck-v2-menu.png'
 canvas.save(ROOT / 'screenshots' / filename)

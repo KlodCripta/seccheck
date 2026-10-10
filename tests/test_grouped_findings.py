@@ -24,9 +24,8 @@ SC_FOLLOWUPS_DONE=1; sc_assess
     def test_pending_counts_paths_and_excludes_recommendations(self):
         out = self.shell(self.setup + 'sc_render_summary')
         self.assertIn('Still to assess: 2', out)
-        self.assertIn('Suggestions: 1', out)
-        self.assertIn('To review: 2', out)
-        self.assertRegex(out, r'Package integrity\s+Completed\s+2')
+        self.assertIn('Optional improvements: 1', out)
+        self.assertNotIn('Package integrity Completed', out)
 
     def test_one_detail_card_per_path_keeps_all_types_of_difference(self):
         out = self.shell(self.setup + 'sc_render_details')
@@ -77,7 +76,7 @@ printf '%s\n' "$SC_RUN_DIR"
 done
 sc_render_details 1
 ''')
-        self.assertIn('Install pacutils using option 6', out)
+        self.assertIn('Install pacutils from Tools', out)
 
     def test_unknown_paths_and_different_modules_are_not_merged(self):
         out = self.shell('''sc_reset 'integrity lynis'; SC_LANG=en; sc_ui_init
