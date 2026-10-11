@@ -891,6 +891,11 @@ sc_baseline_create() {
             '') ;;
             'egrep: warning: egrep is obsolescent; using grep -E')
                 sc_add_diagnostic rkhunter rkh_legacy_grep "$line";;
+            'grep: warning: stray \ before -'|'grep: warning: stray \ before +'|'grep: warning: stray \ before !')
+                # Only these known compatibility notices may pass here. The
+                # complete candidate must still match every independently
+                # verified file and property below. Scan coverage is unchanged.
+                sc_add_diagnostic rkhunter rkh_regex "$line";;
             *) SC_BASELINE_FAILURE="rkhunter --propupd: $(sc_text "$line")"; return 1;;
         esac
     done < "$SC_RUN_DIR/baseline-create.stderr"

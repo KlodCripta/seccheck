@@ -73,6 +73,8 @@ if [[ $action == --propupd ]]; then
     concurrent) printf 'existing administrator baseline\n' > "$SC_TEST_DIR/db/rkhunter.dat";;
     legacy) printf 'egrep: warning: egrep is obsolescent; using grep -E\n' >&2;;
     regex) printf 'grep: warning: stray \\ before +\n' >&2;;
+    regexbad) printf 'grep: warning: stray \\ before -\n' >&2; printf 'File:0:/unchecked/file:bad\n' >> "$db/rkhunter.dat";;
+    unknown) printf 'unexpected scanner error\n' >&2;;
     binary) printf '\\000' >&2;;
   esac
   printf 'candidate generated\n' > "$log"
@@ -389,7 +391,7 @@ sc_run_requested
                     self.assertFalse(target.exists())
 
     def test_forwarding_notice_does_not_hide_real_creation_errors(self):
-        for kind, state in (('legacy', 'created'), ('regex', 'failed'), ('binary', 'failed')):
+        for kind, state in (('legacy', 'created'), ('regex', 'created'), ('regexbad', 'failed'), ('unknown', 'failed'), ('binary', 'failed')):
             with self.subTest(kind=kind):
                 target = self.db / 'rkhunter.dat'
                 target.unlink(missing_ok=True)
@@ -398,7 +400,7 @@ sc_run_requested
                 self.assertEqual(target.exists(), state == 'created')
 
     def test_creation_failure_reports_the_failed_step(self):
-        for kind, detail in (('wronghash', 'Hash'), ('failure', 'exit=1'), ('regex', 'stray'), ('mismatch', 'path-format')):
+        for kind, detail in (('wronghash', 'Hash'), ('failure', 'exit=1'), ('unknown', 'unexpected scanner error'), ('mismatch', 'path-format')):
             with self.subTest(kind=kind):
                 (self.db / 'rkhunter.dat').unlink(missing_ok=True)
                 out = self.execute('sc_offer_baseline <<< s', SC_CANDIDATE=kind)
