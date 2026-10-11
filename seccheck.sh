@@ -807,12 +807,15 @@ sc_baseline_prepare() {
 }
 
 sc_baseline_validate_candidate() {
-    local file=$1 line bytes i match count=0 hash=0 attrs=0 format=0 pkg=0 version=0
+    local file=$1 line bytes i match count=0 hash=0 attrs=0 format=0 pkg=0 version=0 field object label
+    local -a actual=() expected=()
+    SC_BASELINE_FAILURE="candidate: missing, unreadable, binary or oversized reference"
     local -a seen=()
     [[ -f $file && ! -L $file ]] || return 1
     bytes=$(timeout 5 stat -c '%s' -- "$file") || return 1
     [[ $bytes =~ ^[0-9]{1,10}$ ]] && ((bytes > 0 && bytes <= 1048576)) && sc_no_nul "$file" || return 1
     while IFS= read -r line || [[ -n $line ]]; do
+        SC_BASELINE_FAILURE="candidate header: $(sc_text "${line%%:*}")"
         case $line in
             Hash:*) [[ $line == "Hash:$SC_BASELINE_HASH_COMMAND" ]] || return 1; ((hash+=1));;
             Attributes:*) [[ $line == Attributes:Stored ]] || return 1; ((attrs+=1));;
@@ -827,11 +830,32 @@ sc_baseline_validate_candidate() {
                         seen[i]=1; match=1; ((count+=1)); break
                     fi
                 done
-                ((match)) || return 1;;
+                if ((match == 0)); then
+                    IFS=: read -r -a actual <<< "$line"
+                    object=${actual[2]:-unknown}
+                    SC_BASELINE_FAILURE="candidate: $(sc_text "$object"); unverified record"
+                    for i in "${!SC_BASELINE_RECORDS[@]}"; do
+                        IFS=: read -r -a expected <<< "${SC_BASELINE_RECORDS[i]}"
+                        [[ ${expected[2]:-} == "$object" ]] || continue
+                        SC_BASELINE_FAILURE="candidate: $(sc_text "$object"); different properties:"
+                        for field in 1 3 4 5 6 7 8 9 10 11 12; do
+                            [[ ${actual[field]:-} != "${expected[field]:-}" ]] || continue
+                            case $field in
+                                1) label="path-format";; 3) label=SHA256;; 4) label=inode;; 5) label=permissions;;
+                                6) label=UID;; 7) label=GID;; 8) label=size;; 9) label=mtime;;
+                                10) label=package;; 11) label="link-format";; 12) label="link-target";;
+                            esac
+                            SC_BASELINE_FAILURE+=" $label"
+                        done
+                        break
+                    done
+                    return 1
+                fi;;
             Host:*|Arch:*|OS:*|Prelinked:No) ;;
             *) return 1;;
         esac
     done < "$file"
+    SC_BASELINE_FAILURE="candidate: headers or file count invalid; checked=$count expected=$SC_BASELINE_CHECKED"
     ((hash == 1 && attrs == 1 && format == 1 && pkg == 1 && version == 1 && count == SC_BASELINE_CHECKED && count > 0))
 }
 
@@ -839,15 +863,18 @@ sc_baseline_create() {
     local stage rc install='' path i record line started=$SECONDS
     [[ $SC_BASELINE_CONFIRMED == 1 && $SC_BASELINE_STATE == ready ]] || return 1
     SC_BASELINE_STATE=failed SC_BASELINE_REASON=baseline_failed
+    SC_BASELINE_FAILURE="preparation: safety checks or database permissions"
     sc_baseline_guard && sc_baseline_trusted_dir "$SC_BASELINE_DB" && sc_baseline_target_missing || return 1
     # Recheck after the user's decision; do not register files changed while
     # the confirmation was on screen. Candidate validation also pins the set.
     for i in "${!SC_BASELINE_PATHS[@]}"; do
         ((SECONDS-started < 240)) || return 1
+        SC_BASELINE_FAILURE="confirmation: $(sc_text "${SC_BASELINE_PATHS[i]}"); file changed or verification failed"
         record=${SC_BASELINE_RECORDS[i]}
         sc_baseline_file "${SC_BASELINE_PATHS[i]}" "$SC_RUN_DIR/baseline-confirm.$i" || return 1
         [[ $SC_BASELINE_RECORD == "$record" ]] || return 1
     done
+    SC_BASELINE_FAILURE="preparation: temporary folder or language file"
     stage=$(umask 077; mktemp -d "$SC_RUN_DIR/baseline-candidate.XXXXXX") || return 1
     mkdir -m 700 -- "$stage/i18n" || return 1
     sc_baseline_trusted_dir "$SC_BASELINE_DB/i18n" && sc_baseline_input_file "$SC_BASELINE_DB/i18n/en" || return 1
@@ -857,18 +884,21 @@ sc_baseline_create() {
         rkhunter --propupd --dbdir "$stage" --hash "$SC_BASELINE_HASH_COMMAND" --pkgmgr NONE \
         --nocolors --lang en --logfile "$SC_RUN_DIR/baseline-create.log"
     rc=$?
+    SC_BASELINE_FAILURE="rkhunter --propupd: exit=$rc; binary or unreadable stderr"
     ((rc == 0)) && sc_no_nul "$SC_RUN_DIR/baseline-create.stderr" || return 1
     while IFS= read -r line || [[ -n $line ]]; do
         case $line in
             '') ;;
             'egrep: warning: egrep is obsolescent; using grep -E')
                 sc_add_diagnostic rkhunter rkh_legacy_grep "$line";;
-            *) return 1;;
+            *) SC_BASELINE_FAILURE="rkhunter --propupd: $(sc_text "$line")"; return 1;;
         esac
     done < "$SC_RUN_DIR/baseline-create.stderr"
     sc_baseline_validate_candidate "$stage/rkhunter.dat" || return 1
+    SC_BASELINE_FAILURE="installation: database permissions or reference appeared meanwhile"
     sc_baseline_trusted_dir "$SC_BASELINE_DB" && sc_baseline_target_missing || return 1
     install=$(umask 077; mktemp "$SC_BASELINE_DB/.seccheck-baseline.XXXXXX") || return 1
+    SC_BASELINE_FAILURE="installation: private copy, permissions or exclusive creation"
     if ! cp -- "$stage/rkhunter.dat" "$install" || ! chmod 600 -- "$install"; then rm -f -- "$install"; return 1; fi
     path="$SC_BASELINE_DB/rkhunter.dat"
     ln -T -- "$install" "$path" > "$SC_RUN_DIR/baseline-install.stdout" 2> "$SC_RUN_DIR/baseline-install.stderr"; rc=$?
@@ -957,6 +987,11 @@ sc_offer_baseline() {
     sc_add_diagnostic rkhunter baseline_setup "state=$SC_BASELINE_STATE; reason=$SC_BASELINE_REASON; checked=$SC_BASELINE_CHECKED; consent=$SC_BASELINE_CONFIRMED"
     [[ $SC_BASELINE_STATE != created ]] || sc_line "$(sc_t baseline_created)" "$SC_C_GREEN"
     [[ -z $SC_BASELINE_REASON ]] || sc_line "$(sc_t "$SC_BASELINE_REASON")" "$SC_C_AMBER"
+    if [[ $SC_BASELINE_STATE == failed ]]; then
+        sc_line "$(sc_t baseline_failure_cause): $(sc_text "${SC_BASELINE_FAILURE:-unknown}")" "$SC_C_AMBER"
+        printf '%s\n' "${SC_BASELINE_FAILURE:-unknown}" > "$SC_RUN_DIR/baseline-failure.txt"
+        sc_add_diagnostic rkhunter baseline_failure "${SC_BASELINE_FAILURE:-unknown}"
+    fi
     sc_assess
     sc_save_report || { SC_RUN_ACTIVE=0 SC_BASELINE_ACTIVE=0; trap - INT TERM; sc_line "$(sc_t save_error)"; return 73; }
     SC_RUN_ACTIVE=0 SC_BASELINE_ACTIVE=0; trap - INT TERM
@@ -1175,6 +1210,7 @@ sc_t() {
         rkh_prerequisite_detail) en="Prerequisite failure reported by rkhunter:"; it="Causa segnalata da rkhunter:";;
         rkh_baseline_missing) en="The initial file snapshot (rkhunter.dat) is missing or empty. rkhunter cannot compare changes over time."; it="Manca la prima fotografia dei file (rkhunter.dat), oppure è vuota. rkhunter non può confrontare le modifiche nel tempo.";;
         rkh_baseline_help) en="--propupd records the current files as a reference. Use it only after checking their contents and source."; it="--propupd registra i file attuali come riferimento. Va usato solo dopo averne verificato contenuto e provenienza.";;
+        baseline_failure_cause) en="Stopped at"; it="Blocco individuato";;
         baseline_help) en="Would you like help configuring it? [y/N]"; it="Vuoi che ti aiuti a configurarlo? [s/N]";;
         baseline_setup) en="RKHUNTER: INITIAL SETUP"; it="RKHUNTER: CONFIGURAZIONE INIZIALE";;
         baseline_explain) en="The initial reference is missing. It lets rkhunter compare files between scans."; it="Manca il riferimento iniziale. Serve a confrontare i file tra una scansione e l’altra.";;

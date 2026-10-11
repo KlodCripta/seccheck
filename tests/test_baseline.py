@@ -68,6 +68,7 @@ if [[ $action == --propupd ]]; then
     extra) printf 'File:0:/unchecked/file:%064d:1:0644:0:0:1:1::0::\n' 0 >> "$db/rkhunter.dat";;
     empty) : > "$db/rkhunter.dat";;
     wronghash) sed -i 's/^Hash:.*/Hash:NONE/' "$db/rkhunter.dat";;
+    mismatch) sed -i 's/^File:0:/File:1:/' "$db/rkhunter.dat";;
     failure) exit 1;;
     concurrent) printf 'existing administrator baseline\n' > "$SC_TEST_DIR/db/rkhunter.dat";;
     legacy) printf 'egrep: warning: egrep is obsolescent; using grep -E\n' >&2;;
@@ -395,6 +396,14 @@ sc_run_requested
                 out = self.execute('sc_offer_baseline <<< s; printf "STATE|%s" "$SC_BASELINE_STATE"', SC_CANDIDATE=kind)
                 self.assertIn('STATE|' + state, out)
                 self.assertEqual(target.exists(), state == 'created')
+
+    def test_creation_failure_reports_the_failed_step(self):
+        for kind, detail in (('wronghash', 'Hash'), ('failure', 'exit=1'), ('regex', 'stray'), ('mismatch', 'path-format')):
+            with self.subTest(kind=kind):
+                (self.db / 'rkhunter.dat').unlink(missing_ok=True)
+                out = self.execute('sc_offer_baseline <<< s', SC_CANDIDATE=kind)
+                self.assertIn(detail, out)
+                self.assertIn(detail, (self.run / 'baseline-failure.txt').read_text())
 
     def test_repeat_error_or_unfinished_output_never_becomes_complete(self):
         for kind in ('error', 'unfinished'):
