@@ -1,255 +1,110 @@
-# English
+# SecCheck 2.0 — development
 
-<p align="center">
-  <img src="seccheck_poster.png" width="500" alt="SecCheck poster">
-</p>
+A terminal security assistant for **Arch Linux and its derivatives**.
+Choose English or Italian, start a scan and let SecCheck investigate the warnings.
 
-<h1 align="center">SecCheck – Security & Integrity Check</h1>
+![Current menu](screenshots/seccheck-v2-menu.png)
 
-<p align="center">
-A Bash tool for Arch Linux that helps you read and understand system security signals more clearly.
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/Arch%20Linux-supported-1793D1?style=for-the-badge&logo=arch-linux">
-  <img src="https://img.shields.io/badge/Bash-Script-green?style=for-the-badge&logo=gnu-bash">
-  <img src="https://img.shields.io/badge/status-stable-green?style=for-the-badge">
-</p>
-
----
-
-SecCheck is a Bash tool designed for Arch Linux and its derivatives.
-
-It does not introduce new scanning techniques and it does not replace existing tools.  
-Instead, it combines real system checks and presents them in a clearer and more readable way.
-
-The goal is simple: help you understand what is happening on your system without getting lost in raw output or generic warnings.
-
-SecCheck uses three core components.  
-It relies on rkhunter to detect suspicious patterns, Lynis to perform a system audit, and pacman to verify package integrity.
-
-At the end of a scan, results are summarized and presented with a visual risk indicator.
-
-If something needs attention, SecCheck can optionally run a contextual verification phase.  
-This step analyzes files, packages and paths involved, helping distinguish between normal behavior, false positives and potential anomalies.
-
----
-## Screenshot
-
-<p align="center">
-  <img src="screenshots/01_menu.png" width="300">
-</p>
-
----
-
-## Output
-
-All output is bilingual.
-
-Messages are shown in English with an Italian translation directly below each line.
-
----
-
-## Installation
-
-### Clone the repository
+## Start
 
 ```bash
-git clone https://github.com/KlodCripta/seccheck.git
+git clone --branch codex/seccheck-2.0 https://github.com/KlodCripta/seccheck.git
 cd seccheck
-chmod +x seccheck.sh
-./seccheck.sh
+bash seccheck.sh
 ```
 
----
+Choose **1 English** or **2 Italiano**. SecCheck checks the tools at startup and
+shows missing packages only. Accept their installation with pacman or continue
+with the available checks. Scans request root through sudo when needed.
 
-## AUR
+The main menu has three actions:
 
-SecCheck it's available on AUR.
+1. **Full scan:** rkhunter, Lynis and package-file integrity.
+2. **Individual checks:** choose one of those checks.
+3. **Tools:** dependencies or rkhunter signature updates.
 
----
+## After a scan
 
-## Usage
+The initial result shows the number of items to verify and any incomplete checks.
+It asks: **“Vuoi che faccia io le verifiche del caso al posto tuo?”**
+
+- **s** in Italian, **y** in English: analyze the warnings automatically.
+- **m**: show the warnings first, then return to the choice. The technical report
+  is available here too, without accepting automatic analysis.
+- **0** or Enter: finish with the initial result.
+
+Automatic analysis compares supported files with their local package records,
+checks SSH settings/version and investigates reported temporary files under `/dev`.
+It uses the existing privileges. The final result separates explained warnings,
+remaining items and optional improvements. Original evidence remains available.
+
+**Remaining items** shows only unresolved warnings, five per page, with an
+explanation and a next step. **Other results** contains improvements, explained
+warnings, a short report and the full technical report. Logs are shown on request.
+
+![Sample result](screenshots/seccheck-v2-result.png)
+
+## Understanding the result
+
+| Colour | Meaning |
+| --- | --- |
+| Green | No unresolved warnings in the completed, selected checks. |
+| Orange | Warnings need investigation, or checks are incomplete. |
+| Red | A serious indicator needs priority investigation. |
+
+Warnings are not an infection count. Configuration files can change during normal
+use. Optional Lynis suggestions are separate from unresolved warnings and do not
+turn an otherwise complete, clear result orange. A missing check cannot be green.
+SecCheck gives no percentage of infection or guarantee of safety.
+
+The interface uses cold white, bold and italic text, red SEC/white CHECK, and
+orange/green result indicators. It keeps your terminal background. Narrow terminals,
+`NO_COLOR`, `--no-color` and `--ascii` are supported.
+
+## Tools and command line
+
+Requires Bash 4.4+, pacman and GNU coreutils/grep. Scanner packages are **rkhunter**,
+**lynis** and **pacutils** (`paccheck` and `pacfile`). Optional **psmisc** supplies
+`fuser` for temporary-file observations. Python is used only by development tests.
 
 ```bash
-./seccheck.sh
+sudo bash seccheck.sh --lang it --scan full
+sudo bash seccheck.sh --lang en --scan integrity --no-color
+bash seccheck.sh --lang it --demo review
+bash seccheck.sh --help
 ```
 
-SecCheck requires elevated privileges for some checks. If needed, it will request them automatically during execution.
-The tool provides a simple menu to run a full scan or individual modules.
+Batch scans require `--lang` and perform the initial checks. Automatic follow-ups
+require the interactive choice; a pipeline cannot silently approve them.
+Exit status: **0** no urgent/review items in completed checks; **1** unresolved
+items; **2** incomplete checks; other values indicate setup errors.
 
-At the end of the scan, a report is generated.
-If anomalies are detected, you will be prompted to run contextual verification.
+Reports are private under `/var/log/seccheck/run.*` (directory 700, files 600).
+`report.txt` retains full evidence; `findings.tsv`, `checks.tsv`, `modules.tsv` and
+original scanner logs support technical analysis. Review private paths before sharing.
 
----
+SecCheck investigates and suggests next steps. After accepted automatic checks,
+a missing rkhunter baseline gets a guided setup: verify its complete file
+list against local package records, ask a **separate confirmation**, prepare and
+validate an initial reference, then repeat rkhunter. An established reference is
+never replaced, even if empty. Unverifiable files or an unsupported native
+comparison method block setup. Local matches do not establish
+trusted origin: proceed only if you trust the installed system and packages.
 
-## Requirements
+The original scan and unexplained warnings are retained. SecCheck does not
+restore configuration files, delete reported files or apply hardening rules.
 
-- Arch Linux or Arch-based distribution
-- rkhunter
-- lynis
+This is a **development version**. Test on Arch and its derivatives before release.
+See [verification notes](docs/VALIDATION.md) and
+[automatic-check details](docs/RKHUNTER_CONTEXT.md).
 
-Dependencies are checked automatically.
-If missing, SecCheck can install them on request.
+## Development
 
----
-
-## Philosophy
-
-SecCheck is not an antivirus.
-
-It does not guarantee that a system is safe and it does not claim to detect every threat.
-
-It is designed to reduce ambiguity and help interpret system signals more clearly.
-
----
-
-## Testing
-
-SecCheck includes a test harness to validate the parsing logic.
-
-Run all tests:
+```bash
+bash -n seccheck.sh seccheck_test.sh
+shellcheck --severity=warning seccheck.sh seccheck_test.sh
 bash seccheck_test.sh
-
-Run specific modules:
-bash seccheck_test.sh RK
-bash seccheck_test.sh LY
-
-The test suite currently includes 57 cases covering:
-- rkhunter output parsing
-- lynis warnings and suggestions
-- pacman integrity checks
-
----
-
-## License
-
-This project is released under the MIT License.
-
----
-
-## Italiano
-
-<p align="center">
-  <img src="seccheck_poster.png" width="500" alt="SecCheck poster">
-</p>
-
-<h1 align="center">SecCheck – Security & Integrity Check</h1>
-
-<p align="center">
-A Bash tool for Arch Linux that helps you read and understand system security signals more clearly.
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/Arch%20Linux-supported-1793D1?style=for-the-badge&logo=arch-linux">
-  <img src="https://img.shields.io/badge/Bash-Script-green?style=for-the-badge&logo=gnu-bash">
-  <img src="https://img.shields.io/badge/status-stable-green?style=for-the-badge">
-</p>
-
----
-
-SecCheck è un tool scritto in Bash pensato per Arch Linux e derivate.
-
-Non introduce nuovi metodi di scansione e non sostituisce strumenti esistenti.
-Mette insieme controlli reali già disponibili nel sistema e li presenta in modo più leggibile.
-
-L’obiettivo è semplice: aiutarti a capire cosa sta succedendo nel sistema senza dover interpretare output grezzi o warning poco chiari.
-
-SecCheck utilizza tre componenti principali.
-Usa rkhunter per individuare segnali sospetti, Lynis per eseguire un audit del sistema e pacman per verificare l’integrità dei pacchetti.
-
-Al termine della scansione, i risultati vengono riassunti e mostrati con un indicatore visivo del rischio.
-
-Se vengono rilevati elementi che meritano attenzione, il tool può eseguire una verifica contestuale opzionale.
-Questa fase analizza file, pacchetti e percorsi coinvolti, aiutando a distinguere tra comportamenti normali, falsi positivi e possibili anomalie.
-
----
-## Screenshot
-
-<p align="center">
-  <img src="screenshots/01_menu.png" width="300">
-</p>
-
----
-
-## Output
-
-L’output è bilingue.
-
-Ogni messaggio viene mostrato in inglese con traduzione italiana subito sotto.
-
----
-
-## Installazione
-
-Clonare il repository
-
-```bash
-git clone https://github.com/KlodCripta/seccheck.git
-cd seccheck
-chmod +x seccheck.sh
-./seccheck.sh
 ```
 
-## AUR
-
-SecCheck è disponibile su AUR.
-
----
-
-## Utilizzo
-
-```bash
-./seccheck.sh
-```
-
-SecCheck richiede privilegi elevati per alcuni controlli. Se necessario, li richiederà automaticamente durante l’esecuzione.
-Il tool propone un menu semplice per eseguire una scansione completa o singoli moduli.
-
-Al termine viene generato un report.
-Se vengono rilevate anomalie, viene proposta la verifica contestuale.
-
----
-
-## Requisiti
-
-- Arch Linux o derivata
-- rkhunter
-- lynis
-
-Le dipendenze vengono controllate automaticamente.
-Se mancanti, SecCheck può installarle su richiesta.
-
----
-
-## Filosofia
-
-SecCheck non è un antivirus.
-
-Non garantisce che un sistema sia sicuro e non pretende di rilevare ogni minaccia.
-
-È uno strumento pensato per ridurre l’ambiguità e aiutare a interpretare meglio i segnali del sistema.
-
----
-
-## Test
-
-SecCheck include un sistema di test per verificare la logica di parsing.
-
-Eseguire tutti i test:
-bash seccheck_test.sh
-
-Eseguire moduli specifici:
-bash seccheck_test.sh RK
-bash seccheck_test.sh LY
-
-La suite contiene attualmente 57 casi che coprono:
-- parsing output rkhunter
-- warning e suggerimenti di lynis
-- controlli di integrità pacman
-
----
-
-## Licenza
-
-Questo progetto è rilasciato sotto licenza MIT.
+Tests use temporary files and inert scanner commands. License: [MIT](LICENSE).
+External scanner implementations are not bundled.

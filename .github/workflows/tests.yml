@@ -1,0 +1,19 @@
+name: Bash and regression tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax
+        run: bash -n seccheck.sh seccheck_test.sh
+      - name: ShellCheck
+        run: shellcheck --severity=warning seccheck.sh seccheck_test.sh
+      - name: Behavior and inert scanner fixtures
+        run: bash seccheck_test.sh
+      - name: Demonstration CLI
+        run: |
+          bash seccheck.sh --lang en --demo clean --ascii
+          bash seccheck.sh --lang it --demo urgent --no-color
