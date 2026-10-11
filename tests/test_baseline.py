@@ -43,6 +43,11 @@ fi
         self.command('rkhunter', '''
 [[ $1 != --version ]] || { printf 'Rootkit Hunter 1.4.6\n'; exit; }
 action=$1; db=''; log=''; hash=''
+for option in "$@"; do
+  if [[ $action == --propupd && $option == --enable ]]; then
+    printf 'read: 0: read error: Bad file descriptor\n' >&2; exit 1
+  fi
+done
 while (($#)); do
   case $1 in --dbdir) db=$2; shift;; --logfile) log=$2; shift;; --hash) hash=$2; shift;; esac
   shift

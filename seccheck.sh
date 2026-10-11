@@ -855,7 +855,7 @@ sc_baseline_create() {
     [[ $SC_BASELINE_HASH_COMMAND == /* ]] || return 1
     sc_capture "$SC_RUN_DIR/baseline-create.stdout" "$SC_RUN_DIR/baseline-create.stderr" 240 \
         rkhunter --propupd --dbdir "$stage" --hash "$SC_BASELINE_HASH_COMMAND" --pkgmgr NONE \
-        --enable hashes,attributes --nocolors --lang en --logfile "$SC_RUN_DIR/baseline-create.log"
+        --nocolors --lang en --logfile "$SC_RUN_DIR/baseline-create.log"
     rc=$?
     ((rc == 0)) && sc_no_nul "$SC_RUN_DIR/baseline-create.stderr" || return 1
     while IFS= read -r line || [[ -n $line ]]; do
@@ -1193,7 +1193,7 @@ sc_t() {
         baseline_guard) en="An urgent warning or a flagged checking tool blocks initial setup. Check the remaining items first."; it="Un avviso urgente o uno strumento da verificare blocca la configurazione. Controlla prima gli Elementi rimasti.";;
         baseline_limit) en="The file or time limit was reached. Initial setup stays incomplete."; it="Raggiunto il limite di file o di tempo. La configurazione iniziale resta da completare.";;
         baseline_files) en="A file could not be verified against its package. No reference created; see Remaining items."; it="Un file non è verificabile rispetto al suo pacchetto. Riferimento non creato: lo trovi in Elementi rimasti.";;
-        baseline_failed) en="The reference could not be prepared or installed. The previous reference is preserved; see the technical report."; it="Non sono riuscito a preparare o installare il riferimento. Quello precedente è conservato; dettagli nel rapporto tecnico.";;
+        baseline_failed) en="The initial reference could not be created. No reference was replaced; see the technical report."; it="Non sono riuscito a creare il riferimento iniziale. Nessun riferimento è stato sostituito; dettagli nel rapporto tecnico.";;
         rkh_optional) en="Optional or unconfigured tests excluded from this scan:"; it="Test facoltativi o non configurati esclusi da questa scansione:";;
         rkh_optional_short) en="Optional tests excluded; reasons in the report."; it="Test facoltativi esclusi; motivi nel rapporto.";;
         followup_question) en="Would you like me to run the follow-up checks for you?"; it="Vuoi che faccia io le verifiche del caso al posto tuo?";;
