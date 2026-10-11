@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SecCheck 2.0 — Klod Cripta — MIT
-# Standalone, read-only security assistant for Arch Linux and derivatives.
+# Standalone security assistant for Arch Linux and derivatives.
+# Checks are read-only; initial rkhunter setup needs separate confirmation.
 # Sourcing this file defines functions only: no traps, privilege changes or I/O.
 
 SC_VERSION=2.0.0
@@ -24,6 +25,9 @@ sc_reset() {
     declare -ga SC_SCOPE=()
     declare -ga SC_RKH_OPTIONAL=()
     SC_FOLLOWUPS_DONE=0 SC_FOLLOWUPS_ACTIVE=0 SC_FOLLOWUPS_INTERRUPTED=0
+    SC_BASELINE_STATE='' SC_BASELINE_REASON='' SC_BASELINE_CHECKED=0
+    SC_BASELINE_CONFIRMED=0 SC_BASELINE_ACTIVE=0 SC_RKH_CONTEXT_TAG=rkh-context
+    declare -ga SC_BASELINE_PATHS=() SC_BASELINE_RECORDS=()
     local module
     for module in $SC_ALL_MODULES; do
         SC_MODULE_STATUS[$module]=not-run
@@ -292,7 +296,7 @@ sc_rkh_tool_allowed() {
 }
 
 sc_rkh_check_dev() {
-    local i=$1 object=${SC_F_OBJECT[$1]} prefix="$SC_RUN_DIR/rkh-context.$1"
+    local i=$1 object=${SC_F_OBJECT[$1]} prefix="$SC_RUN_DIR/${SC_RKH_CONTEXT_TAG:-rkh-context}.$1"
     local type uid gid mode owner extra rc size pids pid line executable package tool started=$SECONDS count=0
     local -a processes=()
     SC_F_CHECK_KEY[i]=rkh_dev_unknown
@@ -379,7 +383,7 @@ sc_rkh_check_dev() {
 }
 
 sc_rkh_check_file() {
-    local i=$1 object=${SC_F_OBJECT[$1]} prefix="$SC_RUN_DIR/rkh-context.$1"
+    local i=$1 object=${SC_F_OBJECT[$1]} prefix=${2:-"$SC_RUN_DIR/${SC_RKH_CONTEXT_TAG:-rkh-context}.$1"}
     local line field value package='' recorded='' digest='' actual='' size rc
     local files=0 owners=0 modes=0 types=0 uids=0 groups=0 hashes=0 metadata=0
     SC_F_CHECK_KEY[i]=rkh_file_unknown
@@ -394,8 +398,9 @@ sc_rkh_check_file() {
     fi
     sc_capture "$prefix.pacfile" "$prefix.stderr" 20 pacfile --check -- "$object"
     rc=$?
-    SC_F_CHECK_DETAIL[i]="log=rkh-context.$i.pacfile / rkh-context.$i.stderr"
+    SC_F_CHECK_DETAIL[i]="log=${prefix##*/}.pacfile / ${prefix##*/}.stderr"
     ((rc == 0)) && [[ ! -s $prefix.stderr ]] || return
+    sc_no_nul "$prefix.pacfile" || return
     while IFS= read -r line || [[ -n $line ]]; do
         if [[ $line == "no package owns '$object'" ]]; then SC_F_CHECK_KEY[i]=rkh_file_unowned; return; fi
         field=${line%%:*}; value=${line#*:}; value=${value#"${value%%[![:space:]]*}"}
@@ -420,14 +425,14 @@ sc_rkh_check_file() {
     ((rc == 0)) && [[ ! -s $prefix.sha256.stderr ]] || return
     read -r actual _ < "$prefix.sha256"
     [[ $actual =~ ^[0-9a-f]{64}$ ]] || return
-    SC_F_CHECK_DETAIL[i]="$(sc_t package): $package; log=rkh-context.$i.pacfile / rkh-context.$i.sha256"
+    SC_F_CHECK_DETAIL[i]="$(sc_t package): $package; log=${prefix##*/}.pacfile / ${prefix##*/}.sha256"
     if [[ $actual != "$digest" ]]; then SC_F_CHECK_KEY[i]=rkh_file_changed
     elif ((metadata)); then SC_F_CHECK_KEY[i]=rkh_file_metadata
     else SC_F_CHECK_KEY[i]=rkh_file_match; SC_F_PRIORITY[i]=info; SC_F_CONFIDENCE[i]=observation; fi
 }
 
 sc_rkh_ssh_evidence() {
-    local i=$1 command=$2 rc=$3 prefix=${4:-"$SC_RUN_DIR/rkh-context.$1"} excerpt
+    local i=$1 command=$2 rc=$3 prefix=${4:-"$SC_RUN_DIR/${SC_RKH_CONTEXT_TAG:-rkh-context}.$1"} excerpt
     # Show a short, inert excerpt; the full original streams stay in the report directory.
     excerpt=$(timeout 2 head -c 320 -- "$prefix.stderr" 2>/dev/null)
     [[ -n $excerpt ]] || excerpt=$(timeout 2 head -c 320 -- "$prefix.ssh" 2>/dev/null)
@@ -435,7 +440,7 @@ sc_rkh_ssh_evidence() {
 }
 
 sc_rkh_check_ssh() {
-    local i=$1 prefix="$SC_RUN_DIR/rkh-context.$1" value='' line rc major minor count=0 j executable resolved other guard_started=$SECONDS
+    local i=$1 prefix="$SC_RUN_DIR/${SC_RKH_CONTEXT_TAG:-rkh-context}.$1" value='' line rc major minor count=0 j executable resolved other guard_started=$SECONDS
     local query=-T error_size
     SC_F_CHECK_KEY[i]=rkh_ssh_unknown
     SC_F_CHECK_DETAIL[i]="$(sc_t rkh_ssh_not_started)"
@@ -452,7 +457,7 @@ sc_rkh_check_ssh() {
             SC_F_CHECK_KEY[i]=rkh_ssh_flagged; return
         fi
     done
-    SC_F_CHECK_DETAIL[i]="log=rkh-context.$i.ssh / rkh-context.$i.stderr"
+    SC_F_CHECK_DETAIL[i]="log=${prefix##*/}.ssh / ${prefix##*/}.stderr"
     if [[ ${SC_F_KEY[i]} == rkh_ssh_root ]]; then
         sc_capture "$prefix.ssh" "$prefix.stderr" 10 sshd -T
         rc=$?
@@ -557,8 +562,9 @@ sc_run_rkhunter() {
     if ! command -v rkhunter >/dev/null; then sc_module_set rkhunter skipped missing_rkhunter; return 0; fi
     sc_module_set rkhunter running ''
     SC_MODULE_VERSION[rkhunter]=$(sc_version rkhunter --version)
-    local out="$SC_RUN_DIR/rkhunter.stdout" err="$SC_RUN_DIR/rkhunter.stderr"
-    local raw="$SC_RUN_DIR/rkhunter.log" parsed rc line errors=0 unknown=0 reason
+    local prefix=${1:-"$SC_RUN_DIR/rkhunter"}
+    local out="$prefix.stdout" err="$prefix.stderr"
+    local raw="$prefix.log" parsed rc line errors=0 unknown=0 reason
     SC_RKH_WARNINGS=0
     sc_capture "$out" "$err" 1200 rkhunter --check --nocolors --sk --lang en --logfile "$raw"
     rc=$?; SC_MODULE_RC[rkhunter]=$rc
@@ -603,6 +609,339 @@ sc_run_rkhunter() {
     elif [[ -s $out || -s $raw ]]; then sc_module_set rkhunter partial unfinished
     else sc_module_set rkhunter failed command_failed
     fi
+}
+
+# ---- Guided first baseline: package checks, consent, staged native output -----
+sc_baseline_safe_path() {
+    [[ $1 == /* && $1 != / && ${#1} -le 4096 && $1 == "$(sc_text "$1")" &&
+       $1 != *:* && $1 != *"'"* && $1 != *'//'* && $1 != */./* && $1 != */../* &&
+       $1 != */. && $1 != */.. && $1 != */ ]]
+}
+
+sc_baseline_trusted_dir() {
+    local path=$1 resolved data uid mode
+    sc_baseline_safe_path "$path" || return 1
+    resolved=$(timeout 5 readlink -fn -- "$path") || return 1
+    [[ $resolved == "$path" && -d $path && ! -L $path ]] || return 1
+    while [[ $path != / ]]; do
+        data=$(timeout 5 stat -c '%u %a' -- "$path") || return 1
+        read -r uid mode <<< "$data"
+        [[ ( $uid == 0 || $uid == "$EUID" ) && $mode =~ ^[0-7]{3,4}$ ]] || return 1
+        # A root-owned sticky ancestor (e.g. /tmp) is permitted, but the
+        # database directory itself must never be shared/writable by others.
+        if (( (8#$mode & 0022) != 0 )); then
+            [[ $path != "$1" && $uid == 0 ]] && (( (8#$mode & 01000) != 0 )) || return 1
+        fi
+        path=${path%/*}; [[ -n $path ]] || path=/
+    done
+}
+
+sc_baseline_guard() {
+    local tool i
+    for i in "${!SC_F_PRIORITY[@]}"; do
+        [[ ${SC_F_PRIORITY[i]} != urgent ]] || return 1
+        # Native rkhunter launches indirect/configured utilities too. Do not
+        # start it while an identified executable remains under suspicion.
+        if [[ ${SC_F_PRIORITY[i]} == review && ${SC_F_OBJECT[i]} == /* && -x ${SC_F_OBJECT[i]} && ! -d ${SC_F_OBJECT[i]} ]]; then return 1; fi
+    done
+    for tool in rkhunter pacfile timeout stat readlink sha256sum grep tr head cat cp chmod mkdir mktemp ln mv rm; do
+        command -v "$tool" >/dev/null && sc_rkh_tool_allowed "$tool" || return 1
+    done
+}
+
+sc_baseline_input_file() {
+    local file=$1 data uid mode bytes
+    [[ -f $file && ! -L $file ]] || return 1
+    data=$(timeout 5 stat -c '%u %a %s' -- "$file") || return 1
+    read -r uid mode bytes <<< "$data"
+    [[ ( $uid == 0 || $uid == "$EUID" ) && $mode =~ ^[0-7]{3,4}$ && $bytes =~ ^[0-9]{1,10}$ ]] || return 1
+    (( (8#$mode & 0022) == 0 && bytes > 0 && bytes <= 1048576 )) && sc_no_nul "$file"
+}
+
+sc_baseline_target_missing() {
+    local path="$SC_BASELINE_DB/rkhunter.dat"
+    # There is no shell-level compare-and-swap replacement for an empty file.
+    # Create-only installation must not overwrite a concurrently populated one.
+    [[ ! -e $path && ! -L $path ]]
+}
+
+sc_baseline_link() {
+    local object=$1 prefix=$2 line field value rc files=0 owners=0 modes=0 types=0 uids=0 groups=0 targets=0
+    local recorded='' target='' link=''
+    sc_capture "$prefix.link" "$prefix.link.stderr" 5 pacfile --check -- "$object"
+    rc=$?
+    ((rc == 0)) && [[ ! -s $prefix.link.stderr ]] && sc_no_nul "$prefix.link" || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        field=${line%%:*}; value=${line#*:}; value=${value#"${value%%[![:space:]]*}"}
+        case $field in
+            file) ((files+=1)); recorded=$value;;
+            owner)
+                if [[ $value =~ ^[A-Za-z0-9@_+.-]+$ ]]; then ((owners+=1));
+                elif [[ $value =~ ^[0-9]+/[^\(]*$ ]]; then ((uids+=1)); fi;;
+            group) [[ $value =~ ^[0-9]+/[^\(]*$ ]] && ((groups+=1));;
+            mode) [[ $value =~ ^[0-7]{3,4}$ ]] && ((modes+=1));;
+            type) [[ $value == link ]] && ((types+=1));;
+            target) ((targets+=1)); target=$value;;
+        esac
+    done < "$prefix.link"
+    ((files == 1 && owners == 1 && modes == 1 && types == 1 && uids == 1 && groups == 1 && targets == 1)) || return 1
+    [[ $recorded == "${object#/}" && -n $target && $target != *:* ]] || return 1
+    sc_capture "$prefix.target" "$prefix.target.stderr" 5 readlink -n -- "$object"
+    rc=$?
+    ((rc == 0)) && [[ ! -s $prefix.target.stderr ]] && sc_no_nul "$prefix.target" || return 1
+    link=$(cat "$prefix.target"; printf '.'); link=${link%.}
+    [[ $link == "$target" && $link == "$(sc_text "$link")" ]]
+}
+
+sc_baseline_file() {
+    local object=$1 prefix=$2 canonical parent='' part rc link='' digest='' attrs='' i=${#SC_F_OBJECT[@]} n=0
+    local -a parts=()
+    SC_BASELINE_FILE_KEY=rkh_file_unknown
+    SC_BASELINE_FILE_DETAIL="log=${prefix##*/}.*"
+    # Check every parent alias as a package symlink before resolving it. Merely
+    # checking /usr/bin/tool cannot establish the metadata of /bin itself.
+    IFS=/ read -r -a parts <<< "${object#/}"
+    for part in "${parts[@]:0:${#parts[@]}-1}"; do
+        parent+="/$part"
+        if [[ -L $parent ]]; then
+            sc_baseline_link "$parent" "$prefix.parent.$n" || return 1
+            sc_capture "$prefix.parent" "$prefix.parent.stderr" 5 readlink -fn -- "$parent"
+            rc=$?
+            ((rc == 0)) && [[ ! -s $prefix.parent.stderr ]] && sc_no_nul "$prefix.parent" || return 1
+            parent=$(cat "$prefix.parent"; printf '.'); parent=${parent%.}
+            sc_baseline_safe_path "$parent" || return 1
+        fi
+        ((n+=1))
+    done
+    canonical="$parent/${object##*/}"
+    if [[ -L $canonical ]]; then
+        sc_baseline_link "$canonical" "$prefix" || return 1
+        sc_capture "$prefix.resolve" "$prefix.resolve.stderr" 5 readlink -fn -- "$canonical"
+        rc=$?
+        ((rc == 0)) && [[ ! -s $prefix.resolve.stderr ]] && sc_no_nul "$prefix.resolve" || return 1
+        canonical=$(cat "$prefix.resolve"; printf '.'); canonical=${canonical%.}
+        sc_baseline_safe_path "$canonical" || return 1
+        link=$canonical
+    fi
+    # Reuse the strict regular-file verifier in a temporary numeric slot;
+    # baseline checks never change the user's existing finding outcomes.
+    SC_F_OBJECT[i]=$canonical SC_F_PRIORITY[i]=review SC_F_CONFIDENCE[i]=observation
+    sc_rkh_check_file "$i" "$prefix"
+    SC_BASELINE_FILE_KEY=${SC_F_CHECK_KEY[i]}
+    unset 'SC_F_OBJECT[i]' 'SC_F_PRIORITY[i]' 'SC_F_CONFIDENCE[i]' 'SC_F_CHECK_KEY[i]' 'SC_F_CHECK_DETAIL[i]'
+    [[ $SC_BASELINE_FILE_KEY == rkh_file_match ]] || return 1
+    read -r digest _ < "$prefix.sha256"
+    attrs=$(timeout 5 stat -c '%i:0%a:%u:%g:%s:%Y' -- "$object") || return 1
+    [[ $attrs =~ ^[0-9]+:0[0-7]{3,4}:[0-9]+:[0-9]+:[0-9]+:-?[0-9]+$ ]] || return 1
+    # Native rkhunter stores exactly four mode digits, including setuid/sticky.
+    [[ ! $attrs =~ ^[0-9]+:0[0-7]{4}: ]] || attrs="${attrs%%:*}:${attrs#*:0}"
+    SC_BASELINE_RECORD="File:0:$object:$digest:$attrs::0:$link:"
+}
+
+sc_baseline_prepare() {
+    local raw="$SC_RUN_DIR/rkhunter.log" line directory='' count=0 path seen i started=$SECONDS hash=''
+    SC_BASELINE_STATE=blocked SC_BASELINE_REASON=baseline_unavailable SC_BASELINE_CHECKED=0
+    SC_BASELINE_PATHS=() SC_BASELINE_RECORDS=()
+    sc_baseline_guard || { SC_BASELINE_REASON=baseline_guard; return 0; }
+    [[ -f $raw && ! -L $raw ]] && sc_no_nul "$raw" || return 0
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line#\[*\] }; line=${line#'Info: '}
+        if [[ $line == "Using '"*"' as the database directory" ]]; then
+            ((count+=1)); directory=${line#"Using '"}; directory=${directory%"' as the database directory"}
+        fi
+        if [[ $line == "No package manager specified: using hash function '"*"'" ]]; then
+            [[ -z $hash ]] || { SC_BASELINE_REASON=baseline_hash; return 0; }
+            hash=${line#"No package manager specified: using hash function '"}; hash=${hash%"'"}
+        fi
+    done < "$raw"
+    ((count == 1)) || return 0
+    sc_baseline_trusted_dir "$directory" || return 0
+    SC_BASELINE_DB=$directory
+    if ! sc_baseline_target_missing; then
+        SC_BASELINE_REASON=baseline_exists
+        [[ ! -f $directory/rkhunter.dat || -L $directory/rkhunter.dat || -s $directory/rkhunter.dat ]] || SC_BASELINE_REASON=baseline_empty
+        return 0
+    fi
+    SC_BASELINE_HASH_COMMAND=$(command -v sha256sum) || return 0
+    if [[ ! $hash =~ ^/[A-Za-z0-9_./+-]+$ || ! $hash -ef $SC_BASELINE_HASH_COMMAND ]]; then
+        SC_BASELINE_REASON=baseline_hash; return 0
+    fi
+    # rkhunter compares the recorded command string as well as the algorithm.
+    # Preserve its native path even when /bin and /usr/bin identify one inode.
+    SC_BASELINE_HASH_COMMAND=$hash
+    path="$directory/rkhunter_prop_list.dat"
+    sc_baseline_input_file "$path" && sc_baseline_trusted_dir "$directory/i18n" &&
+        sc_baseline_input_file "$directory/i18n/en" || return 0
+    cp -- "$path" "$SC_RUN_DIR/baseline-paths.txt" || return 0
+    count=0
+    while IFS= read -r line || [[ -n $line ]]; do
+        ((count+=1)); ((count <= 10000)) && sc_baseline_safe_path "$line" || return 0
+        # Native rkhunter skips absent candidates and directories. Broken
+        # symlinks are retained and fail verification, rather than being skipped.
+        [[ -f $line || -L $line ]] || continue
+        seen=0
+        for path in "${SC_BASELINE_PATHS[@]}"; do [[ $line != "$path" ]] || seen=1; done
+        ((seen == 0)) || continue
+        ((${#SC_BASELINE_PATHS[@]} < 512 && SECONDS-started < 240)) || { SC_BASELINE_REASON=baseline_limit; return 0; }
+        SC_BASELINE_PATHS+=("$line")
+    done < "$SC_RUN_DIR/baseline-paths.txt"
+    ((${#SC_BASELINE_PATHS[@]} > 0)) || return 0
+    printf 'path\tresult\tdetail\n' > "$SC_RUN_DIR/baseline-checks.tsv"
+    for i in "${!SC_BASELINE_PATHS[@]}"; do
+        ((SECONDS-started < 240)) || { SC_BASELINE_REASON=baseline_limit; return 0; }
+        path=${SC_BASELINE_PATHS[i]}
+        if ! sc_baseline_file "$path" "$SC_RUN_DIR/baseline-file.$i"; then
+            printf '%s\t%s\t%s\n' "$path" "$SC_BASELINE_FILE_KEY" "$SC_BASELINE_FILE_DETAIL" >> "$SC_RUN_DIR/baseline-checks.tsv"
+            SC_BASELINE_REASON=baseline_files
+            sc_add_finding rkhunter baseline review observation "$path" baseline_files "$(sc_t baseline_files)"
+            i=$((${#SC_F_MODULE[@]}-1))
+            SC_F_CHECK_KEY[i]=$SC_BASELINE_FILE_KEY SC_F_CHECK_DETAIL[i]=$SC_BASELINE_FILE_DETAIL
+            return 0
+        fi
+        SC_BASELINE_RECORDS+=("$SC_BASELINE_RECORD")
+        ((SC_BASELINE_CHECKED+=1))
+        printf '%s\t%s\t%s\n' "$path" "$SC_BASELINE_FILE_KEY" "$SC_BASELINE_FILE_DETAIL" >> "$SC_RUN_DIR/baseline-checks.tsv"
+        if ((SC_BASELINE_CHECKED % 25 == 0)); then sc_line "$(sc_t baseline_checking): $SC_BASELINE_CHECKED" "$SC_C_MUTED"; fi
+    done
+    SC_BASELINE_STATE=ready SC_BASELINE_REASON=''
+}
+
+sc_baseline_validate_candidate() {
+    local file=$1 line bytes i match count=0 hash=0 attrs=0 format=0 pkg=0 version=0
+    local -a seen=()
+    [[ -f $file && ! -L $file ]] || return 1
+    bytes=$(timeout 5 stat -c '%s' -- "$file") || return 1
+    [[ $bytes =~ ^[0-9]{1,10}$ ]] && ((bytes > 0 && bytes <= 1048576)) && sc_no_nul "$file" || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        case $line in
+            Hash:*) [[ $line == "Hash:$SC_BASELINE_HASH_COMMAND" ]] || return 1; ((hash+=1));;
+            Attributes:*) [[ $line == Attributes:Stored ]] || return 1; ((attrs+=1));;
+            FormatVersion:*) [[ $line == FormatVersion:1 ]] || return 1; ((format+=1));;
+            Pkgmgr:*) [[ $line == Pkgmgr: ]] || return 1; ((pkg+=1));;
+            Version:*) [[ $line =~ ^Version:[0-9]{10}$ ]] || return 1; ((version+=1));;
+            File:*)
+                match=0
+                for i in "${!SC_BASELINE_RECORDS[@]}"; do
+                    if [[ $line == "${SC_BASELINE_RECORDS[i]}" ]]; then
+                        [[ ${seen[i]:-0} == 0 ]] || return 1
+                        seen[i]=1; match=1; ((count+=1)); break
+                    fi
+                done
+                ((match)) || return 1;;
+            Host:*|Arch:*|OS:*|Prelinked:No) ;;
+            *) return 1;;
+        esac
+    done < "$file"
+    ((hash == 1 && attrs == 1 && format == 1 && pkg == 1 && version == 1 && count == SC_BASELINE_CHECKED && count > 0))
+}
+
+sc_baseline_create() {
+    local stage rc install='' path i record line started=$SECONDS
+    [[ $SC_BASELINE_CONFIRMED == 1 && $SC_BASELINE_STATE == ready ]] || return 1
+    SC_BASELINE_STATE=failed SC_BASELINE_REASON=baseline_failed
+    sc_baseline_guard && sc_baseline_trusted_dir "$SC_BASELINE_DB" && sc_baseline_target_missing || return 1
+    # Recheck after the user's decision; do not register files changed while
+    # the confirmation was on screen. Candidate validation also pins the set.
+    for i in "${!SC_BASELINE_PATHS[@]}"; do
+        ((SECONDS-started < 240)) || return 1
+        record=${SC_BASELINE_RECORDS[i]}
+        sc_baseline_file "${SC_BASELINE_PATHS[i]}" "$SC_RUN_DIR/baseline-confirm.$i" || return 1
+        [[ $SC_BASELINE_RECORD == "$record" ]] || return 1
+    done
+    stage=$(umask 077; mktemp -d "$SC_RUN_DIR/baseline-candidate.XXXXXX") || return 1
+    mkdir -m 700 -- "$stage/i18n" || return 1
+    sc_baseline_trusted_dir "$SC_BASELINE_DB/i18n" && sc_baseline_input_file "$SC_BASELINE_DB/i18n/en" || return 1
+    cp -- "$SC_BASELINE_DB/i18n/en" "$stage/i18n/en" || return 1
+    [[ $SC_BASELINE_HASH_COMMAND == /* ]] || return 1
+    sc_capture "$SC_RUN_DIR/baseline-create.stdout" "$SC_RUN_DIR/baseline-create.stderr" 240 \
+        rkhunter --propupd --dbdir "$stage" --hash "$SC_BASELINE_HASH_COMMAND" --pkgmgr NONE \
+        --enable hashes,attributes --nocolors --lang en --logfile "$SC_RUN_DIR/baseline-create.log"
+    rc=$?
+    ((rc == 0)) && sc_no_nul "$SC_RUN_DIR/baseline-create.stderr" || return 1
+    while IFS= read -r line || [[ -n $line ]]; do
+        case $line in
+            '') ;;
+            'egrep: warning: egrep is obsolescent; using grep -E')
+                sc_add_diagnostic rkhunter rkh_legacy_grep "$line";;
+            *) return 1;;
+        esac
+    done < "$SC_RUN_DIR/baseline-create.stderr"
+    sc_baseline_validate_candidate "$stage/rkhunter.dat" || return 1
+    sc_baseline_trusted_dir "$SC_BASELINE_DB" && sc_baseline_target_missing || return 1
+    install=$(umask 077; mktemp "$SC_BASELINE_DB/.seccheck-baseline.XXXXXX") || return 1
+    if ! cp -- "$stage/rkhunter.dat" "$install" || ! chmod 600 -- "$install"; then rm -f -- "$install"; return 1; fi
+    path="$SC_BASELINE_DB/rkhunter.dat"
+    ln -T -- "$install" "$path" > "$SC_RUN_DIR/baseline-install.stdout" 2> "$SC_RUN_DIR/baseline-install.stderr"; rc=$?
+    rm -f -- "$install"
+    ((rc == 0)) || return 1
+    SC_BASELINE_STATE=created SC_BASELINE_REASON=''
+    sc_add_diagnostic rkhunter baseline_created "db=$SC_BASELINE_DB; verified=$SC_BASELINE_CHECKED; explicit consent; staged SHA-256 baseline"
+    return 0
+}
+
+sc_baseline_repeat() {
+    local i file prefix="$SC_RUN_DIR/rkhunter-repeat"
+    for file in report.txt findings.tsv checks.tsv modules.tsv; do
+        [[ ! -f $SC_RUN_DIR/$file ]] || cp -- "$SC_RUN_DIR/$file" "$SC_RUN_DIR/before-setup.$file" || return 73
+    done
+    # Initial findings stay in the model even if a transient indicator is no
+    # longer present. Only old coverage diagnostics move to their audit file.
+    {
+        printf 'module\tkey\tevidence\n'
+        for i in "${!SC_D_MODULE[@]}"; do
+            [[ ${SC_D_MODULE[i]} == rkhunter ]] || continue
+            printf '%s\t%s\t%s\n' rkhunter "${SC_D_KEY[i]}" "${SC_D_EVIDENCE[i]}"
+            [[ ${SC_D_KEY[i]} == baseline_created ]] && continue
+            unset 'SC_D_MODULE[i]' 'SC_D_KEY[i]' 'SC_D_EVIDENCE[i]'
+        done
+    } > "$SC_RUN_DIR/rkhunter-before-setup.tsv"
+    SC_D_MODULE=("${SC_D_MODULE[@]}") SC_D_KEY=("${SC_D_KEY[@]}") SC_D_EVIDENCE=("${SC_D_EVIDENCE[@]}")
+    SC_RKH_OPTIONAL=()
+    sc_run_rkhunter "$prefix"
+    SC_RKH_CONTEXT_TAG=rkh-repeat-context
+    sc_interpret_rkhunter
+    SC_RKH_CONTEXT_TAG=rkh-context
+    if ((SC_RKH_CONTEXT_PARTIAL)) && [[ ${SC_MODULE_STATUS[rkhunter]} == completed ]]; then
+        sc_module_set rkhunter partial rkh_context_limited
+    fi
+    SC_SCOPE+=('Initial rkhunter setup: full native properties list; <=512 existing files / 240s before another check; local pacfile MTREE + SHA-256; separate consent; staged candidate exact records. Initial log and pre-setup diagnostics retained. Unexplained initial findings remain open.')
+}
+
+sc_offer_baseline() {
+    local i missing=0 answer
+    for i in "${!SC_D_MODULE[@]}"; do
+        [[ ${SC_D_MODULE[i]} == rkhunter && ${SC_D_KEY[i]} == rkh_baseline_missing ]] && missing=1
+    done
+    ((missing && SC_FOLLOWUPS_DONE)) || return 0
+    sc_heading baseline_setup
+    sc_line "$(sc_t baseline_explain)"
+    sc_line "$(sc_t baseline_checking)" "$SC_C_WHITE"
+    SC_RUN_ACTIVE=1 SC_BASELINE_ACTIVE=1
+    trap sc_abort INT TERM
+    sc_baseline_prepare
+    if [[ $SC_BASELINE_STATE == ready ]]; then
+        sc_line "$(sc_t baseline_verified): $SC_BASELINE_CHECKED" "$SC_C_WHITE$SC_C_BOLD"
+        sc_line "$(sc_t baseline_limits)" "$SC_C_WHITE$SC_C_ITALIC"
+        sc_line "$(sc_t baseline_question)" "$SC_C_WHITE$SC_C_BOLD"
+        printf '  > '; IFS= read -r answer || answer=''
+        case $answer in
+            s|S|y|Y)
+                SC_BASELINE_CONFIRMED=1
+                sc_line "$(sc_t baseline_creating)"
+                if sc_baseline_create; then
+                    sc_line "$(sc_t baseline_repeating)"
+                    sc_baseline_repeat || { SC_RUN_ACTIVE=0 SC_BASELINE_ACTIVE=0; trap - INT TERM; sc_line "$(sc_t save_error)"; return 73; }
+                fi;;
+            *) SC_BASELINE_STATE=declined SC_BASELINE_REASON=baseline_declined;;
+        esac
+    fi
+    sc_add_diagnostic rkhunter baseline_setup "state=$SC_BASELINE_STATE; reason=$SC_BASELINE_REASON; checked=$SC_BASELINE_CHECKED; consent=$SC_BASELINE_CONFIRMED"
+    [[ $SC_BASELINE_STATE != created ]] || sc_line "$(sc_t baseline_created)" "$SC_C_GREEN"
+    [[ -z $SC_BASELINE_REASON ]] || sc_line "$(sc_t "$SC_BASELINE_REASON")" "$SC_C_AMBER"
+    sc_assess
+    sc_save_report || { SC_RUN_ACTIVE=0 SC_BASELINE_ACTIVE=0; trap - INT TERM; sc_line "$(sc_t save_error)"; return 73; }
+    SC_RUN_ACTIVE=0 SC_BASELINE_ACTIVE=0; trap - INT TERM
+    [[ $SC_BASELINE_STATE != created ]] || sc_render_summary
 }
 
 sc_parse_lynis() {
@@ -816,6 +1155,24 @@ sc_t() {
         rkh_prerequisite_detail) en="Prerequisite failure reported by rkhunter:"; it="Causa segnalata da rkhunter:";;
         rkh_baseline_missing) en="The initial file snapshot (rkhunter.dat) is missing or empty. rkhunter cannot compare changes over time."; it="Manca la prima fotografia dei file (rkhunter.dat), oppure è vuota. rkhunter non può confrontare le modifiche nel tempo.";;
         rkh_baseline_help) en="--propupd records the current files as a reference. Use it only after checking their contents and source."; it="--propupd registra i file attuali come riferimento. Va usato solo dopo averne verificato contenuto e provenienza.";;
+        baseline_setup) en="RKHUNTER: INITIAL SETUP"; it="RKHUNTER: CONFIGURAZIONE INIZIALE";;
+        baseline_explain) en="The initial reference is missing. It lets rkhunter compare files between scans."; it="Manca il riferimento iniziale. Serve a confrontare i file tra una scansione e l’altra.";;
+        baseline_checking) en="Checking files for the initial reference"; it="Verifico i file per il riferimento iniziale";;
+        baseline_verified) en="Files matching local package records"; it="File conformi ai dati locali dei pacchetti";;
+        baseline_limits) en="This records today's files. It does not clean the PC or prove their origin. Proceed only if you trust the installed system and packages."; it="Registra i file di oggi. Non ripulisce il PC e non ne prova la provenienza. Prosegui solo se ti fidi del sistema e dei pacchetti installati.";;
+        baseline_question) en="Create the initial reference and repeat rkhunter? [y/N]"; it="Creo il riferimento iniziale e ripeto rkhunter? [s/N]";;
+        baseline_creating) en="Preparing and checking the initial reference..."; it="Preparo e verifico il riferimento iniziale...";;
+        baseline_repeating) en="Reference saved. Repeating the rootkit check..."; it="Riferimento salvato. Ripeto il controllo rootkit...";;
+        baseline_created) en="Initial reference created. Other warnings remain for evaluation."; it="Riferimento iniziale creato. Gli altri avvisi restano da valutare.";;
+        baseline_declined) en="Reference not created. You can configure it after a future scan."; it="Riferimento non creato. Potrai configurarlo dopo una prossima scansione.";;
+        baseline_exists) en="An existing reference was found. I will not replace it."; it="Ho trovato un riferimento già presente. Lo conservo.";;
+        baseline_empty) en="The existing reference file is empty. I preserve it; assisted setup can only create a missing reference."; it="Il riferimento presente è vuoto. Lo conservo: la procedura guidata può creare solo un riferimento mancante.";;
+        baseline_hash) en="rkhunter uses a different or unknown file comparison method. I preserve your configuration; no reference created."; it="rkhunter usa un metodo di confronto diverso o sconosciuto. Conservo la tua configurazione; riferimento non creato.";;
+        baseline_unavailable) en="I cannot read a complete, usable rkhunter file list. No reference created; details are in the technical report."; it="Non riesco a leggere un elenco completo e utilizzabile dei file di rkhunter. Riferimento non creato; dettagli nel rapporto tecnico.";;
+        baseline_guard) en="An urgent warning or a flagged checking tool blocks initial setup. Check the remaining items first."; it="Un avviso urgente o uno strumento da verificare blocca la configurazione. Controlla prima gli Elementi rimasti.";;
+        baseline_limit) en="The file or time limit was reached. Initial setup stays incomplete."; it="Raggiunto il limite di file o di tempo. La configurazione iniziale resta da completare.";;
+        baseline_files) en="A file could not be verified against its package. No reference created; see Remaining items."; it="Un file non è verificabile rispetto al suo pacchetto. Riferimento non creato: lo trovi in Elementi rimasti.";;
+        baseline_failed) en="The reference could not be prepared or installed. The previous reference is preserved; see the technical report."; it="Non sono riuscito a preparare o installare il riferimento. Quello precedente è conservato; dettagli nel rapporto tecnico.";;
         rkh_optional) en="Optional or unconfigured tests excluded from this scan:"; it="Test facoltativi o non configurati esclusi da questa scansione:";;
         rkh_optional_short) en="Optional tests excluded; reasons in the report."; it="Test facoltativi esclusi; motivi nel rapporto.";;
         followup_question) en="Would you like me to run the follow-up checks for you?"; it="Vuoi che faccia io le verifiche del caso al posto tuo?";;
@@ -1105,20 +1462,22 @@ sc_brand() {
     if ((SC_WIDTH >= 55)); then
         local i
         local -a sec=(
-            ' ___   ____  ____'
-            '|     |     |    '
-            '|___  |___  |    '
-            '    | |     |    '
-            ' ___| |____ |____'
+            '█▀▀▀▀ █▀▀▀▀ █▀▀▀▀'
+            '█▄▄▄▄ █▄▄▄  █    '
+            '    █ █     █    '
+            '▀▀▀▀▀ ▀▀▀▀▀ ▀▀▀▀▀'
         ) check=(
-            ' ____ |   |  ____  ____ |  / '
-            '|     |   | |     |     | /  '
-            '|     |___| |___  |     |<   '
-            '|     |   | |     |     | \  '
-            '|____ |   | |____ |____ |  \ '
+            '█▀▀▀▀ █   █ █▀▀▀▀ █▀▀▀▀ █  ▄▀'
+            '█     █▄▄▄█ █▄▄▄  █     █▄▀  '
+            '█     █   █ █     █     █ ▀▄ '
+            '▀▀▀▀▀ ▀   ▀ ▀▀▀▀▀ ▀▀▀▀▀ ▀   ▀'
         )
+        if [[ ${SC_ASCII:-0} == 1 ]]; then
+            sec=('##### ##### #####' '#     #     #    ' '#     #     #    ' '##### ####  #    ' '    # #     #    ' '    # #     #    ' '##### ##### #####')
+            check=('##### #   # ##### ##### #   #' '#     #   # #     #     #  # ' '#     #   # #     #     # #  ' '#     ##### ####  #     ##   ' '#     #   # #     #     # #  ' '#     #   # #     #     #  # ' '##### #   # ##### ##### #   #')
+        fi
         printf '\n  %s%s' "$SC_C_WHITE" "$tl"; sc_repeat "$line" 51; printf '%s%s\n' "$tr" "$SC_C_RESET"
-        for ((i=0;i<5;i++)); do
+        for i in "${!sec[@]}"; do
             printf '  %s%s  %s%s %s%s  %s%s%s\n' "$SC_C_WHITE" "$edge" "$SC_C_RED$SC_C_BOLD" "${sec[i]}" "$SC_C_WHITE$SC_C_BOLD" "${check[i]}" "$SC_C_WHITE" "$edge" "$SC_C_RESET"
         done
         printf '  %s%s' "$SC_C_WHITE" "$bl"; sc_repeat "$line" 51; printf '%s%s\n\n' "$br" "$SC_C_RESET"
@@ -1704,6 +2063,10 @@ sc_abort() {
     trap - INT TERM
     local module i
     if [[ ${SC_RUN_ACTIVE:-0} == 1 ]]; then
+        if [[ ${SC_BASELINE_ACTIVE:-0} == 1 ]]; then
+            SC_BASELINE_STATE=interrupted SC_BASELINE_REASON=interrupted
+            sc_add_diagnostic rkhunter baseline_setup "interrupted; consent=$SC_BASELINE_CONFIRMED"
+        fi
         if [[ ${SC_FOLLOWUPS_ACTIVE:-0} == 1 ]]; then
             SC_FOLLOWUPS_INTERRUPTED=1
             for i in "${!SC_F_MODULE[@]}"; do
@@ -1849,6 +2212,7 @@ sc_run_requested() {
     sc_scan_once; rc=$?
     [[ -t 0 && $rc -le 2 ]] || return "$rc"
     sc_offer_followups || return $?
+    ((SC_FOLLOWUPS_DONE == 0)) || sc_offer_baseline || return $?
     sc_result_code; rc=$?
     ((SC_FOLLOWUPS_DONE)) || return "$rc"
     while :; do

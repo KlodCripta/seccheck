@@ -50,5 +50,15 @@ SC_C_RED='<RED>'; SC_C_WHITE='<WHITE>'; SC_C_RESET='<END>'; sc_brand
         out = self.shell('SC_ASCII=1; COLUMNS=80; sc_ui_init; sc_brand')
         rows = out.splitlines()
         self.assertGreaterEqual(len(rows[0]), 50)
-        self.assertEqual(sum(row.startswith('  |') for row in rows), 5)
+        self.assertIn('#####', out)
         self.assertLessEqual(max(map(len, rows)), 80)
+
+    def test_unicode_brand_uses_filled_letters_and_aligned_frame(self):
+        out = self.shell('SC_ASCII=0; COLUMNS=80; sc_ui_init; sc_brand',
+                         TERM='xterm-256color', LC_ALL='C.UTF-8')
+        rows = [row for row in out.splitlines() if row.startswith('  │')]
+        self.assertIn('█', out)
+        self.assertNotIn(' ____', out)
+        self.assertTrue(rows)
+        self.assertEqual(len({len(row) for row in rows}), 1)
+        self.assertLessEqual(max(map(len, out.splitlines())), 80)

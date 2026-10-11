@@ -83,10 +83,16 @@ Reports are private under `/var/log/seccheck/run.*` (directory 700, files 600).
 `report.txt` retains full evidence; `findings.tsv`, `checks.tsv`, `modules.tsv` and
 original scanner logs support technical analysis. Review private paths before sharing.
 
-SecCheck investigates and suggests next steps. It does not reset the rkhunter
-baseline, restore modified configuration files, delete reported files or apply
-hardening rules automatically. A trustworthy initial baseline needs an informed
-decision, especially if changes remain unexplained.
+SecCheck investigates and suggests next steps. After accepted automatic checks,
+a missing rkhunter baseline gets a guided setup: verify its complete file
+list against local package records, ask a **separate confirmation**, prepare and
+validate an initial reference, then repeat rkhunter. An established reference is
+never replaced, even if empty. Unverifiable files or an unsupported native
+comparison method block setup. Local matches do not establish
+trusted origin: proceed only if you trust the installed system and packages.
+
+The original scan and unexplained warnings are retained. SecCheck does not
+restore configuration files, delete reported files or apply hardening rules.
 
 This is a **development version**. Test on Arch and its derivatives before release.
 See [verification notes](docs/VALIDATION.md) and

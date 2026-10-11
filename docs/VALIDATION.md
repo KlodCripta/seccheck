@@ -2,13 +2,17 @@
 
 ## Automated verification
 
-Verified on 10 October 2026 with the final security-flow source:
+Verified on 11 October 2026 with the guided-setup source:
 
 - `bash -n seccheck.sh seccheck_test.sh`: passed.
 - ShellCheck 0.11.0, warning severity: passed without diagnostics.
-- `bash seccheck_test.sh`: **166 tests passed** in 70.826 seconds, no skips.
-- Independent review: two report-access/documentation issues reproduced and
-  corrected; both targeted terminal regressions passed after the fix.
+- `bash seccheck_test.sh`: **198 tests passed** in 46.362 seconds, no skips.
+- Independent review: native reference format, alias links, exclusive creation,
+  configured hashing and flagged indirect helpers corrected with regression tests.
+- An isolated rkhunter 1.4.6 run generated a native reference with 122 records;
+  its headers, canonical link targets and permission format were checked against
+  the implementation. All writes stayed in a private scratch database. This was
+  a format check on Ubuntu, not an Arch system scan or package-origin audit.
 - Menu and result screenshots captured from actual terminal output and inspected.
 
 The suite covers:
@@ -27,6 +31,10 @@ The suite covers:
   protection. A real fuser integration trial opens only its own temporary file.
 - Private report permissions, complete original evidence, interrupted-check
   persistence, narrow terminals, ASCII and NO_COLOR.
+- Separately confirmed initial setup, refusal/EOF, original/repeat evidence,
+  changed files, package/alias links, setuid modes, hash-command path preservation,
+  incomplete reruns and interrupted setup. Existing/empty references and a
+  concurrently created target file, link or directory cannot be overwritten.
 
 The scanners are inert command fixtures; these tests do not certify a real PC.
 Existing-root PTY tests are skipped on non-root test accounts. The optional fuser
@@ -41,7 +49,11 @@ trial is skipped when the necessary tool or own-process access is unavailable.
 5. Check the warnings/finish routes, remaining items and optional improvements.
 6. Interrupt a scan and an analysis; verify that the private report is preserved.
 7. Verify the labels on narrow and normal-width terminals.
+8. With an absent initial reference, decline guided setup and then try confirmed
+   setup after reviewing the installed system. Verify that only checked files
+   are recorded, rkhunter is repeated and independent errors stay visible.
 
-A missing rkhunter.dat, real scanner failures or unexplained file changes remain
-open. SecCheck does not create a baseline from a merely quiet scan. Checks from a
+An absent rkhunter.dat stays unresolved until verified, separately confirmed
+setup succeeds. Real scanner failures or unexplained file changes remain open.
+SecCheck does not create a baseline from a merely quiet scan. Checks from a
 running system cannot rule out hidden compromise or prove package provenance.
