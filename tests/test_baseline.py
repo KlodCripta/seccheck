@@ -261,11 +261,13 @@ sc_offer_baseline
 
     @unittest.skipUnless(os.geteuid() == 0, 'exercise existing-root terminal flow')
     def test_terminal_followup_consent_does_not_approve_baseline_setup(self):
-        for answer, created in ((b's\nn\n0\n', False), (b's\ns\n0\n', True)):
+        for answer, created in ((b's\nn\ns\n0\n', False), (b's\ns\ns\n0\n', True)):
             with self.subTest(answer=answer):
                 (self.db / 'rkhunter.dat').unlink(missing_ok=True)
                 body = '''source "$1"
-sc_parse_args --lang it --scan rkhunter --no-color; sc_ui_init
+sc_parse_args --lang it --scan full --no-color; sc_ui_init
+sc_run_lynis() { sc_module_set lynis completed; }
+sc_run_integrity() { sc_module_set integrity completed; }
 sc_require_scan_host() { return 0; }
 sc_prepare_run() { SC_RUN_DIR="$SC_TEST_DIR/run"; }
 sc_run_requested
@@ -291,6 +293,9 @@ sc_run_requested
                     self.assertEqual(process.wait(timeout=2), 0 if created else 2, data.decode())
                     text = data.decode()
                     self.assertIn('Vuoi che faccia io le verifiche del caso al posto tuo?', text)
+                    self.assertIn('Vuoi che ti aiuti a configurarlo?', text)
+                    self.assertLess(text.index('Vuoi che ti aiuti a configurarlo?'), text.index('[2/3]'))
+                    self.assertLess(text.index('Creo il riferimento iniziale e ripeto rkhunter?'), text.index('[2/3]'))
                     self.assertIn('Creo il riferimento iniziale e ripeto rkhunter?', text)
                     self.assertEqual((self.db / 'rkhunter.dat').exists(), created)
                     self.assertIn('consent=' + ('1' if created else '0'), (self.run / 'report.txt').read_text())

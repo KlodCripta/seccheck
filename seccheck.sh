@@ -907,12 +907,31 @@ sc_baseline_repeat() {
     SC_SCOPE+=('Initial rkhunter setup: full native properties list; <=512 existing files / 240s before another check; local pacfile MTREE + SHA-256; separate consent; staged candidate exact records. Initial log and pre-setup diagnostics retained. Unexplained initial findings remain open.')
 }
 
+sc_offer_initial_baseline() {
+    local i answer missing=0
+    [[ -t 0 ]] || return 0
+    for i in "${!SC_D_MODULE[@]}"; do
+        [[ ${SC_D_MODULE[i]} == rkhunter && ${SC_D_KEY[i]} == rkh_baseline_missing ]] && missing=1
+    done
+    ((missing)) || return 0
+    sc_line "$(sc_t rkh_baseline_short)" "$SC_C_AMBER"
+    sc_line "$(sc_t baseline_help)" "$SC_C_WHITE$SC_C_BOLD"
+    printf '  > '; IFS= read -r answer || answer=''
+    case $answer in
+        s|S|y|Y)
+            sc_interpret_rkhunter
+            sc_offer_baseline initial || return $?
+            SC_RUN_ACTIVE=1
+            trap sc_abort INT TERM;;
+    esac
+}
+
 sc_offer_baseline() {
     local i missing=0 answer
     for i in "${!SC_D_MODULE[@]}"; do
         [[ ${SC_D_MODULE[i]} == rkhunter && ${SC_D_KEY[i]} == rkh_baseline_missing ]] && missing=1
     done
-    ((missing && SC_FOLLOWUPS_DONE)) || return 0
+    ((missing)) || return 0
     sc_heading baseline_setup
     sc_line "$(sc_t baseline_explain)"
     sc_line "$(sc_t baseline_checking)" "$SC_C_WHITE"
@@ -941,7 +960,7 @@ sc_offer_baseline() {
     sc_assess
     sc_save_report || { SC_RUN_ACTIVE=0 SC_BASELINE_ACTIVE=0; trap - INT TERM; sc_line "$(sc_t save_error)"; return 73; }
     SC_RUN_ACTIVE=0 SC_BASELINE_ACTIVE=0; trap - INT TERM
-    [[ $SC_BASELINE_STATE != created ]] || sc_render_summary
+    [[ $SC_BASELINE_STATE != created || ${1:-} == initial ]] || sc_render_summary
 }
 
 sc_parse_lynis() {
@@ -1139,6 +1158,7 @@ sc_t() {
         checks_count) en="Checks completed"; it="Controlli conclusi";;
         scan_count) en="Items to verify"; it="Elementi da verificare";;
         analysis_explained) en="Explained"; it="Chiariti";;
+        rkh_executed_no_history) en="Executed — historical comparison unavailable"; it="Eseguito — confronto storico non disponibile";;
         rkh_baseline_short) en="The initial file snapshot (rkhunter.dat) is missing: no historical comparison."; it="Manca la fotografia iniziale dei file (rkhunter.dat): confronto storico non eseguito.";;
         partial_short) en="Not all tests completed. The technical report has the cause."; it="Non tutti i test sono riusciti. La causa è nel rapporto tecnico.";;
         attention) en="ITEMS STILL TO CHECK"; it="ELEMENTI ANCORA DA VERIFICARE";;
@@ -1155,6 +1175,7 @@ sc_t() {
         rkh_prerequisite_detail) en="Prerequisite failure reported by rkhunter:"; it="Causa segnalata da rkhunter:";;
         rkh_baseline_missing) en="The initial file snapshot (rkhunter.dat) is missing or empty. rkhunter cannot compare changes over time."; it="Manca la prima fotografia dei file (rkhunter.dat), oppure è vuota. rkhunter non può confrontare le modifiche nel tempo.";;
         rkh_baseline_help) en="--propupd records the current files as a reference. Use it only after checking their contents and source."; it="--propupd registra i file attuali come riferimento. Va usato solo dopo averne verificato contenuto e provenienza.";;
+        baseline_help) en="Would you like help configuring it? [y/N]"; it="Vuoi che ti aiuti a configurarlo? [s/N]";;
         baseline_setup) en="RKHUNTER: INITIAL SETUP"; it="RKHUNTER: CONFIGURAZIONE INIZIALE";;
         baseline_explain) en="The initial reference is missing. It lets rkhunter compare files between scans."; it="Manca il riferimento iniziale. Serve a confrontare i file tra una scansione e l’altra.";;
         baseline_checking) en="Checking files for the initial reference"; it="Verifico i file per il riferimento iniziale";;
@@ -2095,7 +2116,12 @@ sc_scan_once() {
         ((step+=1)); printf '\n'
         sc_line "[$step/${#SC_SELECTED[@]}] $(sc_t scanning): $(sc_t "$module")" "$SC_C_PRIMARY"
         case $module in rkhunter) sc_run_rkhunter;; lynis) sc_run_lynis;; integrity) sc_run_integrity;; esac
-        sc_line "$(sc_t "${SC_MODULE_STATUS[$module]}")" "$(sc_status_color "${SC_MODULE_STATUS[$module]}")"
+        if [[ $module == rkhunter && ${SC_MODULE_REASON[$module]} == rkh_baseline_missing ]]; then
+            sc_line "$(sc_t rkh_executed_no_history)" "$SC_C_AMBER"
+        else
+            sc_line "$(sc_t "${SC_MODULE_STATUS[$module]}")" "$(sc_status_color "${SC_MODULE_STATUS[$module]}")"
+        fi
+        [[ $module != rkhunter ]] || sc_offer_initial_baseline || return $?
     done
     sc_assess
     SC_RUN_ACTIVE=0
@@ -2212,7 +2238,6 @@ sc_run_requested() {
     sc_scan_once; rc=$?
     [[ -t 0 && $rc -le 2 ]] || return "$rc"
     sc_offer_followups || return $?
-    ((SC_FOLLOWUPS_DONE == 0)) || sc_offer_baseline || return $?
     sc_result_code; rc=$?
     ((SC_FOLLOWUPS_DONE)) || return "$rc"
     while :; do
