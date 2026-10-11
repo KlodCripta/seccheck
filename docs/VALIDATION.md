@@ -6,7 +6,7 @@ Verified on 11 October 2026 with the guided-setup source:
 
 - `bash -n seccheck.sh seccheck_test.sh`: passed.
 - ShellCheck 0.11.0, warning severity: passed without diagnostics.
-- `bash seccheck_test.sh`: **198 tests passed** in 46.362 seconds, no skips.
+- `bash seccheck_test.sh`: **198 tests passed** in 46.446 seconds, no skips.
 - Independent review: native reference format, alias links, exclusive creation,
   configured hashing and flagged indirect helpers corrected with regression tests.
 - An isolated rkhunter 1.4.6 run generated a native reference with 122 records;
@@ -39,6 +39,10 @@ The suite covers:
 The scanners are inert command fixtures; these tests do not certify a real PC.
 Existing-root PTY tests are skipped on non-root test accounts. The optional fuser
 trial is skipped when the necessary tool or own-process access is unavailable.
+The noninteractive baseline guard test checks both account types: root may run
+the inert scan; non-root must receive exit 77 and the sudo hint before scanning
+or initializing anything. Its original root-only expectation was corrected
+after GitHub Actions exposed the mismatch on its unprivileged runner.
 
 ## Native validation before release
 

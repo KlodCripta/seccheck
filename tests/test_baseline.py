@@ -399,10 +399,20 @@ sc_run_requested
         self.assertIn('RESULT|review|1', out)
 
     def test_noninteractive_scan_does_not_offer_or_create_baseline(self):
-        out = self.execute('''sc_require_scan_host() { :; }
+        body = self.setup_shell() + '''sc_require_scan_host() { :; }
 sc_scan_once() { printf 'SCAN\n'; return 2; }
 SC_SCAN=rkhunter
 sc_run_requested; printf 'EXIT|%s' "$?"
-''')
-        self.assertEqual(out, 'SCAN\nEXIT|2')
+'''
+        result = subprocess.run(['/bin/bash', '-c', 'source "$1"\n' + body, 'test', str(SCRIPT)],
+                                capture_output=True, text=True, timeout=10,
+                                env=dict(os.environ, PATH=self.path, SC_TEST_DIR=str(self.folder), NO_COLOR='1'))
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        if os.geteuid() == 0:
+            self.assertEqual(result.stdout, 'SCAN\nEXIT|2')
+            self.assertEqual(result.stderr, '')
+        else:
+            self.assertEqual(result.stdout, 'EXIT|77')
+            self.assertIn('sudo', result.stderr)
+            self.assertIn('non interattiva', result.stderr)
         self.assertFalse((self.folder / 'calls').exists())
